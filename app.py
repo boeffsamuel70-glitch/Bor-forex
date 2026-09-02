@@ -15,7 +15,6 @@ TZ = ZoneInfo(TIMEZONE)
 OUTPUTSIZE = 100
 HORA_INICIO = 6
 HORA_FIM = 22
-MAX_ATRASO_MINUTOS = 8
 
 ATIVOS = {
     "EURUSD": "EUR/USD",
@@ -27,8 +26,7 @@ estado = {
     codigo: {
         "symbol": symbol, "sinal": "AGUARDAR", "score": 0,
         "preco": None, "timestamp": None,
-        "motivo": "Aguardando leitura", "status": "aguardando",
-        "atualidade_min": None
+        "motivo": "Aguardando leitura", "status": "aguardando"
     } for codigo, symbol in ATIVOS.items()
 }
 
@@ -64,31 +62,6 @@ def obter_candles(symbol):
         raise RuntimeError(f"Nenhum candle retornado para {symbol}.")
     log(f"{symbol}: {len(values)} candles recebidos.")
     return values
-
-def validar_atualidade(candles, symbol):
-    datas = []
-    for c in candles:
-        txt = c.get("datetime")
-        if not txt:
-            continue
-        try:
-            dt = datetime.fromisoformat(txt)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=TZ)
-            datas.append(dt.astimezone(TZ))
-        except ValueError:
-            continue
-
-    if not datas:
-        return False, None, "Data dos candles inválida."
-
-    ultimo = max(datas)
-    atraso = (datetime.now(TZ) - ultimo).total_seconds() / 60
-    atual = atraso <= MAX_ATRASO_MINUTOS
-    log(f"{symbol}: último candle {ultimo.strftime('%Y-%m-%d %H:%M:%S')} | atraso={atraso:.1f} min | atual={'SIM' if atual else 'NÃO'}")
-    if not atual:
-        return False, atraso, f"Dados atrasados ({atraso:.1f} min). Sem sinal até receber candle atual."
-    return True, atraso, ""
 
 def somente_velas_fechadas(candles):
     agora = datetime.now(TZ)
@@ -199,35 +172,14 @@ def analisar(candles):
 
 def processar_ativo(codigo, symbol):
     try:
-        candles_brutos = obter_candles(symbol)
-        atual, atraso, motivo_atualidade = validar_atualidade(candles_brutos, symbol)
-        if not atual:
-            estado[codigo].update({
-                "sinal": "AGUARDAR", "score": 0, "preco": None,
-                "timestamp": None, "motivo": motivo_atualidade,
-                "status": "dados_atrasados",
-                "atualidade_min": round(atraso, 1) if atraso is not None else None
-            })
-            log(f"{symbol} -> BLOQUEADO: {motivo_atualidade}")
-            return
-
-        candles = somente_velas_fechadas(candles_brutos)
-        if len(candles) < 30:
-            estado[codigo].update({
-                "sinal": "AGUARDAR", "score": 0, "preco": None,
-                "timestamp": None, "motivo": "Poucos candles fechados disponíveis.",
-                "status": "aguardando", "atualidade_min": round(atraso, 1)
-            })
-            return
-
+        candles = somente_velas_fechadas(obter_candles(symbol))
         sinal, score, motivo = analisar(candles)
         ultimo = candles[-1]
         preco = float(ultimo["close"])
         ts = ultimo.get("datetime")
         estado[codigo].update({
             "sinal": sinal, "score": score, "preco": preco,
-            "timestamp": ts, "motivo": motivo, "status": "ok",
-            "atualidade_min": round(atraso, 1)
+            "timestamp": ts, "motivo": motivo, "status": "ok"
         })
         log(f"{symbol} -> {sinal} | score={score} | preço={preco} | vela={ts}")
     except Exception as e:
@@ -254,7 +206,6 @@ def loop_robo():
     log(f"Ativos: {', '.join(ATIVOS.values())}")
     log(f"Horário: {HORA_INICIO:02d}:00–{HORA_FIM:02d}:00 BRT")
     log(f"API KEY configurada: {'SIM' if API_KEY else 'NÃO'}")
-    log(f"Limite de atraso: {MAX_ATRASO_MINUTOS} minutos.")
 
     while True:
         if not dentro_do_horario():
@@ -301,7 +252,7 @@ async function atualizar(){
   for(const a of Object.values(d.ativos)) h+=
   '<div class="card"><b>'+a.symbol+'</b><div class="sinal">'+a.sinal+
   '</div>Score: <b>'+a.score+'</b><br>Preço: '+(a.preco??'-')+
-  '<br>Vela: '+(a.timestamp??'-')+'<br>Idade do dado: '+(a.atualidade_min??'-')+' min<br><span class="small">'+a.motivo+'</span></div>';
+  '<br>Vela: '+(a.timestamp??'-')+'<br><span class="small">'+a.motivo+'</span></div>';
   document.getElementById('cards').innerHTML=h;
  }catch(e){document.getElementById('status').innerText='Erro: '+e}
 }
