@@ -628,7 +628,7 @@ def enviar_telegram(texto):
 
         resposta = requests.post(
             url,
-            data={
+            json={
                 "chat_id": TELEGRAM_CHAT_ID,
                 "text": texto,
                 "parse_mode": "HTML",
@@ -636,28 +636,49 @@ def enviar_telegram(texto):
             timeout=15,
         )
 
-        resposta.raise_for_status()
+        # Nao usar raise_for_status() aqui.
+        # Assim o log mostra exatamente o motivo
+        # informado pelo Telegram em caso de erro.
+        try:
+            dados = resposta.json()
+        except Exception:
+            dados = {}
 
-        dados = resposta.json()
+        if resposta.ok and dados.get("ok"):
+            log("Mensagem enviada para o Telegram.")
+            return True
 
-        if not dados.get("ok"):
-            raise RuntimeError(
-                dados.get(
-                    "description",
-                    "Erro desconhecido do Telegram."
-                )
-            )
-
-        log(
-            "Mensagem enviada para o Telegram."
+        descricao = dados.get(
+            "description",
+            resposta.text or "Resposta vazia do Telegram."
         )
 
-        return True
+        log(
+            f"ERRO Telegram HTTP {resposta.status_code}: "
+            f"{descricao}"
+        )
+
+        # Diagnostico adicional para facilitar a correcao.
+        if resposta.status_code == 400:
+            log(
+                "Verifique principalmente TELEGRAM_CHAT_ID "
+                "e se o usuario/grupo iniciou uma conversa com o bot."
+            )
+
+        return False
+
+    except requests.RequestException as e:
+
+        log(
+            f"ERRO de conexao com Telegram: {e}"
+        )
+
+        return False
 
     except Exception as e:
 
         log(
-            f"ERRO ao enviar Telegram: {e}"
+            f"ERRO inesperado ao enviar Telegram: {e}"
         )
 
         return False
