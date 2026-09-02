@@ -33,7 +33,8 @@ MAX_ATRASO_MINUTOS = 8
 ATIVOS = {
     "EURUSD": "EUR/USD",
     "GBPUSD": "GBP/USD",
-    "EURJPY": "EUR/JPY",
+    "USDJPY": "USD/JPY",
+    "GBPJPY": "GBP/JPY",
 }
 
 # ============================================================
