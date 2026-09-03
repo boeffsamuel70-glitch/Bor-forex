@@ -5,6 +5,13 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import requests
+
+# Leitura exclusiva da Bullex (sem envio de ordens)
+try:
+    from bullexapi.stable_api import Bullex
+except ImportError:
+    Bullex = None
+
 from flask import Flask, jsonify, render_template_string
 
 app = Flask(__name__)
@@ -13,7 +20,13 @@ app = Flask(__name__)
 # CONFIGURAÇÃO
 # ============================================================
 
-API_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
+BULLEX_EMAIL = os.getenv("BULLEX_EMAIL", "").strip()
+BULLEX_SENHA = os.getenv("BULLEX_SENHA", "").strip()
+
+# A fonte de candles do robô é a Bullex.
+# Não há código de compra/venda neste arquivo.
+_bullex_api = None
+_bullex_lock = threading.Lock()
 
 TELEGRAM_BOT_TOKEN = os.getenv(
     "TELEGRAM_BOT_TOKEN", ""
@@ -111,6 +124,9 @@ _ultimos_sinais_telegram = {}
 #
 # Pode existir no máximo uma operação pendente por ativo.
 _operacoes_pendentes = {}
+
+# Impede registrar novamente a mesma vela de sinal depois que ela foi finalizada.
+_ultimas_operacoes_registradas = {}
 
 # Resultados da sessão.
 _historico_resultados = []
@@ -248,8 +264,84 @@ def idade_do_ultimo_candle(
 
 
 # ============================================================
-# TWELVE DATA
+# BULLEX - FONTE DE DADOS
 # ============================================================
+
+
+def conectar_bullex():
+    """Conecta à Bullex somente para leitura de mercado."""
+    global _bullex_api
+
+    if Bullex is None:
+        raise RuntimeError(
+            "Pacote bullexapi nao instalado no Render. "
+            "Adicione bullexapi ao requirements.txt."
+        )
+
+    if not BULLEX_EMAIL or not BULLEX_SENHA:
+        raise RuntimeError(
+            "BULLEX_EMAIL e BULLEX_SENHA nao configurados no Render."
+        )
+
+    with _bullex_lock:
+        if _bullex_api is not None:
+            return _bullex_api
+
+        api = Bullex(BULLEX_EMAIL, BULLEX_SENHA)
+        ok, msg = api.connect()
+        if not ok:
+            raise RuntimeError(f"Erro ao conectar na Bullex: {msg}")
+
+        _bullex_api = api
+        log("Conectado à Bullex para leitura de candles.")
+        return _bullex_api
+
+
+def normalizar_candle_bullex(candle):
+    """Converte o candle retornado pela Bullex para o formato usado pelo robô."""
+    item = dict(candle)
+
+    timestamp = (
+        item.get("from")
+        or item.get("timestamp")
+        or item.get("time")
+        or item.get("at")
+    )
+
+    if timestamp is None:
+        return None
+
+    try:
+        if isinstance(timestamp, str):
+            texto = timestamp.strip()
+            if texto.isdigit():
+                timestamp = float(texto)
+            else:
+                dt = parse_datetime_candle(texto)
+                if dt is None:
+                    return None
+                timestamp = dt.timestamp()
+
+        timestamp = float(timestamp)
+        # APIs de mercado normalmente usam segundos; aceite ms também.
+        if timestamp > 10_000_000_000:
+            timestamp /= 1000.0
+
+        dt = datetime.fromtimestamp(timestamp, tz=TZ)
+
+        resultado = {
+            "datetime": dt.isoformat(),
+            "open": float(item["open"]),
+            "high": float(item["high"]),
+            "low": float(item["low"]),
+            "close": float(item["close"]),
+            "volume": float(item.get("volume", 0) or 0),
+        }
+
+        return resultado
+
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return None
 
 
 def obter_candles(
@@ -257,67 +349,60 @@ def obter_candles(
     interval=TIMEFRAME,
     outputsize=OUTPUTSIZE
 ):
+    """Busca candles diretamente da Bullex. Somente leitura."""
+    global _bullex_api
 
-    if not API_KEY:
+    api = conectar_bullex()
 
+    intervalo_segundos = {
+        "1min": 60,
+        "5min": 300,
+        "15min": 900,
+        "30min": 1800,
+        "1h": 3600,
+    }.get(interval)
+
+    if intervalo_segundos is None:
         raise RuntimeError(
-            "TWELVE_DATA_API_KEY "
-            "nao configurada no Render."
+            f"Timeframe nao suportado pela configuracao: {interval}"
         )
 
-    resposta = requests.get(
-
-        "https://api.twelvedata.com/time_series",
-
-        params={
-
-            "symbol": symbol,
-
-            "interval": interval,
-
-            "outputsize": outputsize,
-
-            "timezone": TIMEZONE,
-
-            "apikey": API_KEY,
-        },
-
-        timeout=20,
-    )
-
-    resposta.raise_for_status()
-
-    dados = resposta.json()
-
-    if dados.get("status") == "error":
-
-        raise RuntimeError(
-            dados.get(
-                "message",
-                "Erro retornado pela Twelve Data."
-            )
+    try:
+        dados = api.get_candles(
+            symbol,
+            intervalo_segundos,
+            outputsize,
+            int(time.time()),
+        )
+    except Exception as e:
+        log(f"Falha na leitura Bullex ({symbol}): {e}")
+        # Tenta reconectar uma vez.
+        with _bullex_lock:
+            _bullex_api = None
+        api = conectar_bullex()
+        dados = api.get_candles(
+            symbol,
+            intervalo_segundos,
+            outputsize,
+            int(time.time()),
         )
 
-    values = dados.get(
-        "values"
-    )
-
-    if not values:
-
+    if not dados:
         raise RuntimeError(
-            f"Nenhuma vela recebida "
-            f"para {symbol}: {dados}"
+            f"Nenhuma vela recebida da Bullex para {symbol}."
         )
 
-    candles = ordenar_candles(
-        values
-    )
+    candles = []
+    for candle in dados:
+        normalizado = normalizar_candle_bullex(candle)
+        if normalizado is not None:
+            candles.append(normalizado)
+
+    candles = ordenar_candles(candles)
 
     if not candles:
-
         raise RuntimeError(
-            f"Nao foi possivel interpretar "
-            f"as datas de {symbol}."
+            f"Nao foi possivel interpretar as velas da Bullex para {symbol}."
         )
 
     return candles
@@ -1848,6 +1933,12 @@ def registrar_operacao(
         f"{vela_sinal.isoformat()}"
     )
 
+    if _ultimas_operacoes_registradas.get(symbol) == chave:
+        log(
+            f"{symbol}: operacao duplicada para a mesma vela ignorada."
+        )
+        return
+
     if symbol in _operacoes_pendentes:
 
         log(
@@ -1898,6 +1989,7 @@ def registrar_operacao(
     _operacoes_pendentes[
         symbol
     ] = operacao
+    _ultimas_operacoes_registradas[symbol] = chave
 
     log(
         f"{symbol}: operacao registrada "
@@ -2098,7 +2190,8 @@ def enviar_resultado_telegram(
         f"{fmt(operacao.get('entrada'))}\n"
 
         f"Saida: "
-        f"{fmt(operacao.get('saida'))}\n\n"
+        f"{fmt(operacao.get('saida'))}\n"
+        f"Fonte da vela: Bullex\n\n"
 
         f"📊 ESTATISTICAS\n"
 
@@ -2581,12 +2674,10 @@ def executar_leitura():
         "================================"
     )
 
-    if not API_KEY:
+    if not BULLEX_EMAIL or not BULLEX_SENHA:
 
         log(
-            "ERRO: "
-            "TWELVE_DATA_API_KEY "
-            "nao configurada."
+            "ERRO: BULLEX_EMAIL/BULLEX_SENHA nao configurados."
         )
 
         estado["sinal"] = (
@@ -2594,9 +2685,7 @@ def executar_leitura():
         )
 
         estado["mensagem"] = (
-            "Configure "
-            "TWELVE_DATA_API_KEY "
-            "no Render."
+            "Configure BULLEX_EMAIL e BULLEX_SENHA no Render."
         )
 
         return
@@ -3266,7 +3355,7 @@ Expiração: 5 minutos
 <br><br>
 
 O resultado será calculado automaticamente
-quando a vela de expiração fechar.
+com base na vela de expiração recebida da Bullex.
 
 <br><br>
 
@@ -3379,6 +3468,8 @@ def health():
                 "confirmacao "
                 "em vela separada"
             ),
+        "fonte_candles": "Bullex",
+        "execucao_automatica": False,
 
         "telegram_configurado":
             telegram_configurado(),
