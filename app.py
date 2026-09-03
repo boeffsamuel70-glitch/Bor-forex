@@ -1,3 +1,4 @@
+```python
 import os
 import time
 import threading
@@ -38,6 +39,46 @@ HORA_FIM = 22
 MAX_ATRASO_MINUTOS = 8
 
 # ============================================================
+# CONTROLE DA TWELVE DATA
+# ============================================================
+
+# Intervalo mínimo entre requisições à Twelve Data.
+#
+# Isso é importante para evitar disparar várias chamadas
+# praticamente ao mesmo tempo.
+API_INTERVALO_MINIMO = 10.0
+
+# Quantidade de tentativas em caso de erro 429.
+API_MAX_TENTATIVAS_429 = 3
+
+# Tempo padrão de espera quando a API não informa Retry-After.
+API_ESPERA_429 = 20
+
+_api_lock = threading.Lock()
+
+_ultima_chamada_api = 0.0
+
+# Cache das candles.
+#
+# Chave:
+# (symbol, interval)
+#
+# Valor:
+# {
+#     "candles": [...],
+#     "obtido_em": datetime
+# }
+_cache_candles = {}
+
+_cache_lock = threading.Lock()
+
+# 5M pode ser reutilizado durante pequenos períodos.
+CACHE_5M_SEGUNDOS = 45
+
+# 15M pode ser reutilizado por mais tempo.
+CACHE_15M_SEGUNDOS = 180
+
+# ============================================================
 # ATIVOS
 # ============================================================
 
@@ -50,13 +91,6 @@ ATIVOS = {
 
 # ============================================================
 # ESTADO POR ATIVO
-#
-# IMPORTANTE:
-# Antes existia somente um "estado" global. Assim, cada ativo
-# sobrescrevia o anterior e a interface terminava mostrando
-# somente o último ativo processado.
-#
-# Agora cada ativo possui seu próprio estado independente.
 # ============================================================
 
 
@@ -111,15 +145,10 @@ _robo_started = False
 # CONTROLE DE SINAIS
 # ============================================================
 
-# Evita mandar duas vezes o mesmo sinal.
 _ultimos_sinais_telegram = {}
 
-# Guarda operações aguardando resultado.
-#
-# Pode existir no máximo uma operação pendente por ativo.
 _operacoes_pendentes = {}
 
-# Resultados da sessão.
 _historico_resultados = []
 
 # ============================================================
@@ -134,7 +163,7 @@ def log(msg):
     )
 
     print(
-        f"[BOT] {msg}",
+        f"[BOT] {agora} | {msg}",
         flush=True
     )
 
@@ -154,6 +183,7 @@ def atualizar_estado_ativo(
         estado_ativo = estados_ativos[chave]
 
         for campo, valor in alteracoes.items():
+
             estado_ativo[campo] = valor
 
 
@@ -188,11 +218,13 @@ def parse_datetime_candle(txt):
     try:
 
         if txt.endswith("Z"):
+
             txt = txt[:-1] + "+00:00"
 
         dt = datetime.fromisoformat(txt)
 
         if dt.tzinfo is None:
+
             dt = dt.replace(
                 tzinfo=TZ
             )
@@ -268,15 +300,14 @@ def somente_velas_fechadas(
     ]
 
 
-def idade_do_ultimo_candle(
-    candles
-):
+def idade_do_ultimo_candle(candles):
 
     ordenadas = ordenar_candles(
         candles
     )
 
     if not ordenadas:
+
         return None, None
 
     ultimo = ordenadas[-1]
@@ -288,6 +319,113 @@ def idade_do_ultimo_candle(
     ).total_seconds() / 60
 
     return ultimo, idade
+
+
+# ============================================================
+# CONTROLE DE RATE LIMIT
+# ============================================================
+
+
+def aguardar_intervalo_api():
+
+    global _ultima_chamada_api
+
+    agora = time.monotonic()
+
+    espera = (
+        API_INTERVALO_MINIMO
+        -
+        (
+            agora
+            -
+            _ultima_chamada_api
+        )
+    )
+
+    if espera > 0:
+
+        log(
+            f"Aguardando {espera:.1f}s "
+            "antes da próxima chamada da API."
+        )
+
+        time.sleep(
+            espera
+        )
+
+    _ultima_chamada_api = time.monotonic()
+
+
+# ============================================================
+# CACHE
+# ============================================================
+
+
+def obter_ttl_cache(interval):
+
+    if interval == TIMEFRAME_TREND:
+
+        return CACHE_15M_SEGUNDOS
+
+    return CACHE_5M_SEGUNDOS
+
+
+def obter_cache(symbol, interval):
+
+    chave = (
+        symbol,
+        interval
+    )
+
+    agora = time.monotonic()
+
+    with _cache_lock:
+
+        item = _cache_candles.get(
+            chave
+        )
+
+        if not item:
+
+            return None
+
+        idade = (
+            agora
+            -
+            item["monotonic"]
+        )
+
+        ttl = obter_ttl_cache(
+            interval
+        )
+
+        if idade <= ttl:
+
+            return item["candles"]
+
+        return None
+
+
+def salvar_cache(
+    symbol,
+    interval,
+    candles
+):
+
+    chave = (
+        symbol,
+        interval
+    )
+
+    with _cache_lock:
+
+        _cache_candles[chave] = {
+
+            "candles": candles,
+
+            "monotonic":
+                time.monotonic(),
+        }
 
 
 # ============================================================
@@ -308,62 +446,319 @@ def obter_candles(
             "nao configurada no Render."
         )
 
-    resposta = requests.get(
+    # ========================================================
+    # PRIMEIRO: CACHE
+    # ========================================================
 
-        "https://api.twelvedata.com/time_series",
-
-        params={
-
-            "symbol": symbol,
-
-            "interval": interval,
-
-            "outputsize": outputsize,
-
-            "timezone": TIMEZONE,
-
-            "apikey": API_KEY,
-        },
-
-        timeout=20,
+    cached = obter_cache(
+        symbol,
+        interval
     )
 
-    resposta.raise_for_status()
+    if cached is not None:
 
-    dados = resposta.json()
+        log(
+            f"Cache utilizado: "
+            f"{symbol} {interval}"
+        )
 
-    if dados.get("status") == "error":
+        return cached
 
-        raise RuntimeError(
-            dados.get(
-                "message",
-                "Erro retornado pela Twelve Data."
+    url = (
+        "https://api.twelvedata.com/time_series"
+    )
+
+    ultimo_erro = None
+
+    # ========================================================
+    # TENTATIVAS CONTROLADAS
+    # ========================================================
+
+    for tentativa in range(
+        1,
+        API_MAX_TENTATIVAS_429 + 1
+    ):
+
+        try:
+
+            with _api_lock:
+
+                aguardar_intervalo_api()
+
+                log(
+                    f"API Twelve Data -> "
+                    f"{symbol} {interval} "
+                    f"(tentativa {tentativa})"
+                )
+
+                resposta = requests.get(
+
+                    url,
+
+                    params={
+
+                        "symbol": symbol,
+
+                        "interval": interval,
+
+                        "outputsize": outputsize,
+
+                        "timezone": TIMEZONE,
+
+                        "apikey": API_KEY,
+                    },
+
+                    timeout=20,
+                )
+
+            # =================================================
+            # RATE LIMIT
+            # =================================================
+
+            if resposta.status_code == 429:
+
+                retry_after = resposta.headers.get(
+                    "Retry-After"
+                )
+
+                try:
+
+                    espera = float(
+                        retry_after
+                    )
+
+                except Exception:
+
+                    espera = (
+                        API_ESPERA_429
+                        *
+                        tentativa
+                    )
+
+                espera = max(
+                    espera,
+                    10
+                )
+
+                log(
+                    f"429 da Twelve Data para "
+                    f"{symbol} {interval}. "
+                    f"Aguardando {espera:.1f}s."
+                )
+
+                ultimo_erro = RuntimeError(
+                    f"Twelve Data HTTP 429 "
+                    f"para {symbol} {interval}"
+                )
+
+                if tentativa < API_MAX_TENTATIVAS_429:
+
+                    time.sleep(
+                        espera
+                    )
+
+                    continue
+
+                raise ultimo_erro
+
+            # =================================================
+            # OUTROS ERROS HTTP
+            # =================================================
+
+            if resposta.status_code >= 400:
+
+                try:
+
+                    erro_json = resposta.json()
+
+                except Exception:
+
+                    erro_json = resposta.text
+
+                raise RuntimeError(
+                    f"Twelve Data HTTP "
+                    f"{resposta.status_code}: "
+                    f"{erro_json}"
+                )
+
+            # =================================================
+            # JSON
+            # =================================================
+
+            try:
+
+                dados = resposta.json()
+
+            except Exception as e:
+
+                raise RuntimeError(
+                    "Resposta inválida da "
+                    "Twelve Data."
+                ) from e
+
+            # =================================================
+            # ERRO RETORNADO PELA API
+            # =================================================
+
+            if dados.get("status") == "error":
+
+                mensagem = dados.get(
+                    "message",
+                    "Erro retornado pela Twelve Data."
+                )
+
+                # Alguns limites podem vir como JSON
+                # mesmo com HTTP 200.
+
+                mensagem_lower = str(
+                    mensagem
+                ).lower()
+
+                if (
+                    "rate" in mensagem_lower
+                    or
+                    "limit" in mensagem_lower
+                    or
+                    "too many" in mensagem_lower
+                ):
+
+                    espera = (
+                        API_ESPERA_429
+                        *
+                        tentativa
+                    )
+
+                    log(
+                        f"Limite da Twelve Data "
+                        f"para {symbol} {interval}. "
+                        f"Aguardando {espera}s."
+                    )
+
+                    ultimo_erro = RuntimeError(
+                        str(mensagem)
+                    )
+
+                    if tentativa < API_MAX_TENTATIVAS_429:
+
+                        time.sleep(
+                            espera
+                        )
+
+                        continue
+
+                raise RuntimeError(
+                    str(mensagem)
+                )
+
+            # =================================================
+            # VALUES
+            # =================================================
+
+            values = dados.get(
+                "values"
             )
-        )
 
-    values = dados.get(
-        "values"
+            if not values:
+
+                raise RuntimeError(
+                    f"Nenhuma vela recebida "
+                    f"para {symbol} "
+                    f"{interval}: {dados}"
+                )
+
+            candles = ordenar_candles(
+                values
+            )
+
+            if not candles:
+
+                raise RuntimeError(
+                    f"Nao foi possivel "
+                    f"interpretar as datas "
+                    f"de {symbol}."
+                )
+
+            salvar_cache(
+                symbol,
+                interval,
+                candles
+            )
+
+            log(
+                f"Dados recebidos: "
+                f"{symbol} {interval} | "
+                f"{len(candles)} candles"
+            )
+
+            return candles
+
+        except requests.exceptions.RequestException as e:
+
+            ultimo_erro = e
+
+            log(
+                f"Erro de conexão Twelve Data "
+                f"{symbol} {interval}: {e}"
+            )
+
+            if tentativa < API_MAX_TENTATIVAS_429:
+
+                espera = 5 * tentativa
+
+                time.sleep(
+                    espera
+                )
+
+                continue
+
+            raise
+
+        except RuntimeError as e:
+
+            ultimo_erro = e
+
+            mensagem = str(e).lower()
+
+            if (
+                "429" in mensagem
+                or
+                "rate" in mensagem
+                or
+                "limit" in mensagem
+                or
+                "too many" in mensagem
+            ):
+
+                if tentativa < API_MAX_TENTATIVAS_429:
+
+                    espera = (
+                        API_ESPERA_429
+                        *
+                        tentativa
+                    )
+
+                    time.sleep(
+                        espera
+                    )
+
+                    continue
+
+            raise
+
+        except Exception as e:
+
+            ultimo_erro = e
+
+            raise
+
+    if ultimo_erro:
+
+        raise ultimo_erro
+
+    raise RuntimeError(
+        f"Falha desconhecida ao consultar "
+        f"{symbol} {interval}."
     )
-
-    if not values:
-
-        raise RuntimeError(
-            f"Nenhuma vela recebida "
-            f"para {symbol}: {dados}"
-        )
-
-    candles = ordenar_candles(
-        values
-    )
-
-    if not candles:
-
-        raise RuntimeError(
-            f"Nao foi possivel interpretar "
-            f"as datas de {symbol}."
-        )
-
-    return candles
 
 
 # ============================================================
@@ -385,6 +780,7 @@ def ema(
 ):
 
     if len(values) < period:
+
         return None
 
     k = 2 / (
@@ -393,7 +789,8 @@ def ema(
 
     valor = (
         sum(values[:period])
-        / period
+        /
+        period
     )
 
     for preco in values[period:]:
@@ -413,6 +810,7 @@ def rsi(
 ):
 
     if len(values) < period + 1:
+
         return None
 
     ganhos = []
@@ -447,14 +845,16 @@ def rsi(
         sum(
             ganhos[:period]
         )
-        / period
+        /
+        period
     )
 
     avg_loss = (
         sum(
             perdas[:period]
         )
-        / period
+        /
+        period
     )
 
     for i in range(
@@ -483,6 +883,7 @@ def rsi(
         ) / period
 
     if avg_loss == 0:
+
         return 100.0
 
     rs = (
@@ -508,6 +909,7 @@ def atr(
 ):
 
     if len(candles) < period + 1:
+
         return None
 
     trs = []
@@ -518,6 +920,7 @@ def atr(
     ):
 
         atual = candles[i]
+
         anterior = candles[i - 1]
 
         high = float(
@@ -552,6 +955,7 @@ def atr(
         )
 
     if len(trs) < period:
+
         return None
 
     return (
@@ -653,6 +1057,7 @@ def percentual_distancia(
 ):
 
     if referencia == 0:
+
         return 999.0
 
     return (
@@ -667,7 +1072,7 @@ def percentual_distancia(
 
 
 # ============================================================
-# TENDÊNCIA 15 MIN
+# TENDÊNCIA
 # ============================================================
 
 
@@ -700,8 +1105,10 @@ def tendencia_timeframe(
 
     if not (
         ema5
-        and ema13
-        and ema21
+        and
+        ema13
+        and
+        ema21
     ):
 
         return "NEUTRA"
@@ -741,6 +1148,7 @@ def pullback_call_na_vela(
 ):
 
     if not ema13 or not ema21:
+
         return False
 
     tocou_ema13 = (
@@ -795,6 +1203,7 @@ def pullback_put_na_vela(
 ):
 
     if not ema13 or not ema21:
+
         return False
 
     tocou_ema13 = (
@@ -843,7 +1252,7 @@ def pullback_put_na_vela(
 
 
 # ============================================================
-# ANÁLISE DE MERCADO LATERAL
+# MERCADO LATERAL
 # ============================================================
 
 
@@ -878,6 +1287,7 @@ def mercado_lateral(
     )
 
     if distancia_5_21 < 0.00025:
+
         return True
 
     if atr14:
@@ -889,6 +1299,7 @@ def mercado_lateral(
         )
 
         if atr_ratio < 0.00008:
+
             return True
 
     return False
@@ -1015,10 +1426,6 @@ def analisar_pullback(
 
     # ========================================================
     # PULLBACK
-    #
-    # SOMENTE -2 E -3.
-    #
-    # A vela -1 NÃO pode ser pullback.
     # ========================================================
 
     pullback_call = (
@@ -1250,13 +1657,15 @@ def analisar_pullback(
         )
 
         if atr_ratio < 0.00008:
+
             atr_ok = False
 
         if atr_ratio > 0.0035:
+
             atr_ok = False
 
     # ========================================================
-    # MERCADO LATERAL
+    # LATERAL
     # ========================================================
 
     lateral = mercado_lateral(
@@ -1275,39 +1684,51 @@ def analisar_pullback(
     score_put = 0
 
     if tendencia_5m == "ALTA":
+
         score_call += 3
 
     if tendencia_5m == "BAIXA":
+
         score_put += 3
 
     if tendencia_15m == "ALTA":
+
         score_call += 2
 
     if tendencia_15m == "BAIXA":
+
         score_put += 2
 
     if pullback_call:
+
         score_call += 2
 
     if pullback_put:
+
         score_put += 2
 
     if confirmacao_call:
+
         score_call += 2
 
     if confirmacao_put:
+
         score_put += 2
 
     if rsi_call_ok:
+
         score_call += 1
 
     if rsi_put_ok:
+
         score_put += 1
 
     if contexto_call:
+
         score_call += 1
 
     if contexto_put:
+
         score_put += 1
 
     if confirmacao["body_ratio"] >= 0.25:
@@ -1592,10 +2013,15 @@ def calcular_estatisticas():
     )
 
     return {
+
         "total": total,
+
         "wins": wins,
+
         "losses": losses,
+
         "dojis": dojis,
+
         "taxa": round(
             taxa,
             2
@@ -1613,7 +2039,9 @@ def atualizar_estatisticas_todos():
 
             estados_ativos[chave][
                 "estatisticas"
-            ] = dict(estatisticas)
+            ] = dict(
+                estatisticas
+            )
 
     return estatisticas
 
@@ -1956,6 +2384,7 @@ def avaliar_operacao(
     )
 
     if not operacao:
+
         return
 
     agora = agora_brt()
@@ -1969,6 +2398,7 @@ def avaliar_operacao(
         dt = candle["_dt"]
 
         if dt != alvo_dt:
+
             continue
 
         if (
@@ -1986,6 +2416,7 @@ def avaliar_operacao(
         )
 
         entrada = info["open"]
+
         saida = info["close"]
 
         operacao[
@@ -1999,23 +2430,29 @@ def avaliar_operacao(
         if operacao["sinal"] == "CALL":
 
             if saida > entrada:
+
                 resultado = "WIN"
 
             elif saida < entrada:
+
                 resultado = "LOSS"
 
             else:
+
                 resultado = "DOJI"
 
         else:
 
             if saida < entrada:
+
                 resultado = "WIN"
 
             elif saida > entrada:
+
                 resultado = "LOSS"
 
             else:
+
                 resultado = "DOJI"
 
         operacao[
@@ -2073,12 +2510,15 @@ def enviar_resultado_telegram(
     ]
 
     if resultado == "WIN":
+
         emoji = "✅"
 
     elif resultado == "LOSS":
+
         emoji = "❌"
 
     else:
+
         emoji = "➖"
 
     def fmt(valor):
@@ -2178,8 +2618,7 @@ def processar_ativo(
         )
 
         # ====================================================
-        # PRIMEIRO:
-        # VERIFICAR RESULTADO DE OPERAÇÃO ANTERIOR
+        # RESULTADO DE OPERAÇÃO ANTERIOR
         # ====================================================
 
         avaliar_operacao(
@@ -2231,7 +2670,7 @@ def processar_ativo(
             return
 
         # ====================================================
-        # VELAS FECHADAS
+        # VELAS FECHADAS 5M
         # ====================================================
 
         fechadas_5m = (
@@ -2249,17 +2688,23 @@ def processar_ativo(
 
             atualizar_estado_ativo(
                 chave,
+
                 ativo=symbol,
+
                 sinal="AGUARDAR",
+
                 score=0,
+
                 atualidade_min=(
                     f"{idade:.1f} min"
                 ),
+
                 atualizado=(
                     agora_brt().strftime(
                         "%H:%M:%S BRT"
                     )
                 ),
+
                 mensagem="Poucas velas 5M.",
             )
 
@@ -2296,17 +2741,23 @@ def processar_ativo(
 
             atualizar_estado_ativo(
                 chave,
+
                 ativo=symbol,
+
                 sinal="AGUARDAR",
+
                 score=0,
+
                 atualidade_min=(
                     f"{idade:.1f} min"
                 ),
+
                 atualizado=(
                     agora_brt().strftime(
                         "%H:%M:%S BRT"
                     )
                 ),
+
                 mensagem="Poucas velas 15M.",
             )
 
@@ -2324,7 +2775,7 @@ def processar_ativo(
         )
 
         # ====================================================
-        # ATUALIZAR INTERFACE DESTE ATIVO
+        # ATUALIZAR INTERFACE
         # ====================================================
 
         preco = resultado.get(
@@ -2556,9 +3007,6 @@ def processar_ativo(
             f"ERRO em {symbol}: {e}"
         )
 
-        # O erro fica SOMENTE no cartão deste ativo.
-        # Não apaga os outros três ativos.
-
         atualizar_estado_ativo(
             chave,
 
@@ -2687,8 +3135,10 @@ def executar_leitura():
 
         return
 
-    # Cada ativo é processado separadamente.
-    # O resultado de um nunca substitui o outro.
+    # ========================================================
+    # PROCESSAR ATIVOS
+    # ========================================================
+
     for chave, symbol in ATIVOS.items():
 
         processar_ativo(
@@ -2818,11 +3268,13 @@ def garantir_robo_iniciado():
     global _robo_started
 
     if _robo_started:
+
         return
 
     with _robo_lock:
 
         if _robo_started:
+
             return
 
         _robo_started = True
@@ -3069,6 +3521,7 @@ h1 {
         grid-template-columns:
         repeat(2, 1fr);
     }
+
 }
 
 </style>
@@ -3089,11 +3542,6 @@ Robo Forex Pullback PRO
 Confirmação + RSI + ATR
 
 </div>
-
-
-<!-- ======================================================
-     QUATRO ATIVOS
-     ====================================================== -->
 
 <div class="grade-ativos">
 
@@ -3317,11 +3765,6 @@ Filtros da entrada
 
 </div>
 
-
-<!-- ======================================================
-     ESTATÍSTICAS GERAIS
-     ====================================================== -->
-
 {% set estat = estados_ativos["EURUSD"].estatisticas %}
 
 <div class="card">
@@ -3392,7 +3835,6 @@ Taxa de acerto
 
 </div>
 
-
 <div class="card">
 
 <div class="observacao">
@@ -3444,7 +3886,6 @@ suficiente de operações.
 
 </div>
 
-
 <div class="atualizacao">
 
 Página atualiza automaticamente
@@ -3453,7 +3894,6 @@ a cada 10 segundos.
 </div>
 
 </div>
-
 
 <script>
 
@@ -3501,7 +3941,8 @@ def dados():
 
     return jsonify({
 
-        "ativos": obter_estado_para_json(),
+        "ativos":
+            obter_estado_para_json(),
 
         "estatisticas":
             calcular_estatisticas(),
@@ -3510,7 +3951,9 @@ def dados():
             telegram_configurado(),
 
         "operacoes_pendentes":
-            len(_operacoes_pendentes),
+            len(
+                _operacoes_pendentes
+            ),
 
         "horario_brt":
             agora_brt().strftime(
@@ -3546,7 +3989,9 @@ def health():
             telegram_configurado(),
 
         "ativos":
-            list(ATIVOS.values()),
+            list(
+                ATIVOS.values()
+            ),
 
         "operacoes_pendentes":
             len(
@@ -3555,6 +4000,21 @@ def health():
 
         "estatisticas":
             calcular_estatisticas(),
+
+        "controle_api":
+            {
+                "intervalo_minimo_segundos":
+                    API_INTERVALO_MINIMO,
+
+                "cache_5m_segundos":
+                    CACHE_5M_SEGUNDOS,
+
+                "cache_15m_segundos":
+                    CACHE_15M_SEGUNDOS,
+
+                "max_tentativas_429":
+                    API_MAX_TENTATIVAS_429,
+            },
     })
 
 
@@ -3580,3 +4040,4 @@ if __name__ == "__main__":
 
         debug=False,
     )
+```
