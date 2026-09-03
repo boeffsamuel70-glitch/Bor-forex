@@ -46,13 +46,6 @@ ATIVOS = {
     "GBPUSD": "GBP/USD",
     "USDJPY": "USD/JPY",
     "GBPJPY": "GBP/JPY",
-
-    # NOVOS PARES
-    "USDCAD": "USD/CAD",
-    "EURGBP": "EUR/GBP",
-    "AUDUSD": "AUD/USD",
-    "AUDJPY": "AUD/JPY",
-    "AUDCAD": "AUD/CAD",
 }
 
 # ============================================================
@@ -100,10 +93,26 @@ _robo_started = False
 # CONTROLE DE SINAIS
 # ============================================================
 
+# Evita mandar duas vezes o mesmo sinal.
 _ultimos_sinais_telegram = {}
 
+# Guarda operações aguardando resultado.
+#
+# Exemplo:
+# {
+#   "EUR/USD": {
+#       "id": "...",
+#       "sinal": "CALL",
+#       "entrada": 1.16000,
+#       "vela_sinal": datetime,
+#       "vela_expiracao": datetime
+#   }
+# }
+#
+# Pode existir no máximo uma operação pendente por ativo.
 _operacoes_pendentes = {}
 
+# Resultados da sessão.
 _historico_resultados = []
 
 # ============================================================
@@ -825,6 +834,8 @@ def mercado_lateral(
         preco
     )
 
+    # Se as EMAs estiverem muito próximas,
+    # a tendência é considerada fraca.
     if distancia_5_21 < 0.00025:
         return True
 
@@ -906,6 +917,10 @@ def analisar_pullback(
             "score_put": 0,
         }
 
+    # ========================================================
+    # VALORES
+    # ========================================================
+
     c = closes(
         candles_5m
     )
@@ -949,6 +964,10 @@ def analisar_pullback(
         )
     )
 
+    # ========================================================
+    # VELAS
+    # ========================================================
+
     confirmacao = candle_info(
         candles_5m[-1]
     )
@@ -960,6 +979,14 @@ def analisar_pullback(
     pullback_2 = candle_info(
         candles_5m[-3]
     )
+
+    # ========================================================
+    # PULLBACK
+    #
+    # SOMENTE -2 E -3.
+    #
+    # A vela -1 NÃO pode ser pullback.
+    # ========================================================
 
     pullback_call = (
         pullback_call_na_vela(
@@ -989,6 +1016,10 @@ def analisar_pullback(
         )
     )
 
+    # ========================================================
+    # CONFIRMAÇÃO CALL
+    # ========================================================
+
     confirmacao_call = False
 
     if (
@@ -998,20 +1029,26 @@ def analisar_pullback(
     ):
 
         rejeicao_inferior = (
+
             confirmacao["lower_wick"]
             >=
             confirmacao["body"] * 0.40
+
             and
+
             confirmacao["lower_wick"]
             >
             confirmacao["upper_wick"]
         )
 
         fechamento_forte = (
+
             confirmacao["body_ratio"]
             >=
             0.45
+
             and
+
             (
                 (
                     confirmacao["high"]
@@ -1043,6 +1080,10 @@ def analisar_pullback(
 
             confirmacao_call = True
 
+    # ========================================================
+    # CONFIRMAÇÃO PUT
+    # ========================================================
+
     confirmacao_put = False
 
     if (
@@ -1052,20 +1093,26 @@ def analisar_pullback(
     ):
 
         rejeicao_superior = (
+
             confirmacao["upper_wick"]
             >=
             confirmacao["body"] * 0.40
+
             and
+
             confirmacao["upper_wick"]
             >
             confirmacao["lower_wick"]
         )
 
         fechamento_forte = (
+
             confirmacao["body_ratio"]
             >=
             0.45
+
             and
+
             (
                 (
                     confirmacao["close"]
@@ -1097,6 +1144,10 @@ def analisar_pullback(
 
             confirmacao_put = True
 
+    # ========================================================
+    # CONTEXTO
+    # ========================================================
+
     movimento_4 = (
         c[-1]
         -
@@ -1121,6 +1172,10 @@ def analisar_pullback(
         movimento_8 < 0
     )
 
+    # ========================================================
+    # RSI
+    # ========================================================
+
     rsi_call_ok = (
         rsi14 is not None
         and
@@ -1143,6 +1198,10 @@ def analisar_pullback(
         )
     )
 
+    # ========================================================
+    # ATR
+    # ========================================================
+
     atr_ok = True
 
     if (
@@ -1163,6 +1222,10 @@ def analisar_pullback(
         if atr_ratio > 0.0035:
             atr_ok = False
 
+    # ========================================================
+    # MERCADO LATERAL
+    # ========================================================
+
     lateral = mercado_lateral(
         preco,
         ema5,
@@ -1171,45 +1234,56 @@ def analisar_pullback(
         atr14
     )
 
+    # ========================================================
+    # SCORE
+    # ========================================================
+
     score_call = 0
     score_put = 0
 
+    # Tendência 5M
     if tendencia_5m == "ALTA":
         score_call += 3
 
     if tendencia_5m == "BAIXA":
         score_put += 3
 
+    # Tendência 15M
     if tendencia_15m == "ALTA":
         score_call += 2
 
     if tendencia_15m == "BAIXA":
         score_put += 2
 
+    # Pullback
     if pullback_call:
         score_call += 2
 
     if pullback_put:
         score_put += 2
 
+    # Confirmação
     if confirmacao_call:
         score_call += 2
 
     if confirmacao_put:
         score_put += 2
 
+    # RSI
     if rsi_call_ok:
         score_call += 1
 
     if rsi_put_ok:
         score_put += 1
 
+    # Contexto
     if contexto_call:
         score_call += 1
 
     if contexto_put:
         score_put += 1
 
+    # Corpo da confirmação
     if confirmacao["body_ratio"] >= 0.25:
 
         if (
@@ -1227,6 +1301,10 @@ def analisar_pullback(
         ):
 
             score_put += 1
+
+    # ========================================================
+    # REGRAS FINAIS
+    # ========================================================
 
     sinal = "AGUARDAR"
 
@@ -1259,6 +1337,8 @@ def analisar_pullback(
 
     elif tendencia_5m == "ALTA":
 
+        # Exige também confirmação
+        # do 15M.
         if tendencia_15m != "ALTA":
 
             bloqueio = (
@@ -1303,8 +1383,14 @@ def analisar_pullback(
 
             sinal = "PUT"
 
+    # ========================================================
+    # DETALHES
+    # ========================================================
+
     detalhes_pullback = (
+
         "CONFIRMADO EM VELA ANTERIOR"
+
         if (
             (
                 pullback_call
@@ -1318,12 +1404,16 @@ def analisar_pullback(
                 tendencia_5m == "BAIXA"
             )
         )
+
         else
+
         "NAO"
     )
 
     detalhes_confirmacao = (
+
         "CONFIRMADA"
+
         if (
             (
                 confirmacao_call
@@ -1337,9 +1427,15 @@ def analisar_pullback(
                 tendencia_5m == "BAIXA"
             )
         )
+
         else
+
         "NAO"
     )
+
+    # ========================================================
+    # MENSAGEM
+    # ========================================================
 
     if sinal == "CALL":
 
@@ -1732,6 +1828,13 @@ def registrar_operacao(
 
         return
 
+    # A entrada é na abertura
+    # da próxima vela de 5 minutos.
+    #
+    # Como a vela de sinal acabou
+    # de fechar, a próxima vela começa
+    # imediatamente depois dela.
+
     vela_entrada = (
         vela_sinal
         +
@@ -1825,6 +1928,19 @@ def avaliar_operacao(
 
     agora = agora_brt()
 
+    # A operação só pode ser avaliada
+    # depois do fechamento da vela de entrada.
+    #
+    # Exemplo:
+    #
+    # 10:55 vela de sinal fecha
+    # 11:00 começa entrada
+    # 11:05 fecha entrada
+    #
+    # Comparação:
+    # preço de abertura da vela 11:00
+    # contra fechamento da vela 11:00.
+
     alvo_dt = operacao[
         "vela_expiracao"
     ]
@@ -1836,6 +1952,7 @@ def avaliar_operacao(
         if dt != alvo_dt:
             continue
 
+        # Garantir que a vela já fechou.
         if (
             dt
             +
@@ -1864,19 +1981,29 @@ def avaliar_operacao(
         if operacao["sinal"] == "CALL":
 
             if saida > entrada:
+
                 resultado = "WIN"
+
             elif saida < entrada:
+
                 resultado = "LOSS"
+
             else:
+
                 resultado = "DOJI"
 
         else:
 
             if saida < entrada:
+
                 resultado = "WIN"
+
             elif saida > entrada:
+
                 resultado = "LOSS"
+
             else:
+
                 resultado = "DOJI"
 
         operacao[
@@ -1932,10 +2059,15 @@ def enviar_resultado_telegram(
     ]
 
     if resultado == "WIN":
+
         emoji = "✅"
+
     elif resultado == "LOSS":
+
         emoji = "❌"
+
     else:
+
         emoji = "➖"
 
     def fmt(valor):
@@ -2034,38 +2166,60 @@ def processar_ativo(
             f"{idade:.2f} min"
         )
 
+        # ====================================================
+        # PRIMEIRO:
+        # VERIFICAR RESULTADO DE OPERAÇÃO ANTERIOR
+        # ====================================================
+
         avaliar_operacao(
             symbol,
             candles_5m
         )
 
+        # ====================================================
+        # DADOS ATRASADOS
+        # ====================================================
+
         if idade > MAX_ATRASO_MINUTOS:
 
             estado["ativo"] = symbol
-            estado["sinal"] = "AGUARDAR"
+
+            estado["sinal"] = (
+                "AGUARDAR"
+            )
+
             estado["score"] = 0
+
             estado["preco"] = (
                 f"{float(ultimo_raw['close']):.5f}"
             )
+
             estado["vela"] = (
                 ultimo_raw["_dt"].strftime(
                     "%Y-%m-%d %H:%M:%S BRT"
                 )
             )
+
             estado["atualidade_min"] = (
                 f"{idade:.1f} min"
             )
+
             estado["atualizado"] = (
                 agora_brt().strftime(
                     "%H:%M:%S BRT"
                 )
             )
+
             estado["mensagem"] = (
                 f"Dado atrasado "
                 f"({idade:.1f} min)."
             )
 
             return
+
+        # ====================================================
+        # VELAS FECHADAS
+        # ====================================================
 
         fechadas_5m = (
             somente_velas_fechadas(
@@ -2081,6 +2235,10 @@ def processar_ativo(
             )
 
             return
+
+        # ====================================================
+        # 15M
+        # ====================================================
 
         log(
             f"Consultando 15M: {symbol}"
@@ -2109,25 +2267,44 @@ def processar_ativo(
 
             return
 
+        # ====================================================
+        # ANALISAR
+        # ====================================================
+
         resultado = analisar_pullback(
+
             fechadas_5m,
+
             fechadas_15m
         )
 
+        # ====================================================
+        # ATUALIZAR INTERFACE
+        # ====================================================
+
         estado["ativo"] = symbol
-        estado["sinal"] = resultado["sinal"]
-        estado["score"] = resultado["score"]
+
+        estado["sinal"] = (
+            resultado["sinal"]
+        )
+
+        estado["score"] = (
+            resultado["score"]
+        )
 
         preco = resultado.get(
             "preco"
         )
 
         estado["preco"] = (
+
             f"{preco:.5f}"
+
             if isinstance(
                 preco,
                 (float, int)
             )
+
             else "-"
         )
 
@@ -2136,13 +2313,16 @@ def processar_ativo(
         )
 
         estado["vela"] = (
+
             vela.strftime(
                 "%Y-%m-%d %H:%M:%S BRT"
             )
+
             if isinstance(
                 vela,
                 datetime
             )
+
             else "-"
         )
 
@@ -2178,38 +2358,50 @@ def processar_ativo(
                 ),
 
             "rsi": (
+
                 f"{resultado['rsi']:.2f}"
+
                 if isinstance(
                     resultado.get("rsi"),
                     (float, int)
                 )
+
                 else "-"
             ),
 
             "ema5": (
+
                 f"{resultado['ema5']:.5f}"
+
                 if isinstance(
                     resultado.get("ema5"),
                     (float, int)
                 )
+
                 else "-"
             ),
 
             "ema13": (
+
                 f"{resultado['ema13']:.5f}"
+
                 if isinstance(
                     resultado.get("ema13"),
                     (float, int)
                 )
+
                 else "-"
             ),
 
             "ema21": (
+
                 f"{resultado['ema21']:.5f}"
+
                 if isinstance(
                     resultado.get("ema21"),
                     (float, int)
                 )
+
                 else "-"
             ),
 
@@ -2244,37 +2436,58 @@ def processar_ativo(
                 ),
 
             "atr": (
+
                 f"{resultado['atr']:.6f}"
+
                 if isinstance(
                     resultado.get("atr"),
                     (float, int)
                 )
+
                 else "-"
             ),
         }
 
+        # ====================================================
+        # LOG
+        # ====================================================
+
         log(
+
             f"{symbol} -> "
             f"{resultado['sinal']} | "
+
             f"score="
             f"{resultado['score']} | "
+
             f"CALL="
             f"{resultado.get('score_call', 0)} | "
+
             f"PUT="
             f"{resultado.get('score_put', 0)} | "
+
             f"5M="
             f"{resultado.get('tendencia_5m', '-')} | "
+
             f"15M="
             f"{resultado.get('tendencia_15m', '-')} | "
+
             f"pullback="
             f"{resultado.get('pullback', '-')} | "
+
             f"confirmacao="
             f"{resultado.get('rejeicao', '-')} | "
+
             f"lateral="
             f"{resultado.get('lateral', '-')} | "
+
             f"preco="
             f"{estado['preco']}"
         )
+
+        # ====================================================
+        # NOVO SINAL
+        # ====================================================
 
         if resultado["sinal"] in (
             "CALL",
@@ -2292,6 +2505,10 @@ def processar_ativo(
                 fechadas_5m
             )
 
+        # ====================================================
+        # ESTATÍSTICAS
+        # ====================================================
+
         estado[
             "estatisticas"
         ] = calcular_estatisticas()
@@ -2303,9 +2520,15 @@ def processar_ativo(
         )
 
         estado["ativo"] = symbol
-        estado["sinal"] = "AGUARDAR"
+
+        estado["sinal"] = (
+            "AGUARDAR"
+        )
+
         estado["score"] = 0
+
         estado["preco"] = "-"
+
         estado["vela"] = "-"
 
         estado["atualizado"] = (
@@ -2315,6 +2538,7 @@ def processar_ativo(
         )
 
         estado["atualidade_min"] = "-"
+
         estado["mensagem"] = (
             f"Erro: {e}"
         )
@@ -2365,7 +2589,9 @@ def executar_leitura():
             "nao configurada."
         )
 
-        estado["sinal"] = "AGUARDAR"
+        estado["sinal"] = (
+            "AGUARDAR"
+        )
 
         estado["mensagem"] = (
             "Configure "
@@ -2383,7 +2609,9 @@ def executar_leitura():
             "Fora do horario configurado."
         )
 
-        estado["sinal"] = "AGUARDAR"
+        estado["sinal"] = (
+            "AGUARDAR"
+        )
 
         estado["mensagem"] = (
             "Fora do horario configurado."
@@ -2446,25 +2674,33 @@ def esperar_ate_proxima_leitura():
             +
             timedelta(hours=1)
         ).replace(
+
             minute=0,
+
             second=5,
+
             microsecond=0,
         )
 
     else:
 
         proxima = agora.replace(
+
             minute=proximo_bloco,
+
             second=5,
+
             microsecond=0,
         )
 
     segundos = max(
+
         (
             proxima
             -
             agora
         ).total_seconds(),
+
         1
     )
 
@@ -2528,8 +2764,11 @@ def garantir_robo_iniciado():
         _robo_started = True
 
         thread = threading.Thread(
+
             target=loop_robo,
+
             daemon=True,
+
             name="robo-forex",
         )
 
@@ -2550,113 +2789,171 @@ def iniciar_robo():
 # INTERFACE HTML
 # ============================================================
 
+
 HTML = """
 <!DOCTYPE html>
+
 <html lang="pt-BR">
+
 <head>
+
 <meta charset="UTF-8">
+
 <meta name="viewport"
 content="width=device-width,
 initial-scale=1.0">
+
 <title>
 Robo Forex Pullback PRO
 </title>
 
 <style>
+
 body {
+
     font-family: Arial, sans-serif;
+
     background: #111;
+
     color: white;
+
     margin: 0;
+
     padding: 20px;
 }
 
 .container {
+
     max-width: 750px;
+
     margin: auto;
 }
 
 h1 {
+
     text-align: center;
+
     margin-bottom: 5px;
 }
 
 .subtitulo {
+
     text-align: center;
+
     color: #aaa;
+
     margin-bottom: 20px;
 }
 
 .card {
+
     background: #1d1d1d;
+
     border-radius: 15px;
+
     padding: 20px;
+
     margin-bottom: 15px;
+
     box-shadow:
     0 4px 15px
     rgba(0,0,0,.25);
 }
 
 .sinal {
+
     font-size: 42px;
+
     font-weight: bold;
+
     text-align: center;
+
     margin: 15px 0;
 }
 
 .linha {
+
     display: flex;
-    justify-content: space-between;
+
+    justify-content:
+    space-between;
+
     gap: 10px;
+
     padding: 8px 0;
+
     border-bottom:
     1px solid #333;
 }
 
 .linha:last-child {
+
     border-bottom: none;
 }
 
 .valor {
+
     font-weight: bold;
+
     text-align: right;
 }
 
 .estatisticas {
+
     display: grid;
+
     grid-template-columns:
     repeat(2, 1fr);
+
     gap: 10px;
+
     margin-top: 10px;
 }
 
 .box {
+
     background: #292929;
+
     border-radius: 10px;
+
     padding: 15px;
+
     text-align: center;
 }
 
 .numero {
+
     font-size: 25px;
+
     font-weight: bold;
+
     margin-top: 5px;
 }
 
 .observacao {
+
     text-align: center;
+
     color: #bbb;
+
     font-size: 14px;
+
     line-height: 1.5;
 }
 
 .atualizacao {
+
     text-align: center;
+
     color: #888;
+
     font-size: 13px;
+
     margin-top: 15px;
 }
+
 </style>
+
 </head>
 
 <body>
@@ -2668,59 +2965,83 @@ Robo Forex Pullback PRO
 </h1>
 
 <div class="subtitulo">
+
 5M + 15M + Pullback +
 Confirmação + RSI + ATR
+
 </div>
+
 
 <div class="card">
 
 <div class="linha">
+
 <span>Ativo</span>
+
 <span class="valor">
 {{ estado.ativo }}
 </span>
+
 </div>
 
 <div class="sinal">
+
 {{ estado.sinal }}
+
 </div>
 
 <div class="linha">
+
 <span>Score</span>
+
 <span class="valor">
 {{ estado.score }}
 </span>
+
 </div>
 
 <div class="linha">
+
 <span>Preço</span>
+
 <span class="valor">
 {{ estado.preco }}
 </span>
+
 </div>
 
 <div class="linha">
+
 <span>Vela analisada</span>
+
 <span class="valor">
 {{ estado.vela }}
 </span>
+
 </div>
 
 <div class="linha">
+
 <span>Idade do dado</span>
+
 <span class="valor">
 {{ estado.atualidade_min }}
 </span>
+
 </div>
 
 <div class="linha">
+
 <span>Atualizado</span>
+
 <span class="valor">
 {{ estado.atualizado }}
 </span>
+
 </div>
 
 </div>
+
 
 <div class="card">
 
@@ -2729,90 +3050,127 @@ Filtros da entrada
 </h3>
 
 <div class="linha">
+
 <span>Tendência 5M</span>
+
 <span class="valor">
 {{ estado.detalhes.tendencia_5m }}
 </span>
+
 </div>
 
 <div class="linha">
+
 <span>Tendência 15M</span>
+
 <span class="valor">
 {{ estado.detalhes.tendencia_15m }}
 </span>
+
 </div>
 
 <div class="linha">
+
 <span>Pullback</span>
+
 <span class="valor">
 {{ estado.detalhes.pullback }}
 </span>
+
 </div>
 
 <div class="linha">
+
 <span>Confirmação</span>
+
 <span class="valor">
 {{ estado.detalhes.confirmacao }}
 </span>
+
 </div>
 
 <div class="linha">
+
 <span>Mercado lateral</span>
+
 <span class="valor">
 {{ estado.detalhes.lateral }}
 </span>
+
 </div>
 
 <div class="linha">
+
 <span>Score CALL</span>
+
 <span class="valor">
 {{ estado.detalhes.score_call }}
 </span>
+
 </div>
 
 <div class="linha">
+
 <span>Score PUT</span>
+
 <span class="valor">
 {{ estado.detalhes.score_put }}
 </span>
+
 </div>
 
 <div class="linha">
+
 <span>RSI 14</span>
+
 <span class="valor">
 {{ estado.detalhes.rsi }}
 </span>
+
 </div>
 
 <div class="linha">
+
 <span>EMA 5</span>
+
 <span class="valor">
 {{ estado.detalhes.ema5 }}
 </span>
+
 </div>
 
 <div class="linha">
+
 <span>EMA 13</span>
+
 <span class="valor">
 {{ estado.detalhes.ema13 }}
 </span>
+
 </div>
 
 <div class="linha">
+
 <span>EMA 21</span>
+
 <span class="valor">
 {{ estado.detalhes.ema21 }}
 </span>
+
 </div>
 
 <div class="linha">
+
 <span>ATR 14</span>
+
 <span class="valor">
 {{ estado.detalhes.atr }}
 </span>
+
 </div>
 
 </div>
+
 
 <div class="card">
 
@@ -2823,31 +3181,43 @@ Estatísticas
 <div class="estatisticas">
 
 <div class="box">
+
 Total
+
 <div class="numero">
 {{ estado.estatisticas.total }}
 </div>
+
 </div>
 
 <div class="box">
+
 WIN
+
 <div class="numero">
 {{ estado.estatisticas.wins }}
 </div>
+
 </div>
 
 <div class="box">
+
 LOSS
+
 <div class="numero">
 {{ estado.estatisticas.losses }}
 </div>
+
 </div>
 
 <div class="box">
+
 DOJI
+
 <div class="numero">
 {{ estado.estatisticas.dojis }}
 </div>
+
 </div>
 
 </div>
@@ -2855,15 +3225,21 @@ DOJI
 <br>
 
 <div class="linha">
+
 <span>
 Taxa de acerto
 </span>
+
 <span class="valor">
+
 {{ estado.estatisticas.taxa }}%
+
 </span>
+
 </div>
 
 </div>
+
 
 <div class="card">
 
@@ -2920,20 +3296,29 @@ suficiente de operações.
 
 </div>
 
+
 <div class="atualizacao">
+
 Página atualiza automaticamente
 a cada 10 segundos.
+
 </div>
 
 </div>
+
 
 <script>
+
 setTimeout(function() {
+
     location.reload();
+
 }, 10000);
+
 </script>
 
 </body>
+
 </html>
 """
 
@@ -3018,12 +3403,15 @@ if __name__ == "__main__":
     garantir_robo_iniciado()
 
     app.run(
+
         host="0.0.0.0",
+
         port=int(
             os.getenv(
                 "PORT",
                 "10000"
             )
         ),
+
         debug=False,
     )
