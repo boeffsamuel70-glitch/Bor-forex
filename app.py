@@ -49,42 +49,60 @@ ATIVOS = {
 }
 
 # ============================================================
-# ESTADO
+# ESTADO POR ATIVO
+#
+# IMPORTANTE:
+# Antes existia somente um "estado" global. Assim, cada ativo
+# sobrescrevia o anterior e a interface terminava mostrando
+# somente o último ativo processado.
+#
+# Agora cada ativo possui seu próprio estado independente.
 # ============================================================
 
-estado = {
-    "ativo": "-",
-    "sinal": "AGUARDAR",
-    "score": 0,
-    "preco": "-",
-    "vela": "-",
-    "atualizado": "-",
-    "atualidade_min": "-",
-    "mensagem": "Aguardando primeira leitura.",
 
-    "detalhes": {
-        "score_call": "-",
-        "score_put": "-",
-        "rsi": "-",
-        "ema5": "-",
-        "ema13": "-",
-        "ema21": "-",
-        "tendencia_5m": "-",
-        "tendencia_15m": "-",
-        "pullback": "-",
-        "confirmacao": "-",
-        "lateral": "-",
-        "atr": "-",
-    },
+def novo_estado_ativo():
 
-    "estatisticas": {
-        "total": 0,
-        "wins": 0,
-        "losses": 0,
-        "dojis": 0,
-        "taxa": 0.0,
-    },
+    return {
+        "ativo": "-",
+        "sinal": "AGUARDAR",
+        "score": 0,
+        "preco": "-",
+        "vela": "-",
+        "atualizado": "-",
+        "atualidade_min": "-",
+        "mensagem": "Aguardando primeira leitura.",
+
+        "detalhes": {
+            "score_call": "-",
+            "score_put": "-",
+            "rsi": "-",
+            "ema5": "-",
+            "ema13": "-",
+            "ema21": "-",
+            "tendencia_5m": "-",
+            "tendencia_15m": "-",
+            "pullback": "-",
+            "confirmacao": "-",
+            "lateral": "-",
+            "atr": "-",
+        },
+
+        "estatisticas": {
+            "total": 0,
+            "wins": 0,
+            "losses": 0,
+            "dojis": 0,
+            "taxa": 0.0,
+        },
+    }
+
+
+estados_ativos = {
+    chave: novo_estado_ativo()
+    for chave in ATIVOS
 }
+
+_estado_lock = threading.Lock()
 
 _robo_lock = threading.Lock()
 _robo_started = False
@@ -98,17 +116,6 @@ _ultimos_sinais_telegram = {}
 
 # Guarda operações aguardando resultado.
 #
-# Exemplo:
-# {
-#   "EUR/USD": {
-#       "id": "...",
-#       "sinal": "CALL",
-#       "entrada": 1.16000,
-#       "vela_sinal": datetime,
-#       "vela_expiracao": datetime
-#   }
-# }
-#
 # Pode existir no máximo uma operação pendente por ativo.
 _operacoes_pendentes = {}
 
@@ -121,6 +128,7 @@ _historico_resultados = []
 
 
 def log(msg):
+
     agora = datetime.now(TZ).strftime(
         "%Y-%m-%d %H:%M:%S"
     )
@@ -132,7 +140,42 @@ def log(msg):
 
 
 def agora_brt():
+
     return datetime.now(TZ)
+
+
+def atualizar_estado_ativo(
+    chave,
+    **alteracoes
+):
+
+    with _estado_lock:
+
+        estado_ativo = estados_ativos[chave]
+
+        for campo, valor in alteracoes.items():
+            estado_ativo[campo] = valor
+
+
+def obter_estado_para_json():
+
+    with _estado_lock:
+
+        resultado = {}
+
+        for chave, estado_ativo in estados_ativos.items():
+
+            resultado[chave] = {
+                **estado_ativo,
+                "detalhes": dict(
+                    estado_ativo["detalhes"]
+                ),
+                "estatisticas": dict(
+                    estado_ativo["estatisticas"]
+                ),
+            }
+
+        return resultado
 
 
 def parse_datetime_candle(txt):
@@ -834,8 +877,6 @@ def mercado_lateral(
         preco
     )
 
-    # Se as EMAs estiverem muito próximas,
-    # a tendência é considerada fraca.
     if distancia_5_21 < 0.00025:
         return True
 
@@ -917,10 +958,6 @@ def analisar_pullback(
             "score_put": 0,
         }
 
-    # ========================================================
-    # VALORES
-    # ========================================================
-
     c = closes(
         candles_5m
     )
@@ -963,10 +1000,6 @@ def analisar_pullback(
             candles_15m
         )
     )
-
-    # ========================================================
-    # VELAS
-    # ========================================================
 
     confirmacao = candle_info(
         candles_5m[-1]
@@ -1241,49 +1274,42 @@ def analisar_pullback(
     score_call = 0
     score_put = 0
 
-    # Tendência 5M
     if tendencia_5m == "ALTA":
         score_call += 3
 
     if tendencia_5m == "BAIXA":
         score_put += 3
 
-    # Tendência 15M
     if tendencia_15m == "ALTA":
         score_call += 2
 
     if tendencia_15m == "BAIXA":
         score_put += 2
 
-    # Pullback
     if pullback_call:
         score_call += 2
 
     if pullback_put:
         score_put += 2
 
-    # Confirmação
     if confirmacao_call:
         score_call += 2
 
     if confirmacao_put:
         score_put += 2
 
-    # RSI
     if rsi_call_ok:
         score_call += 1
 
     if rsi_put_ok:
         score_put += 1
 
-    # Contexto
     if contexto_call:
         score_call += 1
 
     if contexto_put:
         score_put += 1
 
-    # Corpo da confirmação
     if confirmacao["body_ratio"] >= 0.25:
 
         if (
@@ -1337,8 +1363,6 @@ def analisar_pullback(
 
     elif tendencia_5m == "ALTA":
 
-        # Exige também confirmação
-        # do 15M.
         if tendencia_15m != "ALTA":
 
             bloqueio = (
@@ -1577,6 +1601,21 @@ def calcular_estatisticas():
             2
         ),
     }
+
+
+def atualizar_estatisticas_todos():
+
+    estatisticas = calcular_estatisticas()
+
+    with _estado_lock:
+
+        for chave in estados_ativos:
+
+            estados_ativos[chave][
+                "estatisticas"
+            ] = dict(estatisticas)
+
+    return estatisticas
 
 
 # ============================================================
@@ -1828,13 +1867,6 @@ def registrar_operacao(
 
         return
 
-    # A entrada é na abertura
-    # da próxima vela de 5 minutos.
-    #
-    # Como a vela de sinal acabou
-    # de fechar, a próxima vela começa
-    # imediatamente depois dela.
-
     vela_entrada = (
         vela_sinal
         +
@@ -1928,19 +1960,6 @@ def avaliar_operacao(
 
     agora = agora_brt()
 
-    # A operação só pode ser avaliada
-    # depois do fechamento da vela de entrada.
-    #
-    # Exemplo:
-    #
-    # 10:55 vela de sinal fecha
-    # 11:00 começa entrada
-    # 11:05 fecha entrada
-    #
-    # Comparação:
-    # preço de abertura da vela 11:00
-    # contra fechamento da vela 11:00.
-
     alvo_dt = operacao[
         "vela_expiracao"
     ]
@@ -1952,7 +1971,6 @@ def avaliar_operacao(
         if dt != alvo_dt:
             continue
 
-        # Garantir que a vela já fechou.
         if (
             dt
             +
@@ -1981,29 +1999,23 @@ def avaliar_operacao(
         if operacao["sinal"] == "CALL":
 
             if saida > entrada:
-
                 resultado = "WIN"
 
             elif saida < entrada:
-
                 resultado = "LOSS"
 
             else:
-
                 resultado = "DOJI"
 
         else:
 
             if saida < entrada:
-
                 resultado = "WIN"
 
             elif saida > entrada:
-
                 resultado = "LOSS"
 
             else:
-
                 resultado = "DOJI"
 
         operacao[
@@ -2036,6 +2048,8 @@ def avaliar_operacao(
             f"{estatisticas['taxa']:.2f}%"
         )
 
+        atualizar_estatisticas_todos()
+
         enviar_resultado_telegram(
             operacao,
             estatisticas
@@ -2059,15 +2073,12 @@ def enviar_resultado_telegram(
     ]
 
     if resultado == "WIN":
-
         emoji = "✅"
 
     elif resultado == "LOSS":
-
         emoji = "❌"
 
     else:
-
         emoji = "➖"
 
     def fmt(valor):
@@ -2182,37 +2193,39 @@ def processar_ativo(
 
         if idade > MAX_ATRASO_MINUTOS:
 
-            estado["ativo"] = symbol
+            atualizar_estado_ativo(
+                chave,
 
-            estado["sinal"] = (
-                "AGUARDAR"
-            )
+                ativo=symbol,
 
-            estado["score"] = 0
+                sinal="AGUARDAR",
 
-            estado["preco"] = (
-                f"{float(ultimo_raw['close']):.5f}"
-            )
+                score=0,
 
-            estado["vela"] = (
-                ultimo_raw["_dt"].strftime(
-                    "%Y-%m-%d %H:%M:%S BRT"
-                )
-            )
+                preco=(
+                    f"{float(ultimo_raw['close']):.5f}"
+                ),
 
-            estado["atualidade_min"] = (
-                f"{idade:.1f} min"
-            )
+                vela=(
+                    ultimo_raw["_dt"].strftime(
+                        "%Y-%m-%d %H:%M:%S BRT"
+                    )
+                ),
 
-            estado["atualizado"] = (
-                agora_brt().strftime(
-                    "%H:%M:%S BRT"
-                )
-            )
+                atualidade_min=(
+                    f"{idade:.1f} min"
+                ),
 
-            estado["mensagem"] = (
-                f"Dado atrasado "
-                f"({idade:.1f} min)."
+                atualizado=(
+                    agora_brt().strftime(
+                        "%H:%M:%S BRT"
+                    )
+                ),
+
+                mensagem=(
+                    f"Dado atrasado "
+                    f"({idade:.1f} min)."
+                ),
             )
 
             return
@@ -2232,6 +2245,22 @@ def processar_ativo(
 
             log(
                 f"{symbol}: poucas velas 5M."
+            )
+
+            atualizar_estado_ativo(
+                chave,
+                ativo=symbol,
+                sinal="AGUARDAR",
+                score=0,
+                atualidade_min=(
+                    f"{idade:.1f} min"
+                ),
+                atualizado=(
+                    agora_brt().strftime(
+                        "%H:%M:%S BRT"
+                    )
+                ),
+                mensagem="Poucas velas 5M.",
             )
 
             return
@@ -2265,6 +2294,22 @@ def processar_ativo(
                 f"{symbol}: poucas velas 15M."
             )
 
+            atualizar_estado_ativo(
+                chave,
+                ativo=symbol,
+                sinal="AGUARDAR",
+                score=0,
+                atualidade_min=(
+                    f"{idade:.1f} min"
+                ),
+                atualizado=(
+                    agora_brt().strftime(
+                        "%H:%M:%S BRT"
+                    )
+                ),
+                mensagem="Poucas velas 15M.",
+            )
+
             return
 
         # ====================================================
@@ -2279,71 +2324,18 @@ def processar_ativo(
         )
 
         # ====================================================
-        # ATUALIZAR INTERFACE
+        # ATUALIZAR INTERFACE DESTE ATIVO
         # ====================================================
-
-        estado["ativo"] = symbol
-
-        estado["sinal"] = (
-            resultado["sinal"]
-        )
-
-        estado["score"] = (
-            resultado["score"]
-        )
 
         preco = resultado.get(
             "preco"
-        )
-
-        estado["preco"] = (
-
-            f"{preco:.5f}"
-
-            if isinstance(
-                preco,
-                (float, int)
-            )
-
-            else "-"
         )
 
         vela = resultado.get(
             "vela"
         )
 
-        estado["vela"] = (
-
-            vela.strftime(
-                "%Y-%m-%d %H:%M:%S BRT"
-            )
-
-            if isinstance(
-                vela,
-                datetime
-            )
-
-            else "-"
-        )
-
-        estado["atualizado"] = (
-            agora_brt().strftime(
-                "%H:%M:%S BRT"
-            )
-        )
-
-        estado["atualidade_min"] = (
-            f"{idade:.1f} min"
-        )
-
-        estado["mensagem"] = (
-            resultado.get(
-                "mensagem",
-                ""
-            )
-        )
-
-        estado["detalhes"] = {
+        detalhes = {
 
             "score_call":
                 resultado.get(
@@ -2448,6 +2440,53 @@ def processar_ativo(
             ),
         }
 
+        atualizar_estado_ativo(
+            chave,
+
+            ativo=symbol,
+
+            sinal=resultado["sinal"],
+
+            score=resultado["score"],
+
+            preco=(
+                f"{preco:.5f}"
+                if isinstance(
+                    preco,
+                    (float, int)
+                )
+                else "-"
+            ),
+
+            vela=(
+                vela.strftime(
+                    "%Y-%m-%d %H:%M:%S BRT"
+                )
+                if isinstance(
+                    vela,
+                    datetime
+                )
+                else "-"
+            ),
+
+            atualizado=(
+                agora_brt().strftime(
+                    "%H:%M:%S BRT"
+                )
+            ),
+
+            atualidade_min=(
+                f"{idade:.1f} min"
+            ),
+
+            mensagem=resultado.get(
+                "mensagem",
+                ""
+            ),
+
+            detalhes=detalhes,
+        )
+
         # ====================================================
         # LOG
         # ====================================================
@@ -2482,7 +2521,7 @@ def processar_ativo(
             f"{resultado.get('lateral', '-')} | "
 
             f"preco="
-            f"{estado['preco']}"
+            f"{preco}"
         )
 
         # ====================================================
@@ -2509,9 +2548,7 @@ def processar_ativo(
         # ESTATÍSTICAS
         # ====================================================
 
-        estado[
-            "estatisticas"
-        ] = calcular_estatisticas()
+        atualizar_estatisticas_todos()
 
     except Exception as e:
 
@@ -2519,28 +2556,33 @@ def processar_ativo(
             f"ERRO em {symbol}: {e}"
         )
 
-        estado["ativo"] = symbol
+        # O erro fica SOMENTE no cartão deste ativo.
+        # Não apaga os outros três ativos.
 
-        estado["sinal"] = (
-            "AGUARDAR"
-        )
+        atualizar_estado_ativo(
+            chave,
 
-        estado["score"] = 0
+            ativo=symbol,
 
-        estado["preco"] = "-"
+            sinal="AGUARDAR",
 
-        estado["vela"] = "-"
+            score=0,
 
-        estado["atualizado"] = (
-            agora_brt().strftime(
-                "%H:%M:%S BRT"
-            )
-        )
+            preco="-",
 
-        estado["atualidade_min"] = "-"
+            vela="-",
 
-        estado["mensagem"] = (
-            f"Erro: {e}"
+            atualizado=(
+                agora_brt().strftime(
+                    "%H:%M:%S BRT"
+                )
+            ),
+
+            atualidade_min="-",
+
+            mensagem=(
+                f"Erro: {e}"
+            ),
         )
 
 
@@ -2589,15 +2631,25 @@ def executar_leitura():
             "nao configurada."
         )
 
-        estado["sinal"] = (
-            "AGUARDAR"
-        )
+        with _estado_lock:
 
-        estado["mensagem"] = (
-            "Configure "
-            "TWELVE_DATA_API_KEY "
-            "no Render."
-        )
+            for chave, symbol in ATIVOS.items():
+
+                estados_ativos[chave][
+                    "ativo"
+                ] = symbol
+
+                estados_ativos[chave][
+                    "sinal"
+                ] = "AGUARDAR"
+
+                estados_ativos[chave][
+                    "mensagem"
+                ] = (
+                    "Configure "
+                    "TWELVE_DATA_API_KEY "
+                    "no Render."
+                )
 
         return
 
@@ -2609,22 +2661,34 @@ def executar_leitura():
             "Fora do horario configurado."
         )
 
-        estado["sinal"] = (
-            "AGUARDAR"
-        )
+        with _estado_lock:
 
-        estado["mensagem"] = (
-            "Fora do horario configurado."
-        )
+            for chave, symbol in ATIVOS.items():
 
-        estado["atualizado"] = (
-            agora.strftime(
-                "%H:%M:%S BRT"
-            )
-        )
+                estados_ativos[chave][
+                    "ativo"
+                ] = symbol
+
+                estados_ativos[chave][
+                    "sinal"
+                ] = "AGUARDAR"
+
+                estados_ativos[chave][
+                    "mensagem"
+                ] = (
+                    "Fora do horario configurado."
+                )
+
+                estados_ativos[chave][
+                    "atualizado"
+                ] = agora.strftime(
+                    "%H:%M:%S BRT"
+                )
 
         return
 
+    # Cada ativo é processado separadamente.
+    # O resultado de um nunca substitui o outro.
     for chave, symbol in ATIVOS.items():
 
         processar_ativo(
@@ -2632,9 +2696,9 @@ def executar_leitura():
             symbol
         )
 
-    estado[
-        "estatisticas"
-    ] = calcular_estatisticas()
+    estatisticas = (
+        atualizar_estatisticas_todos()
+    )
 
     log(
         "Leitura concluida."
@@ -2643,13 +2707,13 @@ def executar_leitura():
     log(
         f"Estatisticas: "
         f"WINS="
-        f"{estado['estatisticas']['wins']} | "
+        f"{estatisticas['wins']} | "
         f"LOSS="
-        f"{estado['estatisticas']['losses']} | "
+        f"{estatisticas['losses']} | "
         f"DOJI="
-        f"{estado['estatisticas']['dojis']} | "
+        f"{estatisticas['dojis']} | "
         f"TAXA="
-        f"{estado['estatisticas']['taxa']:.2f}%"
+        f"{estatisticas['taxa']:.2f}%"
     )
 
 
@@ -2789,7 +2853,6 @@ def iniciar_robo():
 # INTERFACE HTML
 # ============================================================
 
-
 HTML = """
 <!DOCTYPE html>
 
@@ -2809,6 +2872,10 @@ Robo Forex Pullback PRO
 
 <style>
 
+* {
+    box-sizing: border-box;
+}
+
 body {
 
     font-family: Arial, sans-serif;
@@ -2824,7 +2891,7 @@ body {
 
 .container {
 
-    max-width: 750px;
+    max-width: 1100px;
 
     margin: auto;
 }
@@ -2845,6 +2912,16 @@ h1 {
     margin-bottom: 20px;
 }
 
+.grade-ativos {
+
+    display: grid;
+
+    grid-template-columns:
+    repeat(2, minmax(0, 1fr));
+
+    gap: 15px;
+}
+
 .card {
 
     background: #1d1d1d;
@@ -2860,15 +2937,31 @@ h1 {
     rgba(0,0,0,.25);
 }
 
-.sinal {
+.card-ativo {
 
-    font-size: 42px;
+    min-width: 0;
+}
+
+.nome-ativo {
+
+    font-size: 25px;
 
     font-weight: bold;
 
     text-align: center;
 
-    margin: 15px 0;
+    margin-bottom: 8px;
+}
+
+.sinal {
+
+    font-size: 38px;
+
+    font-weight: bold;
+
+    text-align: center;
+
+    margin: 12px 0;
 }
 
 .linha {
@@ -2896,6 +2989,18 @@ h1 {
     font-weight: bold;
 
     text-align: right;
+
+    overflow-wrap: anywhere;
+}
+
+.secao {
+
+    margin-top: 18px;
+}
+
+.secao h3 {
+
+    margin-bottom: 8px;
 }
 
 .estatisticas {
@@ -2903,7 +3008,7 @@ h1 {
     display: grid;
 
     grid-template-columns:
-    repeat(2, 1fr);
+    repeat(4, 1fr);
 
     gap: 10px;
 
@@ -2952,6 +3057,20 @@ h1 {
     margin-top: 15px;
 }
 
+@media (max-width: 800px) {
+
+    .grade-ativos {
+
+        grid-template-columns: 1fr;
+    }
+
+    .estatisticas {
+
+        grid-template-columns:
+        repeat(2, 1fr);
+    }
+}
+
 </style>
 
 </head>
@@ -2972,21 +3091,35 @@ Confirmação + RSI + ATR
 </div>
 
 
-<div class="card">
+<!-- ======================================================
+     QUATRO ATIVOS
+     ====================================================== -->
+
+<div class="grade-ativos">
+
+{% for chave, symbol in ativos.items() %}
+
+{% set a = estados_ativos[chave] %}
+
+<div class="card card-ativo">
+
+<div class="nome-ativo">
+{{ symbol }}
+</div>
 
 <div class="linha">
 
 <span>Ativo</span>
 
 <span class="valor">
-{{ estado.ativo }}
+{{ a.ativo }}
 </span>
 
 </div>
 
 <div class="sinal">
 
-{{ estado.sinal }}
+{{ a.sinal }}
 
 </div>
 
@@ -2995,7 +3128,7 @@ Confirmação + RSI + ATR
 <span>Score</span>
 
 <span class="valor">
-{{ estado.score }}
+{{ a.score }}
 </span>
 
 </div>
@@ -3005,7 +3138,7 @@ Confirmação + RSI + ATR
 <span>Preço</span>
 
 <span class="valor">
-{{ estado.preco }}
+{{ a.preco }}
 </span>
 
 </div>
@@ -3015,7 +3148,7 @@ Confirmação + RSI + ATR
 <span>Vela analisada</span>
 
 <span class="valor">
-{{ estado.vela }}
+{{ a.vela }}
 </span>
 
 </div>
@@ -3025,7 +3158,7 @@ Confirmação + RSI + ATR
 <span>Idade do dado</span>
 
 <span class="valor">
-{{ estado.atualidade_min }}
+{{ a.atualidade_min }}
 </span>
 
 </div>
@@ -3035,15 +3168,12 @@ Confirmação + RSI + ATR
 <span>Atualizado</span>
 
 <span class="valor">
-{{ estado.atualizado }}
+{{ a.atualizado }}
 </span>
 
 </div>
 
-</div>
-
-
-<div class="card">
+<div class="secao">
 
 <h3>
 Filtros da entrada
@@ -3054,7 +3184,7 @@ Filtros da entrada
 <span>Tendência 5M</span>
 
 <span class="valor">
-{{ estado.detalhes.tendencia_5m }}
+{{ a.detalhes.tendencia_5m }}
 </span>
 
 </div>
@@ -3064,7 +3194,7 @@ Filtros da entrada
 <span>Tendência 15M</span>
 
 <span class="valor">
-{{ estado.detalhes.tendencia_15m }}
+{{ a.detalhes.tendencia_15m }}
 </span>
 
 </div>
@@ -3074,7 +3204,7 @@ Filtros da entrada
 <span>Pullback</span>
 
 <span class="valor">
-{{ estado.detalhes.pullback }}
+{{ a.detalhes.pullback }}
 </span>
 
 </div>
@@ -3084,7 +3214,7 @@ Filtros da entrada
 <span>Confirmação</span>
 
 <span class="valor">
-{{ estado.detalhes.confirmacao }}
+{{ a.detalhes.confirmacao }}
 </span>
 
 </div>
@@ -3094,7 +3224,7 @@ Filtros da entrada
 <span>Mercado lateral</span>
 
 <span class="valor">
-{{ estado.detalhes.lateral }}
+{{ a.detalhes.lateral }}
 </span>
 
 </div>
@@ -3104,7 +3234,7 @@ Filtros da entrada
 <span>Score CALL</span>
 
 <span class="valor">
-{{ estado.detalhes.score_call }}
+{{ a.detalhes.score_call }}
 </span>
 
 </div>
@@ -3114,7 +3244,7 @@ Filtros da entrada
 <span>Score PUT</span>
 
 <span class="valor">
-{{ estado.detalhes.score_put }}
+{{ a.detalhes.score_put }}
 </span>
 
 </div>
@@ -3124,7 +3254,7 @@ Filtros da entrada
 <span>RSI 14</span>
 
 <span class="valor">
-{{ estado.detalhes.rsi }}
+{{ a.detalhes.rsi }}
 </span>
 
 </div>
@@ -3134,7 +3264,7 @@ Filtros da entrada
 <span>EMA 5</span>
 
 <span class="valor">
-{{ estado.detalhes.ema5 }}
+{{ a.detalhes.ema5 }}
 </span>
 
 </div>
@@ -3144,7 +3274,7 @@ Filtros da entrada
 <span>EMA 13</span>
 
 <span class="valor">
-{{ estado.detalhes.ema13 }}
+{{ a.detalhes.ema13 }}
 </span>
 
 </div>
@@ -3154,7 +3284,7 @@ Filtros da entrada
 <span>EMA 21</span>
 
 <span class="valor">
-{{ estado.detalhes.ema21 }}
+{{ a.detalhes.ema21 }}
 </span>
 
 </div>
@@ -3164,18 +3294,40 @@ Filtros da entrada
 <span>ATR 14</span>
 
 <span class="valor">
-{{ estado.detalhes.atr }}
+{{ a.detalhes.atr }}
 </span>
 
 </div>
 
 </div>
 
+<div class="secao">
+
+<div class="observacao">
+
+{{ a.mensagem }}
+
+</div>
+
+</div>
+
+</div>
+
+{% endfor %}
+
+</div>
+
+
+<!-- ======================================================
+     ESTATÍSTICAS GERAIS
+     ====================================================== -->
+
+{% set estat = estados_ativos["EURUSD"].estatisticas %}
 
 <div class="card">
 
 <h3>
-Estatísticas
+Estatísticas gerais
 </h3>
 
 <div class="estatisticas">
@@ -3185,7 +3337,7 @@ Estatísticas
 Total
 
 <div class="numero">
-{{ estado.estatisticas.total }}
+{{ estat.total }}
 </div>
 
 </div>
@@ -3195,7 +3347,7 @@ Total
 WIN
 
 <div class="numero">
-{{ estado.estatisticas.wins }}
+{{ estat.wins }}
 </div>
 
 </div>
@@ -3205,7 +3357,7 @@ WIN
 LOSS
 
 <div class="numero">
-{{ estado.estatisticas.losses }}
+{{ estat.losses }}
 </div>
 
 </div>
@@ -3215,7 +3367,7 @@ LOSS
 DOJI
 
 <div class="numero">
-{{ estado.estatisticas.dojis }}
+{{ estat.dojis }}
 </div>
 
 </div>
@@ -3232,7 +3384,7 @@ Taxa de acerto
 
 <span class="valor">
 
-{{ estado.estatisticas.taxa }}%
+{{ estat.taxa }}%
 
 </span>
 
@@ -3244,10 +3396,6 @@ Taxa de acerto
 <div class="card">
 
 <div class="observacao">
-
-{{ estado.mensagem }}
-
-<br><br>
 
 Quando houver sinal:
 
@@ -3333,13 +3481,14 @@ def index():
 
     garantir_robo_iniciado()
 
-    estado[
-        "estatisticas"
-    ] = calcular_estatisticas()
+    atualizar_estatisticas_todos()
+
+    estados = obter_estado_para_json()
 
     return render_template_string(
         HTML,
-        estado=estado
+        ativos=ATIVOS,
+        estados_ativos=estados
     )
 
 
@@ -3348,13 +3497,26 @@ def dados():
 
     garantir_robo_iniciado()
 
-    estado[
-        "estatisticas"
-    ] = calcular_estatisticas()
+    atualizar_estatisticas_todos()
 
-    return jsonify(
-        estado
-    )
+    return jsonify({
+
+        "ativos": obter_estado_para_json(),
+
+        "estatisticas":
+            calcular_estatisticas(),
+
+        "telegram_configurado":
+            telegram_configurado(),
+
+        "operacoes_pendentes":
+            len(_operacoes_pendentes),
+
+        "horario_brt":
+            agora_brt().strftime(
+                "%Y-%m-%d %H:%M:%S"
+            ),
+    })
 
 
 @app.route("/health")
@@ -3382,6 +3544,9 @@ def health():
 
         "telegram_configurado":
             telegram_configurado(),
+
+        "ativos":
+            list(ATIVOS.values()),
 
         "operacoes_pendentes":
             len(
