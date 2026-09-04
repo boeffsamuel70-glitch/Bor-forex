@@ -1563,6 +1563,7 @@ def analisar_pullback(
             <=
             0.30
         )
+
         rompeu_pullback = (
             confirmacao["close"]
             <
@@ -3026,18 +3027,37 @@ def executar_leitura():
         "================================"
     )
 
-    if not BULLEX_EMAIL or not BULLEX_SENHA:
+    # ========================================================
+    # AUTENTICAÇÃO BULLEX
+    # ========================================================
+    # A versão atual usa BULLEX_SSID ou BULLEX_AUTH_BODY_JSON.
+    # Não usa mais BULLEX_EMAIL/BULLEX_SENHA.
+
+    try:
+
+        _auth_body()
+
+    except Exception as e:
 
         log(
-            "ERRO: BULLEX_EMAIL/BULLEX_SENHA nao configurados."
+            f"ERRO: autenticacao Bullex nao configurada: {e}"
         )
 
         estado["sinal"] = (
             "AGUARDAR"
         )
 
+        estado["score"] = 0
+
         estado["mensagem"] = (
-            "Configure BULLEX_EMAIL e BULLEX_SENHA no Render."
+            "Configure BULLEX_SSID ou "
+            "BULLEX_AUTH_BODY_JSON no Render."
+        )
+
+        estado["atualizado"] = (
+            agora_brt().strftime(
+                "%H:%M:%S BRT"
+            )
         )
 
         return
