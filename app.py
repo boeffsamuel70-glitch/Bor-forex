@@ -4,7 +4,10 @@ import threading
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+import json
 import requests
+import websocket
+
 from flask import Flask, jsonify, render_template_string
 
 app = Flask(__name__)
@@ -13,7 +16,59 @@ app = Flask(__name__)
 # CONFIGURAÇÃO
 # ============================================================
 
-API_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
+# ============================================================
+# BULLEX WEBSOCKET - LEITURA DIRETA DO FEED
+# ============================================================
+# IMPORTANTE:
+# Este arquivo SOMENTE lê candles. Não envia ordens para a Bullex.
+#
+# A autenticação do WebSocket usa a sessão da Traderoom. Para não
+# colocar segredo dentro do código, informe a sessão por variável
+# de ambiente.
+#
+# BULLEX_SSID:
+#   valor da sessão "ssid" obtido na autenticação da Traderoom.
+#
+# Se a sua captura usar outro corpo de autenticação, você pode
+# informar o JSON completo em BULLEX_AUTH_BODY_JSON.
+#
+# Exemplo:
+# BULLEX_AUTH_BODY_JSON={"ssid":"SEU_VALOR_DE_SESSAO"}
+#
+# Nunca coloque esses valores no GitHub.
+BULLEX_WS_URL = os.getenv(
+    "BULLEX_WS_URL",
+    "wss://ws.trade.bull-ex.com/echo/websocket"
+).strip()
+
+BULLEX_ORIGIN = os.getenv(
+    "BULLEX_ORIGIN",
+    "https://trade.bull-ex.com"
+).strip()
+
+BULLEX_SSID = os.getenv("BULLEX_SSID", "").strip()
+BULLEX_AUTH_BODY_JSON = os.getenv(
+    "BULLEX_AUTH_BODY_JSON", ""
+).strip()
+
+# Mapa confirmado na Traderoom para os ativos OTC.
+# 5M = 300 segundos; 15M = 900 segundos.
+ATIVO_BULLEX = {
+    "EURUSD": {"symbol": "EUR/USD", "active_id": 76, "ticker": "EURUSD-OTC"},
+    "GBPUSD": {"symbol": "GBP/USD", "active_id": 81, "ticker": "GBPUSD-OTC"},
+    "USDJPY": {"symbol": "USD/JPY", "active_id": 85, "ticker": "USDJPY-OTC"},
+    "GBPJPY": {"symbol": "GBP/JPY", "active_id": 84, "ticker": "GBPJPY-OTC"},
+}
+
+_BULLEX_CANDLE_SIZES = {"5min": 300, "15min": 900}
+_bullex_ws = None
+_bullex_ws_lock = threading.RLock()
+_bullex_request_lock = threading.Lock()
+_bullex_request_counter = 1000
+_bullex_connected = False
+_bullex_last_error = None
+_bullex_candles = {}
+_bullex_cv = threading.Condition(_bullex_ws_lock)
 
 TELEGRAM_BOT_TOKEN = os.getenv(
     "TELEGRAM_BOT_TOKEN", ""
@@ -37,7 +92,6 @@ HORA_FIM = 22
 
 MAX_ATRASO_MINUTOS = 8
 
-
 # ============================================================
 # ATIVOS
 # ============================================================
@@ -49,58 +103,34 @@ ATIVOS = {
     "GBPJPY": "GBP/JPY",
 }
 
-
 # ============================================================
-# ESTADO INDIVIDUAL DE CADA ATIVO
-# ============================================================
-
-def criar_estado_ativo():
-
-    return {
-        "ativo": "-",
-        "sinal": "AGUARDAR",
-        "score": 0,
-        "preco": "-",
-        "vela": "-",
-        "atualizado": "-",
-        "atualidade_min": "-",
-
-        "mensagem":
-            "Aguardando primeira leitura.",
-
-        "detalhes": {
-
-            "score_call": "-",
-            "score_put": "-",
-            "rsi": "-",
-            "ema5": "-",
-            "ema13": "-",
-            "ema21": "-",
-
-            "tendencia_5m": "-",
-            "tendencia_15m": "-",
-
-            "pullback": "-",
-            "confirmacao": "-",
-            "lateral": "-",
-            "atr": "-",
-        },
-    }
-
-
-# Cada ativo tem seu próprio estado.
-estado_ativos = {
-    symbol: criar_estado_ativo()
-    for symbol in ATIVOS.values()
-}
-
-
-# ============================================================
-# ESTADO GERAL
+# ESTADO
 # ============================================================
 
 estado = {
-    "ativos": estado_ativos,
+    "ativo": "-",
+    "sinal": "AGUARDAR",
+    "score": 0,
+    "preco": "-",
+    "vela": "-",
+    "atualizado": "-",
+    "atualidade_min": "-",
+    "mensagem": "Aguardando primeira leitura.",
+
+    "detalhes": {
+        "score_call": "-",
+        "score_put": "-",
+        "rsi": "-",
+        "ema5": "-",
+        "ema13": "-",
+        "ema21": "-",
+        "tendencia_5m": "-",
+        "tendencia_15m": "-",
+        "pullback": "-",
+        "confirmacao": "-",
+        "lateral": "-",
+        "atr": "-",
+    },
 
     "estatisticas": {
         "total": 0,
@@ -111,28 +141,44 @@ estado = {
     },
 }
 
-
 _robo_lock = threading.Lock()
 _robo_started = False
-
 
 # ============================================================
 # CONTROLE DE SINAIS
 # ============================================================
 
+# Evita mandar duas vezes o mesmo sinal.
 _ultimos_sinais_telegram = {}
 
+# Guarda operações aguardando resultado.
+#
+# Exemplo:
+# {
+#   "EUR/USD": {
+#       "id": "...",
+#       "sinal": "CALL",
+#       "entrada": 1.16000,
+#       "vela_sinal": datetime,
+#       "vela_expiracao": datetime
+#   }
+# }
+#
+# Pode existir no máximo uma operação pendente por ativo.
 _operacoes_pendentes = {}
 
-_historico_resultados = []
+# Impede registrar novamente a mesma vela de sinal depois que ela foi finalizada.
+_ultimas_operacoes_registradas = {}
 
+# Resultados da sessão.
+_historico_resultados = []
 
 # ============================================================
 # UTILITÁRIOS
 # ============================================================
 
-def log(msg):
 
+def log(msg):
     agora = datetime.now(TZ).strftime(
         "%Y-%m-%d %H:%M:%S"
     )
@@ -144,7 +190,6 @@ def log(msg):
 
 
 def agora_brt():
-
     return datetime.now(TZ)
 
 
@@ -158,17 +203,11 @@ def parse_datetime_candle(txt):
     try:
 
         if txt.endswith("Z"):
-
-            txt = (
-                txt[:-1]
-                +
-                "+00:00"
-            )
+            txt = txt[:-1] + "+00:00"
 
         dt = datetime.fromisoformat(txt)
 
         if dt.tzinfo is None:
-
             dt = dt.replace(
                 tzinfo=TZ
             )
@@ -194,7 +233,6 @@ def parse_datetime_candle(txt):
                 )
 
             except Exception:
-
                 pass
 
     return None
@@ -237,18 +275,11 @@ def somente_velas_fechadas(
     agora = agora_brt()
 
     return [
-
         candle
-
         for candle in candles
-
-        if (
-            candle["_dt"]
-            +
-            timedelta(minutes=minutos)
-            <=
-            agora
-        )
+        if candle["_dt"]
+        + timedelta(minutes=minutos)
+        <= agora
     ]
 
 
@@ -261,7 +292,6 @@ def idade_do_ultimo_candle(
     )
 
     if not ordenadas:
-
         return None, None
 
     ultimo = ordenadas[-1]
@@ -276,81 +306,465 @@ def idade_do_ultimo_candle(
 
 
 # ============================================================
-# TWELVE DATA
+# BULLEX - FONTE DE DADOS (WEBSOCKET DIRETO)
 # ============================================================
+
+def _next_request_id():
+    global _bullex_request_counter
+    with _bullex_request_lock:
+        _bullex_request_counter += 1
+        return str(_bullex_request_counter)
+
+
+def _auth_body():
+    if BULLEX_AUTH_BODY_JSON:
+        try:
+            body = json.loads(BULLEX_AUTH_BODY_JSON)
+            if not isinstance(body, dict):
+                raise ValueError("BULLEX_AUTH_BODY_JSON precisa ser um objeto JSON.")
+            return body
+        except Exception as e:
+            raise RuntimeError(
+                f"BULLEX_AUTH_BODY_JSON invalido: {e}"
+            )
+
+    if not BULLEX_SSID:
+        raise RuntimeError(
+            "Configure BULLEX_SSID ou BULLEX_AUTH_BODY_JSON no Render. "
+            "Nao coloque o segredo no codigo/GitHub."
+        )
+
+    return {"ssid": BULLEX_SSID}
+
+
+def _montar_send_message(nome, version, body=None):
+    payload = {
+        "name": "sendMessage",
+        "request_id": _next_request_id(),
+        "local_time": int(time.time() * 1000) % 1_000_000,
+        "msg": {
+            "name": nome,
+            "version": version,
+        },
+    }
+
+    if body is not None:
+        payload["msg"]["body"] = body
+
+    return payload
+
+
+def _normalizar_candle_ws(item):
+    if not isinstance(item, dict):
+        return None
+
+    timestamp = item.get("from")
+    if timestamp is None:
+        timestamp = item.get("timestamp")
+    if timestamp is None:
+        timestamp = item.get("time")
+    if timestamp is None:
+        return None
+
+    try:
+        timestamp = float(timestamp)
+        if timestamp > 10_000_000_000:
+            timestamp /= 1000.0
+
+        dt = datetime.fromtimestamp(timestamp, tz=TZ)
+
+        return {
+            "id": item.get("id"),
+            "datetime": dt.isoformat(),
+            "open": float(item["open"]),
+            "high": float(item.get("max", item.get("high"))),
+            "low": float(item.get("min", item.get("low"))),
+            "close": float(item["close"]),
+            "volume": float(item.get("volume", 0) or 0),
+        }
+    except (TypeError, ValueError, OverflowError, KeyError):
+        return None
+
+
+def _armazenar_candle_ws(active_id, size, item):
+    candle = _normalizar_candle_ws(item)
+    if candle is None:
+        return
+
+    chave = (int(active_id), int(size), candle.get("id"))
+    if candle.get("id") is None:
+        chave = (
+            int(active_id),
+            int(size),
+            candle["datetime"],
+        )
+
+    with _bullex_cv:
+        bucket = _bullex_candles.setdefault(
+            (int(active_id), int(size)),
+            {}
+        )
+        bucket[chave] = candle
+        _bullex_cv.notify_all()
+
+
+def _extrair_candles_da_resposta(msg):
+    nome = msg.get("name")
+    conteudo = msg.get("msg")
+
+    if nome == "candles":
+        if isinstance(conteudo, list):
+            return conteudo
+        if isinstance(conteudo, dict):
+            for chave in ("candles", "data", "values"):
+                if isinstance(conteudo.get(chave), list):
+                    return conteudo[chave]
+
+    if nome == "first-candles" and isinstance(conteudo, dict):
+        por_tamanho = conteudo.get("candles_by_size", {})
+        if isinstance(por_tamanho, dict):
+            encontrados = []
+            for valor in por_tamanho.values():
+                if isinstance(valor, dict):
+                    encontrados.append(valor)
+                elif isinstance(valor, list):
+                    encontrados.extend(valor)
+            return encontrados
+
+    return []
+
+
+def _on_bullex_message(ws, raw_message):
+    global _bullex_last_error
+
+    try:
+        data = json.loads(raw_message)
+    except Exception:
+        return
+
+    # Eventos em tempo real confirmados na Traderoom.
+    if data.get("name") == "candle-generated":
+        msg = data.get("msg", {})
+        if isinstance(msg, dict):
+            active_id = msg.get("active_id")
+            size = msg.get("size")
+            if active_id is not None and size is not None:
+                _armazenar_candle_ws(active_id, size, msg)
+        return
+
+    # Algumas mensagens vêm embrulhadas em data.
+    if isinstance(data.get("data"), str):
+        try:
+            inner = json.loads(data["data"])
+        except Exception:
+            inner = None
+        if isinstance(inner, dict):
+            _on_bullex_message(ws, json.dumps(inner))
+            return
+
+    if isinstance(data.get("data"), dict):
+        inner = data["data"]
+        if inner.get("name") == "candle-generated":
+            _on_bullex_message(ws, json.dumps(inner))
+            return
+
+    request_id = data.get("request_id")
+    if request_id is not None:
+        # Guarda a resposta para o solicitante.
+        with _bullex_cv:
+            _bullex_response_store[str(request_id)] = data
+            _bullex_cv.notify_all()
+
+
+def _on_bullex_error(ws, error):
+    global _bullex_last_error
+    _bullex_last_error = str(error)
+    log(f"Bullex WebSocket erro: {error}")
+
+
+def _on_bullex_close(ws, code, reason):
+    global _bullex_connected
+    _bullex_connected = False
+    log(
+        f"Bullex WebSocket fechado: "
+        f"code={code} reason={reason}"
+    )
+
+
+def _on_bullex_open(ws):
+    global _bullex_connected, _bullex_last_error
+    _bullex_last_error = None
+    _bullex_connected = True
+    log("Bullex WebSocket conectado.")
+
+    try:
+        auth = _montar_send_message(
+            "authenticate",
+            "1.0",
+            _auth_body()
+        )
+        ws.send(json.dumps(auth, separators=(",", ":")))
+        log("Autenticacao WebSocket enviada.")
+    except Exception as e:
+        _bullex_last_error = str(e)
+        log(f"Erro ao enviar autenticacao Bullex: {e}")
+
+
+_bullex_response_store = {}
+
+
+def _thread_bullex_ws():
+    global _bullex_ws, _bullex_connected
+
+    while True:
+        try:
+            cookie = os.getenv("BULLEX_COOKIE", "").strip()
+
+            ws = websocket.WebSocketApp(
+                BULLEX_WS_URL,
+                cookie=cookie or None,
+                on_open=_on_bullex_open,
+                on_message=_on_bullex_message,
+                on_error=_on_bullex_error,
+                on_close=_on_bullex_close,
+            )
+
+            with _bullex_ws_lock:
+                _bullex_ws = ws
+
+            ws.run_forever(
+                ping_interval=20,
+                ping_timeout=10,
+                origin=BULLEX_ORIGIN,
+            )
+
+        except Exception as e:
+            _bullex_connected = False
+            log(f"Falha no WebSocket Bullex: {e}")
+
+        time.sleep(5)
+
+
+def conectar_bullex():
+    global _bullex_ws
+
+    with _bullex_ws_lock:
+        if _bullex_ws is not None and _bullex_connected:
+            return _bullex_ws
+
+        if not _auth_body():
+            raise RuntimeError("Autenticacao Bullex nao configurada.")
+
+        # Inicia apenas uma thread de WebSocket.
+        if not getattr(conectar_bullex, "_thread_started", False):
+            conectar_bullex._thread_started = True
+            thread = threading.Thread(
+                target=_thread_bullex_ws,
+                daemon=True,
+                name="bullex-websocket",
+            )
+            thread.start()
+
+    limite = time.time() + 20
+    while time.time() < limite:
+        with _bullex_ws_lock:
+            if _bullex_ws is not None and _bullex_connected:
+                return _bullex_ws
+        time.sleep(0.2)
+
+    raise RuntimeError(
+        "WebSocket Bullex nao conectou em 20 segundos. "
+        "Verifique BULLEX_SSID/BULLEX_AUTH_BODY_JSON e os logs."
+    )
+
+
+def _enviar_e_aguardar(nome, version, body=None, timeout=15):
+    ws = conectar_bullex()
+
+    payload = _montar_send_message(
+        nome,
+        version,
+        body
+    )
+
+    request_id = str(payload["request_id"])
+
+    with _bullex_cv:
+        _bullex_response_store.pop(request_id, None)
+
+    ws.send(json.dumps(payload, separators=(",", ":")))
+
+    limite = time.time() + timeout
+
+    with _bullex_cv:
+        while time.time() < limite:
+            resposta = _bullex_response_store.pop(
+                request_id,
+                None
+            )
+            if resposta is not None:
+                return resposta
+
+            restante = limite - time.time()
+            if restante <= 0:
+                break
+
+            _bullex_cv.wait(timeout=min(0.5, restante))
+
+    raise RuntimeError(
+        f"Timeout aguardando resposta Bullex: "
+        f"{nome} request_id={request_id}"
+    )
+
+
+def _obter_ultimo_id(active_id, size):
+    # Primeiro-candles é uma chamada confirmada pela Traderoom.
+    resposta = _enviar_e_aguardar(
+        "get-first-candles",
+        "1.0",
+        {
+            "active_id": int(active_id),
+            "split_normalization": True,
+        },
+        timeout=15,
+    )
+
+    msg = resposta.get("msg", {})
+    if not isinstance(msg, dict):
+        raise RuntimeError(
+            "Resposta invalida em get-first-candles."
+        )
+
+    por_tamanho = msg.get("candles_by_size", {})
+    valor = por_tamanho.get(str(size))
+
+    if valor is None:
+        # Alguns retornos podem usar chave numerica.
+        valor = por_tamanho.get(size)
+
+    if isinstance(valor, list):
+        itens = valor
+    elif isinstance(valor, dict):
+        itens = [valor]
+    else:
+        itens = []
+
+    if not itens:
+        raise RuntimeError(
+            f"get-first-candles nao retornou candle "
+            f"para active_id={active_id}, size={size}."
+        )
+
+    ultimo = max(
+        itens,
+        key=lambda x: int(x.get("id", 0))
+    )
+
+    return int(ultimo["id"])
+
 
 def obter_candles(
     symbol,
     interval=TIMEFRAME,
     outputsize=OUTPUTSIZE
 ):
+    """Busca OHLC diretamente do WebSocket da Bullex."""
+    codigo = None
 
-    if not API_KEY:
+    for chave, nome in ATIVOS.items():
+        if nome == symbol:
+            codigo = chave
+            break
 
+    if codigo is None:
         raise RuntimeError(
-            "TWELVE_DATA_API_KEY "
-            "nao configurada no Render."
+            f"Ativo nao mapeado para Bullex: {symbol}"
         )
 
-    resposta = requests.get(
+    config = ATIVO_BULLEX[codigo]
+    active_id = config["active_id"]
 
-        "https://api.twelvedata.com/time_series",
+    size = _BULLEX_CANDLE_SIZES.get(interval)
+    if size is None:
+        raise RuntimeError(
+            f"Timeframe nao suportado: {interval}"
+        )
 
-        params={
+    ultimo_id = _obter_ultimo_id(
+        active_id,
+        size
+    )
 
-            "symbol": symbol,
+    # O protocolo confirmado usa from_id/to_id.
+    from_id = max(
+        1,
+        ultimo_id - int(outputsize) + 1
+    )
 
-            "interval": interval,
-
-            "outputsize": outputsize,
-
-            "timezone": TIMEZONE,
-
-            "apikey": API_KEY,
+    resposta = _enviar_e_aguardar(
+        "get-candles",
+        "2.0",
+        {
+            "active_id": int(active_id),
+            "size": int(size),
+            "from_id": int(from_id),
+            "to_id": int(ultimo_id),
+            "split_normalization": True,
+            "only_closed": True,
         },
-
         timeout=20,
     )
 
-    resposta.raise_for_status()
+    dados = _extrair_candles_da_resposta(
+        resposta
+    )
 
-    dados = resposta.json()
+    candles = []
 
-    if dados.get("status") == "error":
-
-        raise RuntimeError(
-            dados.get(
-                "message",
-                "Erro retornado pela Twelve Data."
+    for item in dados:
+        normalizado = _normalizar_candle_ws(item)
+        if normalizado is not None:
+            _armazenar_candle_ws(
+                active_id,
+                size,
+                item
             )
+            candles.append(normalizado)
+
+    # Acrescenta eventos em tempo real já recebidos.
+    with _bullex_cv:
+        bucket = _bullex_candles.get(
+            (int(active_id), int(size)),
+            {}
         )
+        candles.extend(bucket.values())
 
-    values = dados.get("values")
-
-    if not values:
-
-        raise RuntimeError(
-            f"Nenhuma vela recebida "
-            f"para {symbol}: {dados}"
+    # Remove duplicados pelo id/datetime.
+    unicos = {}
+    for candle in candles:
+        chave = (
+            candle.get("id"),
+            candle.get("datetime")
         )
+        unicos[chave] = candle
 
     candles = ordenar_candles(
-        values
+        list(unicos.values())
     )
 
     if not candles:
-
         raise RuntimeError(
-            f"Nao foi possivel interpretar "
-            f"as datas de {symbol}."
+            f"Nenhum candle recebido da Bullex "
+            f"para {symbol} ({interval})."
         )
 
-    return candles
+    return candles[-int(outputsize):]
 
 
 # ============================================================
 # INDICADORES
 # ============================================================
+
 
 def closes(candles):
 
@@ -366,7 +780,6 @@ def ema(
 ):
 
     if len(values) < period:
-
         return None
 
     k = 2 / (
@@ -375,8 +788,7 @@ def ema(
 
     valor = (
         sum(values[:period])
-        /
-        period
+        / period
     )
 
     for preco in values[period:]:
@@ -396,7 +808,6 @@ def rsi(
 ):
 
     if len(values) < period + 1:
-
         return None
 
     ganhos = []
@@ -431,16 +842,14 @@ def rsi(
         sum(
             ganhos[:period]
         )
-        /
-        period
+        / period
     )
 
     avg_loss = (
         sum(
             perdas[:period]
         )
-        /
-        period
+        / period
     )
 
     for i in range(
@@ -469,7 +878,6 @@ def rsi(
         ) / period
 
     if avg_loss == 0:
-
         return 100.0
 
     rs = (
@@ -495,7 +903,6 @@ def atr(
 ):
 
     if len(candles) < period + 1:
-
         return None
 
     trs = []
@@ -506,7 +913,6 @@ def atr(
     ):
 
         atual = candles[i]
-
         anterior = candles[i - 1]
 
         high = float(
@@ -541,7 +947,6 @@ def atr(
         )
 
     if len(trs) < period:
-
         return None
 
     return (
@@ -556,6 +961,7 @@ def atr(
 # ============================================================
 # INFORMAÇÕES DA VELA
 # ============================================================
+
 
 def candle_info(candle):
 
@@ -642,7 +1048,6 @@ def percentual_distancia(
 ):
 
     if referencia == 0:
-
         return 999.0
 
     return (
@@ -657,8 +1062,9 @@ def percentual_distancia(
 
 
 # ============================================================
-# TENDÊNCIA
+# TENDÊNCIA 15 MIN
 # ============================================================
+
 
 def tendencia_timeframe(
     candles
@@ -689,10 +1095,8 @@ def tendencia_timeframe(
 
     if not (
         ema5
-        and
-        ema13
-        and
-        ema21
+        and ema13
+        and ema21
     ):
 
         return "NEUTRA"
@@ -724,6 +1128,7 @@ def tendencia_timeframe(
 # PULLBACK
 # ============================================================
 
+
 def pullback_call_na_vela(
     info,
     ema13,
@@ -731,7 +1136,6 @@ def pullback_call_na_vela(
 ):
 
     if not ema13 or not ema21:
-
         return False
 
     tocou_ema13 = (
@@ -786,7 +1190,6 @@ def pullback_put_na_vela(
 ):
 
     if not ema13 or not ema21:
-
         return False
 
     tocou_ema13 = (
@@ -835,8 +1238,9 @@ def pullback_put_na_vela(
 
 
 # ============================================================
-# MERCADO LATERAL
+# ANÁLISE DE MERCADO LATERAL
 # ============================================================
+
 
 def mercado_lateral(
     preco,
@@ -868,8 +1272,9 @@ def mercado_lateral(
         preco
     )
 
+    # Se as EMAs estiverem muito próximas,
+    # a tendência é considerada fraca.
     if distancia_5_21 < 0.00025:
-
         return True
 
     if atr14:
@@ -881,7 +1286,6 @@ def mercado_lateral(
         )
 
         if atr_ratio < 0.00008:
-
             return True
 
     return False
@@ -890,6 +1294,7 @@ def mercado_lateral(
 # ============================================================
 # ESTRATÉGIA
 # ============================================================
+
 
 def analisar_pullback(
     candles_5m,
@@ -950,6 +1355,10 @@ def analisar_pullback(
             "score_put": 0,
         }
 
+    # ========================================================
+    # VALORES
+    # ========================================================
+
     c = closes(
         candles_5m
     )
@@ -993,6 +1402,10 @@ def analisar_pullback(
         )
     )
 
+    # ========================================================
+    # VELAS
+    # ========================================================
+
     confirmacao = candle_info(
         candles_5m[-1]
     )
@@ -1007,18 +1420,19 @@ def analisar_pullback(
 
     # ========================================================
     # PULLBACK
+    #
+    # SOMENTE -2 E -3.
+    #
+    # A vela -1 NÃO pode ser pullback.
     # ========================================================
 
     pullback_call = (
-
         pullback_call_na_vela(
             pullback_1,
             ema13,
             ema21
         )
-
         or
-
         pullback_call_na_vela(
             pullback_2,
             ema13,
@@ -1027,15 +1441,12 @@ def analisar_pullback(
     )
 
     pullback_put = (
-
         pullback_put_na_vela(
             pullback_1,
             ema13,
             ema21
         )
-
         or
-
         pullback_put_na_vela(
             pullback_2,
             ema13,
@@ -1152,7 +1563,6 @@ def analisar_pullback(
             <=
             0.30
         )
-
         rompeu_pullback = (
             confirmacao["close"]
             <
@@ -1244,15 +1654,13 @@ def analisar_pullback(
         )
 
         if atr_ratio < 0.00008:
-
             atr_ok = False
 
         if atr_ratio > 0.0035:
-
             atr_ok = False
 
     # ========================================================
-    # LATERAL
+    # MERCADO LATERAL
     # ========================================================
 
     lateral = mercado_lateral(
@@ -1270,54 +1678,49 @@ def analisar_pullback(
     score_call = 0
     score_put = 0
 
+    # Tendência 5M
     if tendencia_5m == "ALTA":
-
         score_call += 3
 
     if tendencia_5m == "BAIXA":
-
         score_put += 3
 
+    # Tendência 15M
     if tendencia_15m == "ALTA":
-
         score_call += 2
 
     if tendencia_15m == "BAIXA":
-
         score_put += 2
 
+    # Pullback
     if pullback_call:
-
         score_call += 2
 
     if pullback_put:
-
         score_put += 2
 
+    # Confirmação
     if confirmacao_call:
-
         score_call += 2
 
     if confirmacao_put:
-
         score_put += 2
 
+    # RSI
     if rsi_call_ok:
-
         score_call += 1
 
     if rsi_put_ok:
-
         score_put += 1
 
+    # Contexto
     if contexto_call:
-
         score_call += 1
 
     if contexto_put:
-
         score_put += 1
 
+    # Corpo da confirmação
     if confirmacao["body_ratio"] >= 0.25:
 
         if (
@@ -1371,6 +1774,8 @@ def analisar_pullback(
 
     elif tendencia_5m == "ALTA":
 
+        # Exige também confirmação
+        # do 15M.
         if tendencia_15m != "ALTA":
 
             bloqueio = (
@@ -1424,15 +1829,12 @@ def analisar_pullback(
         "CONFIRMADO EM VELA ANTERIOR"
 
         if (
-
             (
                 pullback_call
                 and
                 tendencia_5m == "ALTA"
             )
-
             or
-
             (
                 pullback_put
                 and
@@ -1450,15 +1852,12 @@ def analisar_pullback(
         "CONFIRMADA"
 
         if (
-
             (
                 confirmacao_call
                 and
                 tendencia_5m == "ALTA"
             )
-
             or
-
             (
                 confirmacao_put
                 and
@@ -1521,8 +1920,7 @@ def analisar_pullback(
 
         "preco": preco,
 
-        "vela":
-            candles_5m[-1]["_dt"],
+        "vela": candles_5m[-1]["_dt"],
 
         "rsi": rsi14,
 
@@ -1565,6 +1963,7 @@ def analisar_pullback(
 # ESTATÍSTICAS
 # ============================================================
 
+
 def calcular_estatisticas():
 
     total = len(
@@ -1596,28 +1995,20 @@ def calcular_estatisticas():
     )
 
     taxa = (
-
         wins
         /
         decididos
         *
         100
-
         if decididos > 0
-
         else 0
     )
 
     return {
-
         "total": total,
-
         "wins": wins,
-
         "losses": losses,
-
         "dojis": dojis,
-
         "taxa": round(
             taxa,
             2
@@ -1628,6 +2019,7 @@ def calcular_estatisticas():
 # ============================================================
 # TELEGRAM
 # ============================================================
+
 
 def telegram_configurado():
 
@@ -1701,6 +2093,7 @@ def enviar_telegram(texto):
 # ============================================================
 # ENVIAR SINAL
 # ============================================================
+
 
 def enviar_sinal_telegram(
     symbol,
@@ -1843,6 +2236,7 @@ def enviar_sinal_telegram(
 # REGISTRAR OPERAÇÃO
 # ============================================================
 
+
 def registrar_operacao(
     symbol,
     resultado,
@@ -1871,6 +2265,13 @@ def registrar_operacao(
 
         return
 
+    # A entrada é na abertura
+    # da próxima vela de 5 minutos.
+    #
+    # Como a vela de sinal acabou
+    # de fechar, a próxima vela começa
+    # imediatamente depois dela.
+
     vela_entrada = (
         vela_sinal
         +
@@ -1883,6 +2284,12 @@ def registrar_operacao(
         f"{symbol}|"
         f"{vela_sinal.isoformat()}"
     )
+
+    if _ultimas_operacoes_registradas.get(symbol) == chave:
+        log(
+            f"{symbol}: operacao duplicada para a mesma vela ignorada."
+        )
+        return
 
     if symbol in _operacoes_pendentes:
 
@@ -1921,9 +2328,11 @@ def registrar_operacao(
         "vela_expiracao":
             vela_expiracao,
 
-        "entrada": None,
+        "entrada":
+            None,
 
-        "saida": None,
+        "saida":
+            None,
 
         "resultado":
             "PENDENTE",
@@ -1932,6 +2341,7 @@ def registrar_operacao(
     _operacoes_pendentes[
         symbol
     ] = operacao
+    _ultimas_operacoes_registradas[symbol] = chave
 
     log(
         f"{symbol}: operacao registrada "
@@ -1945,6 +2355,7 @@ def registrar_operacao(
 # AVALIAR WIN / LOSS
 # ============================================================
 
+
 def avaliar_operacao(
     symbol,
     candles
@@ -1957,10 +2368,22 @@ def avaliar_operacao(
     )
 
     if not operacao:
-
         return
 
     agora = agora_brt()
+
+    # A operação só pode ser avaliada
+    # depois do fechamento da vela de entrada.
+    #
+    # Exemplo:
+    #
+    # 10:55 vela de sinal fecha
+    # 11:00 começa entrada
+    # 11:05 fecha entrada
+    #
+    # Comparação:
+    # preço de abertura da vela 11:00
+    # contra fechamento da vela 11:00.
 
     alvo_dt = operacao[
         "vela_expiracao"
@@ -1971,9 +2394,9 @@ def avaliar_operacao(
         dt = candle["_dt"]
 
         if dt != alvo_dt:
-
             continue
 
+        # Garantir que a vela já fechou.
         if (
             dt
             +
@@ -1989,7 +2412,6 @@ def avaliar_operacao(
         )
 
         entrada = info["open"]
-
         saida = info["close"]
 
         operacao[
@@ -2070,6 +2492,7 @@ def avaliar_operacao(
 # TELEGRAM - RESULTADO
 # ============================================================
 
+
 def enviar_resultado_telegram(
     operacao,
     estatisticas
@@ -2119,7 +2542,8 @@ def enviar_resultado_telegram(
         f"{fmt(operacao.get('entrada'))}\n"
 
         f"Saida: "
-        f"{fmt(operacao.get('saida'))}\n\n"
+        f"{fmt(operacao.get('saida'))}\n"
+        f"Fonte da vela: Bullex\n\n"
 
         f"📊 ESTATISTICAS\n"
 
@@ -2145,221 +2569,9 @@ def enviar_resultado_telegram(
 
 
 # ============================================================
-# ATUALIZAR ESTADO DO ATIVO
-# ============================================================
-
-def atualizar_estado_ativo(
-    symbol,
-    resultado,
-    idade
-):
-
-    ativo = estado_ativos[
-        symbol
-    ]
-
-    ativo["ativo"] = symbol
-
-    ativo["sinal"] = (
-        resultado["sinal"]
-    )
-
-    ativo["score"] = (
-        resultado["score"]
-    )
-
-    preco = resultado.get(
-        "preco"
-    )
-
-    ativo["preco"] = (
-
-        f"{preco:.5f}"
-
-        if isinstance(
-            preco,
-            (float, int)
-        )
-
-        else "-"
-    )
-
-    vela = resultado.get(
-        "vela"
-    )
-
-    ativo["vela"] = (
-
-        vela.strftime(
-            "%Y-%m-%d %H:%M:%S BRT"
-        )
-
-        if isinstance(
-            vela,
-            datetime
-        )
-
-        else "-"
-    )
-
-    ativo["atualizado"] = (
-        agora_brt().strftime(
-            "%H:%M:%S BRT"
-        )
-    )
-
-    ativo["atualidade_min"] = (
-        f"{idade:.1f} min"
-    )
-
-    ativo["mensagem"] = (
-        resultado.get(
-            "mensagem",
-            ""
-        )
-    )
-
-    ativo["detalhes"] = {
-
-        "score_call":
-            resultado.get(
-                "score_call",
-                "-"
-            ),
-
-        "score_put":
-            resultado.get(
-                "score_put",
-                "-"
-            ),
-
-        "rsi": (
-
-            f"{resultado['rsi']:.2f}"
-
-            if isinstance(
-                resultado.get("rsi"),
-                (float, int)
-            )
-
-            else "-"
-        ),
-
-        "ema5": (
-
-            f"{resultado['ema5']:.5f}"
-
-            if isinstance(
-                resultado.get("ema5"),
-                (float, int)
-            )
-
-            else "-"
-        ),
-
-        "ema13": (
-
-            f"{resultado['ema13']:.5f}"
-
-            if isinstance(
-                resultado.get("ema13"),
-                (float, int)
-            )
-
-            else "-"
-        ),
-
-        "ema21": (
-
-            f"{resultado['ema21']:.5f}"
-
-            if isinstance(
-                resultado.get("ema21"),
-                (float, int)
-            )
-
-            else "-"
-        ),
-
-        "tendencia_5m":
-            resultado.get(
-                "tendencia_5m",
-                "-"
-            ),
-
-        "tendencia_15m":
-            resultado.get(
-                "tendencia_15m",
-                "-"
-            ),
-
-        "pullback":
-            resultado.get(
-                "pullback",
-                "-"
-            ),
-
-        "confirmacao":
-            resultado.get(
-                "rejeicao",
-                "-"
-            ),
-
-        "lateral":
-            resultado.get(
-                "lateral",
-                "-"
-            ),
-
-        "atr": (
-
-            f"{resultado['atr']:.6f}"
-
-            if isinstance(
-                resultado.get("atr"),
-                (float, int)
-            )
-
-            else "-"
-        ),
-    }
-
-
-def atualizar_estado_erro(
-    symbol,
-    mensagem
-):
-
-    ativo = estado_ativos[
-        symbol
-    ]
-
-    ativo["ativo"] = symbol
-
-    ativo["sinal"] = "AGUARDAR"
-
-    ativo["score"] = 0
-
-    ativo["preco"] = "-"
-
-    ativo["vela"] = "-"
-
-    ativo["atualizado"] = (
-        agora_brt().strftime(
-            "%H:%M:%S BRT"
-        )
-    )
-
-    ativo["atualidade_min"] = "-"
-
-    ativo["mensagem"] = (
-        mensagem
-    )
-
-
-# ============================================================
 # PROCESSAR ATIVO
 # ============================================================
+
 
 def processar_ativo(
     chave,
@@ -2400,7 +2612,8 @@ def processar_ativo(
         )
 
         # ====================================================
-        # RESULTADO DA OPERAÇÃO ANTERIOR
+        # PRIMEIRO:
+        # VERIFICAR RESULTADO DE OPERAÇÃO ANTERIOR
         # ====================================================
 
         avaliar_operacao(
@@ -2414,28 +2627,37 @@ def processar_ativo(
 
         if idade > MAX_ATRASO_MINUTOS:
 
-            atualizar_estado_erro(
-                symbol,
-                f"Dado atrasado "
-                f"({idade:.1f} min)."
+            estado["ativo"] = symbol
+
+            estado["sinal"] = (
+                "AGUARDAR"
             )
 
-            ativo = estado_ativos[
-                symbol
-            ]
+            estado["score"] = 0
 
-            ativo["preco"] = (
+            estado["preco"] = (
                 f"{float(ultimo_raw['close']):.5f}"
             )
 
-            ativo["vela"] = (
+            estado["vela"] = (
                 ultimo_raw["_dt"].strftime(
                     "%Y-%m-%d %H:%M:%S BRT"
                 )
             )
 
-            ativo["atualidade_min"] = (
+            estado["atualidade_min"] = (
                 f"{idade:.1f} min"
+            )
+
+            estado["atualizado"] = (
+                agora_brt().strftime(
+                    "%H:%M:%S BRT"
+                )
+            )
+
+            estado["mensagem"] = (
+                f"Dado atrasado "
+                f"({idade:.1f} min)."
             )
 
             return
@@ -2453,9 +2675,8 @@ def processar_ativo(
 
         if len(fechadas_5m) < 40:
 
-            atualizar_estado_erro(
-                symbol,
-                "Poucas velas 5M."
+            log(
+                f"{symbol}: poucas velas 5M."
             )
 
             return
@@ -2485,9 +2706,8 @@ def processar_ativo(
 
         if len(fechadas_15m) < 40:
 
-            atualizar_estado_erro(
-                symbol,
-                "Poucas velas 15M."
+            log(
+                f"{symbol}: poucas velas 15M."
             )
 
             return
@@ -2504,14 +2724,174 @@ def processar_ativo(
         )
 
         # ====================================================
-        # ATUALIZAR SOMENTE ESTE ATIVO
+        # ATUALIZAR INTERFACE
         # ====================================================
 
-        atualizar_estado_ativo(
-            symbol,
-            resultado,
-            idade
+        estado["ativo"] = symbol
+
+        estado["sinal"] = (
+            resultado["sinal"]
         )
+
+        estado["score"] = (
+            resultado["score"]
+        )
+
+        preco = resultado.get(
+            "preco"
+        )
+
+        estado["preco"] = (
+
+            f"{preco:.5f}"
+
+            if isinstance(
+                preco,
+                (float, int)
+            )
+
+            else "-"
+        )
+
+        vela = resultado.get(
+            "vela"
+        )
+
+        estado["vela"] = (
+
+            vela.strftime(
+                "%Y-%m-%d %H:%M:%S BRT"
+            )
+
+            if isinstance(
+                vela,
+                datetime
+            )
+
+            else "-"
+        )
+
+        estado["atualizado"] = (
+            agora_brt().strftime(
+                "%H:%M:%S BRT"
+            )
+        )
+
+        estado["atualidade_min"] = (
+            f"{idade:.1f} min"
+        )
+
+        estado["mensagem"] = (
+            resultado.get(
+                "mensagem",
+                ""
+            )
+        )
+
+        estado["detalhes"] = {
+
+            "score_call":
+                resultado.get(
+                    "score_call",
+                    "-"
+                ),
+
+            "score_put":
+                resultado.get(
+                    "score_put",
+                    "-"
+                ),
+
+            "rsi": (
+
+                f"{resultado['rsi']:.2f}"
+
+                if isinstance(
+                    resultado.get("rsi"),
+                    (float, int)
+                )
+
+                else "-"
+            ),
+
+            "ema5": (
+
+                f"{resultado['ema5']:.5f}"
+
+                if isinstance(
+                    resultado.get("ema5"),
+                    (float, int)
+                )
+
+                else "-"
+            ),
+
+            "ema13": (
+
+                f"{resultado['ema13']:.5f}"
+
+                if isinstance(
+                    resultado.get("ema13"),
+                    (float, int)
+                )
+
+                else "-"
+            ),
+
+            "ema21": (
+
+                f"{resultado['ema21']:.5f}"
+
+                if isinstance(
+                    resultado.get("ema21"),
+                    (float, int)
+                )
+
+                else "-"
+            ),
+
+            "tendencia_5m":
+                resultado.get(
+                    "tendencia_5m",
+                    "-"
+                ),
+
+            "tendencia_15m":
+                resultado.get(
+                    "tendencia_15m",
+                    "-"
+                ),
+
+            "pullback":
+                resultado.get(
+                    "pullback",
+                    "-"
+                ),
+
+            "confirmacao":
+                resultado.get(
+                    "rejeicao",
+                    "-"
+                ),
+
+            "lateral":
+                resultado.get(
+                    "lateral",
+                    "-"
+                ),
+
+            "atr": (
+
+                f"{resultado['atr']:.6f}"
+
+                if isinstance(
+                    resultado.get("atr"),
+                    (float, int)
+                )
+
+                else "-"
+            ),
+        }
 
         # ====================================================
         # LOG
@@ -2547,7 +2927,7 @@ def processar_ativo(
             f"{resultado.get('lateral', '-')} | "
 
             f"preco="
-            f"{estado_ativos[symbol]['preco']}"
+            f"{estado['preco']}"
         )
 
         # ====================================================
@@ -2584,8 +2964,27 @@ def processar_ativo(
             f"ERRO em {symbol}: {e}"
         )
 
-        atualizar_estado_erro(
-            symbol,
+        estado["ativo"] = symbol
+
+        estado["sinal"] = (
+            "AGUARDAR"
+        )
+
+        estado["score"] = 0
+
+        estado["preco"] = "-"
+
+        estado["vela"] = "-"
+
+        estado["atualizado"] = (
+            agora_brt().strftime(
+                "%H:%M:%S BRT"
+            )
+        )
+
+        estado["atualidade_min"] = "-"
+
+        estado["mensagem"] = (
             f"Erro: {e}"
         )
 
@@ -2593,6 +2992,7 @@ def processar_ativo(
 # ============================================================
 # HORÁRIO
 # ============================================================
+
 
 def dentro_do_horario():
 
@@ -2608,8 +3008,9 @@ def dentro_do_horario():
 
 
 # ============================================================
-# LEITURA DE TODOS OS ATIVOS
+# LEITURA
 # ============================================================
+
 
 def executar_leitura():
 
@@ -2618,29 +3019,26 @@ def executar_leitura():
     )
 
     log(
-        "INICIANDO LEITURA DOS ATIVOS"
+        "INICIANDO LEITURA"
     )
 
     log(
         "================================"
     )
 
-    if not API_KEY:
+    if not BULLEX_EMAIL or not BULLEX_SENHA:
 
         log(
-            "ERRO: "
-            "TWELVE_DATA_API_KEY "
-            "nao configurada."
+            "ERRO: BULLEX_EMAIL/BULLEX_SENHA nao configurados."
         )
 
-        for symbol in ATIVOS.values():
+        estado["sinal"] = (
+            "AGUARDAR"
+        )
 
-            atualizar_estado_erro(
-                symbol,
-                "Configure "
-                "TWELVE_DATA_API_KEY "
-                "no Render."
-            )
+        estado["mensagem"] = (
+            "Configure BULLEX_EMAIL e BULLEX_SENHA no Render."
+        )
 
         return
 
@@ -2652,31 +3050,21 @@ def executar_leitura():
             "Fora do horario configurado."
         )
 
-        for symbol in ATIVOS.values():
+        estado["sinal"] = (
+            "AGUARDAR"
+        )
 
-            ativo = estado_ativos[
-                symbol
-            ]
+        estado["mensagem"] = (
+            "Fora do horario configurado."
+        )
 
-            ativo["sinal"] = (
-                "AGUARDAR"
+        estado["atualizado"] = (
+            agora.strftime(
+                "%H:%M:%S BRT"
             )
-
-            ativo["mensagem"] = (
-                "Fora do horario configurado."
-            )
-
-            ativo["atualizado"] = (
-                agora.strftime(
-                    "%H:%M:%S BRT"
-                )
-            )
+        )
 
         return
-
-    # ========================================================
-    # TODOS OS ATIVOS
-    # ========================================================
 
     for chave, symbol in ATIVOS.items():
 
@@ -2690,7 +3078,7 @@ def executar_leitura():
     ] = calcular_estatisticas()
 
     log(
-        "Leitura de todos os ativos concluida."
+        "Leitura concluida."
     )
 
     log(
@@ -2709,6 +3097,7 @@ def executar_leitura():
 # ============================================================
 # PRÓXIMA LEITURA
 # ============================================================
+
 
 def esperar_ate_proxima_leitura():
 
@@ -2770,6 +3159,7 @@ def esperar_ate_proxima_leitura():
 # LOOP
 # ============================================================
 
+
 def loop_robo():
 
     log(
@@ -2799,18 +3189,17 @@ def loop_robo():
 # INICIAR ROBÔ
 # ============================================================
 
+
 def garantir_robo_iniciado():
 
     global _robo_started
 
     if _robo_started:
-
         return
 
     with _robo_lock:
 
         if _robo_started:
-
             return
 
         _robo_started = True
@@ -2841,8 +3230,8 @@ def iniciar_robo():
 # INTERFACE HTML
 # ============================================================
 
-HTML = """
 
+HTML = """
 <!DOCTYPE html>
 
 <html lang="pt-BR">
@@ -2861,20 +3250,11 @@ Robo Forex Pullback PRO
 
 <style>
 
-* {
-    box-sizing: border-box;
-}
-
 body {
 
     font-family: Arial, sans-serif;
 
-    background:
-        linear-gradient(
-            135deg,
-            #0b0b0b,
-            #151515
-        );
+    background: #111;
 
     color: white;
 
@@ -2885,9 +3265,7 @@ body {
 
 .container {
 
-    width: 100%;
-
-    max-width: 1400px;
+    max-width: 750px;
 
     margin: auto;
 }
@@ -2897,8 +3275,6 @@ h1 {
     text-align: center;
 
     margin-bottom: 5px;
-
-    font-size: 30px;
 }
 
 .subtitulo {
@@ -2907,212 +3283,8 @@ h1 {
 
     color: #aaa;
 
-    margin-bottom: 25px;
-}
-
-
-/* ==========================================================
-   GRID DOS ATIVOS
-   ========================================================== */
-
-.ativos {
-
-    display: grid;
-
-    grid-template-columns:
-        repeat(2, minmax(0, 1fr));
-
-    gap: 18px;
-
     margin-bottom: 20px;
 }
-
-
-/* ==========================================================
-   CARD DO ATIVO
-   ========================================================== */
-
-.ativo-card {
-
-    background: #1d1d1d;
-
-    border-radius: 16px;
-
-    padding: 20px;
-
-    box-shadow:
-        0 5px 20px
-        rgba(0,0,0,.35);
-
-    border:
-        1px solid #303030;
-
-    transition:
-        transform .2s,
-        border-color .2s;
-}
-
-.ativo-card:hover {
-
-    transform: translateY(-2px);
-
-    border-color: #555;
-}
-
-.ativo-titulo {
-
-    display: flex;
-
-    justify-content:
-        space-between;
-
-    align-items: center;
-
-    margin-bottom: 5px;
-}
-
-.ativo-nome {
-
-    font-size: 25px;
-
-    font-weight: bold;
-}
-
-.status {
-
-    font-size: 12px;
-
-    color: #888;
-}
-
-
-/* ==========================================================
-   SINAL
-   ========================================================== */
-
-.sinal {
-
-    font-size: 40px;
-
-    font-weight: bold;
-
-    text-align: center;
-
-    padding: 12px;
-
-    margin:
-        12px 0 15px;
-
-    border-radius: 12px;
-
-    background: #252525;
-}
-
-.call {
-
-    color: #00e676;
-
-    background:
-        rgba(0,230,118,.08);
-}
-
-.put {
-
-    color: #ff5252;
-
-    background:
-        rgba(255,82,82,.08);
-}
-
-.aguardar {
-
-    color: #ffc107;
-
-    background:
-        rgba(255,193,7,.06);
-}
-
-
-/* ==========================================================
-   LINHAS
-   ========================================================== */
-
-.linha {
-
-    display: flex;
-
-    justify-content:
-        space-between;
-
-    align-items:
-        center;
-
-    gap: 12px;
-
-    padding: 8px 0;
-
-    border-bottom:
-        1px solid #333;
-}
-
-.linha:last-child {
-
-    border-bottom: none;
-}
-
-.valor {
-
-    font-weight: bold;
-
-    text-align: right;
-
-    word-break: break-word;
-}
-
-
-/* ==========================================================
-   FILTROS
-   ========================================================== */
-
-.filtros {
-
-    margin-top: 18px;
-
-    padding-top: 12px;
-
-    border-top:
-        1px solid #333;
-}
-
-.filtros h3 {
-
-    margin-top: 0;
-
-    color: #ddd;
-}
-
-
-/* ==========================================================
-   MENSAGEM
-   ========================================================== */
-
-.observacao {
-
-    text-align: center;
-
-    color: #bbb;
-
-    font-size: 13px;
-
-    line-height: 1.5;
-
-    margin-top: 15px;
-}
-
-
-/* ==========================================================
-   ESTATÍSTICAS
-   ========================================================== */
 
 .card {
 
@@ -3125,8 +3297,46 @@ h1 {
     margin-bottom: 15px;
 
     box-shadow:
-        0 4px 15px
-        rgba(0,0,0,.25);
+    0 4px 15px
+    rgba(0,0,0,.25);
+}
+
+.sinal {
+
+    font-size: 42px;
+
+    font-weight: bold;
+
+    text-align: center;
+
+    margin: 15px 0;
+}
+
+.linha {
+
+    display: flex;
+
+    justify-content:
+    space-between;
+
+    gap: 10px;
+
+    padding: 8px 0;
+
+    border-bottom:
+    1px solid #333;
+}
+
+.linha:last-child {
+
+    border-bottom: none;
+}
+
+.valor {
+
+    font-weight: bold;
+
+    text-align: right;
 }
 
 .estatisticas {
@@ -3134,7 +3344,7 @@ h1 {
     display: grid;
 
     grid-template-columns:
-        repeat(4, 1fr);
+    repeat(2, 1fr);
 
     gap: 10px;
 
@@ -3161,10 +3371,16 @@ h1 {
     margin-top: 5px;
 }
 
+.observacao {
 
-/* ==========================================================
-   RODAPÉ
-   ========================================================== */
+    text-align: center;
+
+    color: #bbb;
+
+    font-size: 14px;
+
+    line-height: 1.5;
+}
 
 .atualizacao {
 
@@ -3177,70 +3393,16 @@ h1 {
     margin-top: 15px;
 }
 
-
-/* ==========================================================
-   CELULAR
-   ========================================================== */
-
-@media (max-width: 850px) {
-
-    .ativos {
-
-        grid-template-columns: 1fr;
-    }
-
-    .estatisticas {
-
-        grid-template-columns:
-            repeat(2, 1fr);
-    }
-}
-
-@media (max-width: 500px) {
-
-    body {
-
-        padding: 10px;
-    }
-
-    h1 {
-
-        font-size: 24px;
-    }
-
-    .ativo-card {
-
-        padding: 15px;
-    }
-
-    .ativo-nome {
-
-        font-size: 22px;
-    }
-
-    .sinal {
-
-        font-size: 34px;
-    }
-
-    .linha {
-
-        font-size: 13px;
-    }
-}
-
 </style>
 
 </head>
-
 
 <body>
 
 <div class="container">
 
-
 <h1>
-🤖 Robo Forex Pullback PRO
+Robo Forex Pullback PRO
 </h1>
 
 <div class="subtitulo">
@@ -3251,318 +3413,213 @@ Confirmação + RSI + ATR
 </div>
 
 
-<!-- =======================================================
-     TODOS OS ATIVOS
-     ======================================================= -->
-
-<div class="ativos">
-
-{% for symbol, ativo in estado.ativos.items() %}
-
-
-<div class="ativo-card">
-
-
-<div class="ativo-titulo">
-
-<div class="ativo-nome">
-
-{{ symbol }}
-
-</div>
-
-<div class="status">
-
-Atualizado:
-{{ ativo.atualizado }}
-
-</div>
-
-</div>
-
-
-<!-- SINAL -->
-
-<div class="sinal
-{% if ativo.sinal == 'CALL' %}
-call
-{% elif ativo.sinal == 'PUT' %}
-put
-{% else %}
-aguardar
-{% endif %}
-">
-
-{{ ativo.sinal }}
-
-</div>
-
-
-<!-- DADOS PRINCIPAIS -->
+<div class="card">
 
 <div class="linha">
 
-<span>
-Score
-</span>
+<span>Ativo</span>
 
 <span class="valor">
-{{ ativo.score }}
+{{ estado.ativo }}
 </span>
 
 </div>
 
+<div class="sinal">
+
+{{ estado.sinal }}
+
+</div>
 
 <div class="linha">
 
-<span>
-Preço
-</span>
+<span>Score</span>
 
 <span class="valor">
-{{ ativo.preco }}
+{{ estado.score }}
 </span>
 
 </div>
-
 
 <div class="linha">
 
-<span>
-Vela analisada
-</span>
+<span>Preço</span>
 
 <span class="valor">
-{{ ativo.vela }}
+{{ estado.preco }}
 </span>
 
 </div>
-
 
 <div class="linha">
 
-<span>
-Idade do dado
-</span>
+<span>Vela analisada</span>
 
 <span class="valor">
-{{ ativo.atualidade_min }}
+{{ estado.vela }}
 </span>
 
 </div>
 
+<div class="linha">
 
-<!-- FILTROS -->
+<span>Idade do dado</span>
 
-<div class="filtros">
+<span class="valor">
+{{ estado.atualidade_min }}
+</span>
+
+</div>
+
+<div class="linha">
+
+<span>Atualizado</span>
+
+<span class="valor">
+{{ estado.atualizado }}
+</span>
+
+</div>
+
+</div>
+
+
+<div class="card">
 
 <h3>
 Filtros da entrada
 </h3>
 
+<div class="linha">
+
+<span>Tendência 5M</span>
+
+<span class="valor">
+{{ estado.detalhes.tendencia_5m }}
+</span>
+
+</div>
 
 <div class="linha">
 
-<span>
-Tendência 5M
-</span>
+<span>Tendência 15M</span>
 
 <span class="valor">
-{{ ativo.detalhes.tendencia_5m }}
+{{ estado.detalhes.tendencia_15m }}
 </span>
 
 </div>
-
 
 <div class="linha">
 
-<span>
-Tendência 15M
-</span>
+<span>Pullback</span>
 
 <span class="valor">
-{{ ativo.detalhes.tendencia_15m }}
+{{ estado.detalhes.pullback }}
 </span>
 
 </div>
-
 
 <div class="linha">
 
-<span>
-Pullback
-</span>
+<span>Confirmação</span>
 
 <span class="valor">
-{{ ativo.detalhes.pullback }}
+{{ estado.detalhes.confirmacao }}
 </span>
 
 </div>
-
 
 <div class="linha">
 
-<span>
-Confirmação
-</span>
+<span>Mercado lateral</span>
 
 <span class="valor">
-{{ ativo.detalhes.confirmacao }}
+{{ estado.detalhes.lateral }}
 </span>
 
 </div>
-
 
 <div class="linha">
 
-<span>
-Mercado lateral
-</span>
+<span>Score CALL</span>
 
 <span class="valor">
-{{ ativo.detalhes.lateral }}
+{{ estado.detalhes.score_call }}
 </span>
 
 </div>
-
 
 <div class="linha">
 
-<span>
-Score CALL
-</span>
+<span>Score PUT</span>
 
 <span class="valor">
-{{ ativo.detalhes.score_call }}
+{{ estado.detalhes.score_put }}
 </span>
 
 </div>
-
 
 <div class="linha">
 
-<span>
-Score PUT
-</span>
+<span>RSI 14</span>
 
 <span class="valor">
-{{ ativo.detalhes.score_put }}
+{{ estado.detalhes.rsi }}
 </span>
 
 </div>
-
 
 <div class="linha">
 
-<span>
-RSI 14
-</span>
+<span>EMA 5</span>
 
 <span class="valor">
-{{ ativo.detalhes.rsi }}
+{{ estado.detalhes.ema5 }}
 </span>
 
 </div>
-
 
 <div class="linha">
 
-<span>
-EMA 5
-</span>
+<span>EMA 13</span>
 
 <span class="valor">
-{{ ativo.detalhes.ema5 }}
+{{ estado.detalhes.ema13 }}
 </span>
 
 </div>
-
 
 <div class="linha">
 
-<span>
-EMA 13
-</span>
+<span>EMA 21</span>
 
 <span class="valor">
-{{ ativo.detalhes.ema13 }}
+{{ estado.detalhes.ema21 }}
 </span>
 
 </div>
-
 
 <div class="linha">
 
-<span>
-EMA 21
-</span>
+<span>ATR 14</span>
 
 <span class="valor">
-{{ ativo.detalhes.ema21 }}
-</span>
-
-</div>
-
-
-<div class="linha">
-
-<span>
-ATR 14
-</span>
-
-<span class="valor">
-{{ ativo.detalhes.atr }}
+{{ estado.detalhes.atr }}
 </span>
 
 </div>
 
 </div>
 
-
-<!-- MENSAGEM -->
-
-<div class="observacao">
-
-{{ ativo.mensagem }}
-
-<br><br>
-
-<strong>
-Entrada:
-próxima vela de 5 minutos
-</strong>
-
-<br>
-
-<strong>
-Expiração:
-5 minutos
-</strong>
-
-</div>
-
-
-</div>
-
-
-{% endfor %}
-
-</div>
-
-
-<!-- =======================================================
-     ESTATÍSTICAS GERAIS
-     ======================================================= -->
 
 <div class="card">
 
 <h3>
-📊 Estatísticas gerais
+Estatísticas
 </h3>
 
-
 <div class="estatisticas">
-
 
 <div class="box">
 
@@ -3574,7 +3631,6 @@ Total
 
 </div>
 
-
 <div class="box">
 
 WIN
@@ -3584,7 +3640,6 @@ WIN
 </div>
 
 </div>
-
 
 <div class="box">
 
@@ -3596,7 +3651,6 @@ LOSS
 
 </div>
 
-
 <div class="box">
 
 DOJI
@@ -3607,12 +3661,9 @@ DOJI
 
 </div>
 
-
 </div>
 
-
 <br>
-
 
 <div class="linha">
 
@@ -3628,26 +3679,14 @@ Taxa de acerto
 
 </div>
 
-
 </div>
 
-
-<!-- =======================================================
-     OBSERVAÇÃO
-     ======================================================= -->
 
 <div class="card">
 
 <div class="observacao">
 
-O robô analisa os quatro ativos
-independentemente.
-
-<br><br>
-
-Cada ativo possui seu próprio
-sinal, score, indicadores e
-operação pendente.
+{{ estado.mensagem }}
 
 <br><br>
 
@@ -3668,7 +3707,7 @@ Expiração: 5 minutos
 <br><br>
 
 O resultado será calculado automaticamente
-quando a vela de expiração fechar.
+com base na vela de expiração recebida da Bullex.
 
 <br><br>
 
@@ -3706,7 +3745,6 @@ a cada 10 segundos.
 
 </div>
 
-
 </div>
 
 
@@ -3720,7 +3758,6 @@ setTimeout(function() {
 
 </script>
 
-
 </body>
 
 </html>
@@ -3730,6 +3767,7 @@ setTimeout(function() {
 # ============================================================
 # ROTAS
 # ============================================================
+
 
 @app.route("/")
 def index():
@@ -3782,11 +3820,8 @@ def health():
                 "confirmacao "
                 "em vela separada"
             ),
-
-        "ativos":
-            list(
-                ATIVOS.values()
-            ),
+        "fonte_candles": "Bullex",
+        "execucao_automatica": False,
 
         "telegram_configurado":
             telegram_configurado(),
@@ -3804,6 +3839,7 @@ def health():
 # ============================================================
 # EXECUÇÃO
 # ============================================================
+
 
 if __name__ == "__main__":
 
