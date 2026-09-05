@@ -69,8 +69,13 @@ ATIVO_BULLEX = {
     "EURUSD": {"symbol": "EUR/USD", "active_id": 76, "ticker": "EURUSD-OTC"},
     "EURJPY": {"symbol": "EUR/JPY", "active_id": 79, "ticker": "EURJPY-OTC"},
     "GBPUSD": {"symbol": "GBP/USD", "active_id": 81, "ticker": "GBPUSD-OTC"},
-    "USDJPY": {"symbol": "USD/JPY", "active_id": 85, "ticker": "USDJPY-OTC"},
     "GBPJPY": {"symbol": "GBP/JPY", "active_id": 84, "ticker": "GBPJPY-OTC"},
+    "USDJPY": {"symbol": "USD/JPY", "active_id": 85, "ticker": "USDJPY-OTC"},
+    "EURGBP": {"symbol": "EUR/GBP", "active_id": 77, "ticker": "EURGBP-OTC"},
+    "USDCHF": {"symbol": "USD/CHF", "active_id": 78, "ticker": "USDCHF-OTC"},
+    "NZDUSD": {"symbol": "NZD/USD", "active_id": 80, "ticker": "NZDUSD-OTC"},
+    "AUDUSD": {"symbol": "AUD/USD", "active_id": 2111, "ticker": "AUDUSD-OTC"},
+    "USDCAD": {"symbol": "USD/CAD", "active_id": 2112, "ticker": "USDCAD-OTC"},
 }
 
 _bullex_assets_lock = threading.RLock()
@@ -85,8 +90,13 @@ ATIVOS = {
     "EURUSD": "EUR/USD",
     "EURJPY": "EUR/JPY",
     "GBPUSD": "GBP/USD",
-    "USDJPY": "USD/JPY",
     "GBPJPY": "GBP/JPY",
+    "USDJPY": "USD/JPY",
+    "EURGBP": "EUR/GBP",
+    "USDCHF": "USD/CHF",
+    "NZDUSD": "NZD/USD",
+    "AUDUSD": "AUD/USD",
+    "USDCAD": "USD/CAD",
 }
 
 _BULLEX_CANDLE_SIZES = {"5min": 300, "15min": 900}
@@ -112,7 +122,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OTC-AUTO-FIX-FUNCOES-20260905-03"
+BULLEX_DIAGNOSTIC_VERSION = "OTC-10-PARES-20260905-04"
 
 _bullex_diag = {
     "messages": 0,
@@ -196,7 +206,7 @@ estado = {
 # Informações expostas no dashboard sobre a descoberta automática.
 estado["ativos_info"] = {
     "quantidade": len(ATIVO_BULLEX),
-    "status": "FALLBACK / aguardando descoberta",
+    "status": "FALLBACK / 10 pares prioritários / aguardando descoberta",
     "lista": ", ".join(
         f"{cfg['ticker']} (id {cfg['active_id']})"
         for cfg in ATIVO_BULLEX.values()
@@ -1495,8 +1505,33 @@ def _consultar_lista_instrumentos(nome, versoes=("2.0", "1.0")):
     return None, []
 
 
+# ============================================================
+# FILTRO DOS 10 PARES OTC PRIORITÁRIOS
+# ============================================================
+
+# A Traderoom continua sendo consultada automaticamente e pode retornar
+# dezenas de OTCs. O robô, porém, processa somente estes 10 pares.
+# A estratégia, Telegram, dashboard, histórico e candles permanecem iguais.
+OTC_PARES_PRIORITARIOS = {
+    "EURUSD": {"symbol": "EUR/USD", "active_id": 76, "ticker": "EURUSD-OTC"},
+    "EURJPY": {"symbol": "EUR/JPY", "active_id": 79, "ticker": "EURJPY-OTC"},
+    "GBPUSD": {"symbol": "GBP/USD", "active_id": 81, "ticker": "GBPUSD-OTC"},
+    "GBPJPY": {"symbol": "GBP/JPY", "active_id": 84, "ticker": "GBPJPY-OTC"},
+    "USDJPY": {"symbol": "USD/JPY", "active_id": 85, "ticker": "USDJPY-OTC"},
+    "EURGBP": {"symbol": "EUR/GBP", "active_id": 77, "ticker": "EURGBP-OTC"},
+    "USDCHF": {"symbol": "USD/CHF", "active_id": 78, "ticker": "USDCHF-OTC"},
+    "NZDUSD": {"symbol": "NZD/USD", "active_id": 80, "ticker": "NZDUSD-OTC"},
+    "AUDUSD": {"symbol": "AUD/USD", "active_id": 2111, "ticker": "AUDUSD-OTC"},
+    "USDCAD": {"symbol": "USD/CAD", "active_id": 2112, "ticker": "USDCAD-OTC"},
+}
+
+OTC_TICKERS_PRIORITARIOS = {
+    cfg["ticker"].upper(): codigo
+    for codigo, cfg in OTC_PARES_PRIORITARIOS.items()
+}
+
 def _atualizar_ativos_otc(otcs, origem):
-    """Substitui ATIVO_BULLEX/ATIVOS pela lista OTC descoberta."""
+    """Carrega somente os 10 pares OTC prioritários encontrados na Traderoom."""
     global ATIVO_BULLEX
     global ATIVOS
     global _bullex_assets_detected
@@ -1507,22 +1542,50 @@ def _atualizar_ativos_otc(otcs, origem):
     if not otcs:
         raise RuntimeError("Nenhum ativo OTC foi encontrado na Traderoom.")
 
+    # Indexa a resposta automática por ticker.
+    encontrados = {}
+    for item in otcs:
+        ticker = str(item.get("ticker", "")).strip().upper()
+        if ticker:
+            encontrados[ticker] = item
+
     novos_bullex = {}
     novos_ativos = {}
 
-    for item in otcs:
-        codigo = item["codigo"]
-        # Evita colisão de código caso a Traderoom envie dois registros
-        # com o mesmo ticker textual.
-        if codigo in novos_bullex:
-            codigo = f"{codigo}_{item['active_id']}"
+    # Mantém a ordem fixa dos 10 pares, independentemente da ordem
+    # em que a Traderoom devolver os 85 instrumentos.
+    for codigo, preferido in OTC_PARES_PRIORITARIOS.items():
+        item = encontrados.get(preferido["ticker"].upper())
+
+        if item is None:
+            # Fallback pelo active_id, caso a Traderoom altere apenas
+            # a grafia do ticker, mas preserve o ID conhecido.
+            for candidato in otcs:
+                try:
+                    if int(candidato.get("active_id")) == int(preferido["active_id"]):
+                        item = candidato
+                        break
+                except (TypeError, ValueError):
+                    continue
+
+        if item is None:
+            log(
+                f"[OTC FILTRO] {preferido['ticker']} não apareceu "
+                "na lista atual da Traderoom; será ignorado."
+            )
+            continue
 
         novos_bullex[codigo] = {
-            "symbol": item["symbol"],
-            "active_id": int(item["active_id"]),
-            "ticker": item["ticker"],
+            "symbol": preferido["symbol"],
+            "active_id": int(item.get("active_id", preferido["active_id"])),
+            "ticker": preferido["ticker"],
         }
-        novos_ativos[codigo] = item["symbol"]
+        novos_ativos[codigo] = preferido["symbol"]
+
+    if not novos_bullex:
+        raise RuntimeError(
+            "Nenhum dos 10 pares OTC prioritários está disponível na Traderoom."
+        )
 
     with _bullex_assets_lock:
         ATIVO_BULLEX = novos_bullex
@@ -1533,7 +1596,8 @@ def _atualizar_ativos_otc(otcs, origem):
         _bullex_assets_source = origem
 
     log(
-        "[OTC AUTO] Ativos carregados automaticamente: "
+        "[OTC AUTO] Filtro ativo: "
+        f"{len(novos_bullex)}/10 pares prioritários carregados: "
         + ", ".join(
             f"{cfg['ticker']}={cfg['active_id']}"
             for cfg in novos_bullex.values()
@@ -1542,13 +1606,12 @@ def _atualizar_ativos_otc(otcs, origem):
 
     estado["ativos_info"] = {
         "quantidade": len(novos_bullex),
-        "status": "AUTOMÁTICO",
+        "status": f"AUTOMÁTICO / FILTRO 10 PARES ({len(novos_bullex)}/10)",
         "lista": ", ".join(
             f"{cfg['ticker']} (id {cfg['active_id']})"
             for cfg in novos_bullex.values()
         ) or "-",
     }
-
 
 def _descobrir_otcs_automaticamente():
     """
