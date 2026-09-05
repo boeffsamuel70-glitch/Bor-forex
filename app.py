@@ -4,7 +4,6 @@ import threading
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import json
-import re
 import requests
 import websocket
 
@@ -62,41 +61,12 @@ BULLEX_USER_AGENT = os.getenv(
 # ATIVOS BULLEX
 # ============================================================
 
-# Fallback inicial. Depois da autenticação o robô consulta
-# automaticamente as listas de instrumentos da Traderoom e substitui
-# esta tabela pelos OTC realmente disponíveis na conta.
 ATIVO_BULLEX = {
     "EURUSD": {"symbol": "EUR/USD", "active_id": 76, "ticker": "EURUSD-OTC"},
     "EURJPY": {"symbol": "EUR/JPY", "active_id": 79, "ticker": "EURJPY-OTC"},
     "GBPUSD": {"symbol": "GBP/USD", "active_id": 81, "ticker": "GBPUSD-OTC"},
-    "GBPJPY": {"symbol": "GBP/JPY", "active_id": 84, "ticker": "GBPJPY-OTC"},
     "USDJPY": {"symbol": "USD/JPY", "active_id": 85, "ticker": "USDJPY-OTC"},
-    "EURGBP": {"symbol": "EUR/GBP", "active_id": 77, "ticker": "EURGBP-OTC"},
-    "USDCHF": {"symbol": "USD/CHF", "active_id": 78, "ticker": "USDCHF-OTC"},
-    "NZDUSD": {"symbol": "NZD/USD", "active_id": 80, "ticker": "NZDUSD-OTC"},
-    "AUDUSD": {"symbol": "AUD/USD", "active_id": 2111, "ticker": "AUDUSD-OTC"},
-    "USDCAD": {"symbol": "USD/CAD", "active_id": 2112, "ticker": "USDCAD-OTC"},
-}
-
-_bullex_assets_lock = threading.RLock()
-_bullex_assets_detected = False
-_bullex_assets_last_error = None
-_bullex_assets_updated_at = None
-_bullex_assets_source = None
-
-# Mantém a estratégia funcionando imediatamente enquanto a lista automática
-# ainda está sendo carregada.
-ATIVOS = {
-    "EURUSD": "EUR/USD",
-    "EURJPY": "EUR/JPY",
-    "GBPUSD": "GBP/USD",
-    "GBPJPY": "GBP/JPY",
-    "USDJPY": "USD/JPY",
-    "EURGBP": "EUR/GBP",
-    "USDCHF": "USD/CHF",
-    "NZDUSD": "NZD/USD",
-    "AUDUSD": "AUD/USD",
-    "USDCAD": "USD/CAD",
+    "GBPJPY": {"symbol": "GBP/JPY", "active_id": 84, "ticker": "GBPJPY-OTC"},
 }
 
 _BULLEX_CANDLE_SIZES = {"5min": 300, "15min": 900}
@@ -122,7 +92,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OTC-10-PARES-20260905-05"
+BULLEX_DIAGNOSTIC_VERSION = "OTC-WS-HISTORY-STRATEGY-FIX-20260905-03"
 
 _bullex_diag = {
     "messages": 0,
@@ -134,10 +104,6 @@ _bullex_diag = {
     "last_active_id": None,
     "last_size": None,
     "last_keys": [],
-    "last_stored": {},
-    "processamentos": 0,
-    "ultimo_processamento": None,
-    "erros_processamento": 0,
 }
 _bullex_diag_lock = threading.Lock()
 
@@ -167,7 +133,13 @@ MAX_ATRASO_MINUTOS = 8
 # ATIVOS
 # ============================================================
 
-
+ATIVOS = {
+    "EURUSD": "EUR/USD",
+    "EURJPY": "EUR/JPY",
+    "GBPUSD": "GBP/USD",
+    "USDJPY": "USD/JPY",
+    "GBPJPY": "GBP/JPY",
+}
 
 # ============================================================
 # ESTADO
@@ -196,6 +168,7 @@ estado = {
         "confirmacao": "-",
         "lateral": "-",
         "atr": "-",
+        "bloqueio": "-",
     },
 
     "estatisticas": {
@@ -205,16 +178,6 @@ estado = {
         "dojis": 0,
         "taxa": 0.0,
     },
-}
-
-# Informações expostas no dashboard sobre a descoberta automática.
-estado["ativos_info"] = {
-    "quantidade": len(ATIVO_BULLEX),
-    "status": "FALLBACK / 10 pares prioritários / aguardando descoberta",
-    "lista": ", ".join(
-        f"{cfg['ticker']} (id {cfg['active_id']})"
-        for cfg in ATIVO_BULLEX.values()
-    ) or "-",
 }
 
 _robo_lock = threading.Lock()
@@ -454,6 +417,7 @@ def _normalizar_candle_ws(item):
             "low": float(low),
             "close": float(item["close"]),
             "volume": float(item.get("volume", 0) or 0),
+            "phase": item.get("phase"),
         }
 
     except (
@@ -503,26 +467,6 @@ def _armazenar_candle_ws(active_id, size, item):
 
         bucket[chave] = candle
         _bullex_cv.notify_all()
-
-    # Diagnóstico leve: registra apenas a primeira vela armazenada de cada
-    # ativo/timeframe, evitando inundar o log (o feed é contínuo).
-    diag_key = f"{active_id_int}:{size_int}"
-    with _bullex_diag_lock:
-        primeiro_armazenamento = diag_key not in _bullex_diag["last_stored"]
-        if primeiro_armazenamento:
-            _bullex_diag["last_stored"][diag_key] = {
-                "active_id": active_id_int,
-                "size": size_int,
-                "candle_id": candle.get("id"),
-                "datetime": candle.get("datetime"),
-            }
-
-    if primeiro_armazenamento:
-        log(
-            f"[DIAG STORE] candle armazenado: active_id={active_id_int} "
-            f"size={size_int} id={candle.get('id')} "
-            f"datetime={candle.get('datetime')}"
-        )
 
 
 def _extrair_candles_da_resposta(msg):
@@ -751,7 +695,7 @@ def _on_bullex_message(ws, raw_message):
             log("Autenticacao Bullex confirmada.")
 
         threading.Thread(
-            target=_inicializar_ativos_otc,
+            target=_assinar_candles_otc,
             daemon=True,
             name="bullex-candle-subscriptions",
         ).start()
@@ -1135,195 +1079,25 @@ def _assinar_candle(active_id, size):
         )
 
 
-def _texto_tem_otc(valor):
-    """Retorna True quando o valor representa claramente um instrumento OTC."""
-    if valor is None:
-        return False
-    texto = str(valor).strip().upper()
-    return (
-        "OTC" in texto
-        or texto.endswith("-OTC")
-        or texto.endswith("_OTC")
-        or texto.endswith("/OTC")
-    )
+def _assinar_candles_otc():
+    """Assina 5M e 15M dos ativos usados pelo robô."""
+    assinaturas = set()
 
+    for config in ATIVO_BULLEX.values():
+        active_id = int(config["active_id"])
+        for size in (300, 900):
+            chave = (active_id, size)
+            if chave in assinaturas:
+                continue
+            assinaturas.add(chave)
+            try:
+                _assinar_candle(active_id, size)
+            except Exception as e:
+                log(
+                    f"Nao foi possivel assinar candle-generated "
+                    f"active_id={active_id} size={size}: {e}"
+                )
 
-def _iter_dicts_recursivo(obj):
-    """Percorre listas/dicionários de qualquer formato retornado pela Traderoom."""
-    if isinstance(obj, dict):
-        yield obj
-        for valor in obj.values():
-            yield from _iter_dicts_recursivo(valor)
-    elif isinstance(obj, list):
-        for valor in obj:
-            yield from _iter_dicts_recursivo(valor)
-
-
-def _primeiro_valor(item, chaves):
-    for chave in chaves:
-        if chave in item and item[chave] not in (None, ""):
-            return item[chave]
-    return None
-
-
-def _normalizar_instrumento_otc(item):
-    """
-    Converte diferentes formatos de underlying_list em:
-    codigo -> {symbol, active_id, ticker}.
-
-    A Traderoom pode mudar a posição/nome de campos entre versões.
-    Por isso procuramos por aliases conhecidos em vez de depender de
-    um único JSON rígido.
-    """
-    if not isinstance(item, dict):
-        return None
-
-    active_id = _primeiro_valor(
-        item,
-        (
-            "active_id",
-            "activeId",
-            "activeID",
-            "asset_id",
-            "assetId",
-            "instrument_id",
-            "instrumentId",
-            "id",
-        ),
-    )
-
-    try:
-        active_id = int(active_id)
-    except (TypeError, ValueError):
-        return None
-
-    ticker = _primeiro_valor(
-        item,
-        (
-            "ticker",
-            "ticker_name",
-            "tickerName",
-            "display_name",
-            "displayName",
-            "instrument_name",
-            "instrumentName",
-            "name",
-            "symbol",
-            "underlying",
-            "underlying_name",
-            "underlyingName",
-        ),
-    )
-
-    symbol = _primeiro_valor(
-        item,
-        (
-            "symbol",
-            "asset_name",
-            "assetName",
-            "underlying",
-            "underlying_name",
-            "underlyingName",
-            "name",
-        ),
-    )
-
-    # Alguns retornos trazem o OTC em um campo e o par em outro.
-    campos_texto = [
-        item.get(chave)
-        for chave in (
-            "ticker",
-            "ticker_name",
-            "tickerName",
-            "display_name",
-            "displayName",
-            "instrument_name",
-            "instrumentName",
-            "name",
-            "symbol",
-            "underlying",
-            "underlying_name",
-            "underlyingName",
-            "type",
-            "instrument_type",
-        )
-    ]
-
-    texto_otc = " ".join(
-        str(x) for x in campos_texto if x not in (None, "")
-    ).upper()
-
-    if "OTC" not in texto_otc:
-        return None
-
-    # Ticker é preferido para identificar o ativo OTC.
-    ticker_text = str(ticker or symbol or "").strip()
-    symbol_text = str(symbol or ticker or "").strip()
-
-    if not ticker_text:
-        ticker_text = f"OTC-{active_id}"
-
-    # Se só veio EURUSD-OTC, cria EUR/USD para a estratégia.
-    base = ticker_text.upper()
-    base = re.sub(r"[^A-Z]", "", base.replace("OTC", ""))
-    if len(base) >= 6 and base[:6].isalpha():
-        par = base[:6]
-        symbol_normalizado = f"{par[:3]}/{par[3:6]}"
-    else:
-        base2 = re.sub(r"[^A-Z]", "", symbol_text.upper().replace("OTC", ""))
-        if len(base2) >= 6:
-            symbol_normalizado = f"{base2[:3]}/{base2[3:6]}"
-        else:
-            symbol_normalizado = symbol_text or ticker_text
-
-    # Código interno estável, derivado do ticker/par.
-    codigo_base = re.sub(r"[^A-Z0-9]", "", ticker_text.upper())
-    if not codigo_base:
-        codigo_base = re.sub(r"[^A-Z0-9]", "", symbol_normalizado.upper())
-    codigo = codigo_base
-    if not codigo.upper().endswith("OTC"):
-        codigo = f"{codigo}OTC"
-
-    return {
-        "codigo": codigo,
-        "symbol": symbol_normalizado,
-        "active_id": active_id,
-        "ticker": ticker_text,
-        "raw": item,
-    }
-
-
-def _extrair_otcs_da_resposta(resposta):
-    """Extrai todos os OTCs de uma resposta, mesmo com envelopes diferentes."""
-    encontrados = {}
-
-    for item in _iter_dicts_recursivo(resposta):
-        normalizado = _normalizar_instrumento_otc(item)
-        if not normalizado:
-            continue
-
-        active_id = normalizado["active_id"]
-        atual = encontrados.get(active_id)
-
-        # Prefere a ocorrência que tenha ticker explícito com OTC.
-        if atual is None:
-            encontrados[active_id] = normalizado
-        else:
-            atual_ticker = str(atual.get("ticker", "")).upper()
-            novo_ticker = str(normalizado.get("ticker", "")).upper()
-            if "OTC" in novo_ticker and "OTC" not in atual_ticker:
-                encontrados[active_id] = normalizado
-
-    resultado = list(encontrados.values())
-    resultado.sort(key=lambda x: (x["ticker"].upper(), x["active_id"]))
-    return resultado
-
-
-
-
-# ============================================================
-# BULLEX - COMANDOS ASSINCRONOS / INICIALIZACAO OTC
-# ============================================================
 
 def _enviar_e_aguardar(
     nome,
@@ -1411,271 +1185,6 @@ def _enviar_e_aguardar(
     raise RuntimeError(
         f"Timeout aguardando resposta Bullex: "
         f"{nome} request_id={request_id}"
-    )
-
-def _assinar_candles_otc():
-    """Assina 5M e 15M dos ativos usados pelo robô."""
-    assinaturas = set()
-
-    for config in ATIVO_BULLEX.values():
-        active_id = int(config["active_id"])
-        for size in (300, 900):
-            chave = (active_id, size)
-            if chave in assinaturas:
-                continue
-            assinaturas.add(chave)
-            try:
-                _assinar_candle(active_id, size)
-            except Exception as e:
-                log(
-                    f"Nao foi possivel assinar candle-generated "
-                    f"active_id={active_id} size={size}: {e}"
-                )
-
-def _inicializar_ativos_otc():
-    """Descobre OTCs e, somente depois, assina os candles."""
-    global _bullex_assets_last_error
-
-    try:
-        otcs = _descobrir_otcs_automaticamente()
-
-        # Assina somente após a tabela dinâmica estar pronta.
-        _assinar_candles_otc()
-
-        log(
-            f"[OTC AUTO] Inicialização concluída com {len(otcs)} ativos OTC."
-        )
-    except Exception as e:
-        _bullex_assets_last_error = str(e)
-        log(f"[OTC AUTO] ERRO na descoberta automática: {e}")
-
-        # Fallback: não derruba o robô se a lista automática falhar.
-        log(
-            "[OTC AUTO] Mantendo ativos de fallback já conhecidos "
-            "para não interromper o robô."
-        )
-        try:
-            _assinar_candles_otc()
-        except Exception as sube:
-            log(f"[OTC AUTO] Erro no fallback de assinaturas: {sube}")
-
-def _corpo_lista_instrumentos(nome):
-    """
-    Corpo exigido pelo serviço de lista de instrumentos.
-
-    A resposta bruta da Bullex confirmou que enviar body vazio para
-    digital-option-instruments.get-underlying-list provoca:
-    "body unmarshal error" + "EOF".
-
-    Para o serviço digital, a estrutura compatível é informar o tipo
-    digital-option. Para o serviço marginal, o endpoint observado já
-    responde com body vazio, então mantemos None.
-    """
-    if nome == "digital-option-instruments.get-underlying-list":
-        return {"type": "digital-option"}
-    return None
-
-
-def _consultar_lista_instrumentos(nome, versoes=("2.0", "1.0")):
-    """
-    Consulta um microserviço de instrumentos usando o body correto para
-    cada serviço.
-    """
-    ultimo_erro = None
-    body = _corpo_lista_instrumentos(nome)
-
-    for versao in versoes:
-        try:
-            resposta = _enviar_e_aguardar(
-                nome,
-                versao,
-                body,
-                timeout=12,
-            )
-            # DIAGNÓSTICO TEMPORÁRIO: imprime a resposta bruta para descobrirmos
-            # o formato EXATO usado pela Traderoom. Não altera a lógica de candles.
-            try:
-                bruto = json.dumps(resposta, ensure_ascii=False, separators=(",", ":"))
-            except Exception:
-                bruto = repr(resposta)
-
-            # Evita explodir o log do Render, mas preserva uma amostra grande.
-            if len(bruto) > 50000:
-                bruto_log = bruto[:50000] + "... [TRUNCADO EM 50000 CARACTERES]"
-            else:
-                bruto_log = bruto
-
-            log(f"[OTC RAW] {nome} v{versao} RESPOSTA={bruto_log}")
-
-            otcs = _extrair_otcs_da_resposta(resposta)
-            if otcs:
-                log(
-                    f"[OTC AUTO] {nome} v{versao}: "
-                    f"{len(otcs)} OTC encontrados."
-                )
-                return resposta, otcs
-            log(
-                f"[OTC AUTO] {nome} v{versao}: resposta recebida, "
-                "mas nenhum OTC foi reconhecido."
-            )
-        except Exception as e:
-            ultimo_erro = e
-            log(
-                f"[OTC AUTO] Falha em {nome} v{versao}: {e}"
-            )
-
-    if ultimo_erro:
-        raise ultimo_erro
-    return None, []
-
-
-# ============================================================
-# FILTRO DOS 10 PARES OTC PRIORITÁRIOS
-# ============================================================
-
-# A Traderoom continua sendo consultada automaticamente e pode retornar
-# dezenas de OTCs. O robô, porém, processa somente estes 10 pares.
-# A estratégia, Telegram, dashboard, histórico e candles permanecem iguais.
-OTC_PARES_PRIORITARIOS = {
-    "EURUSD": {"symbol": "EUR/USD", "active_id": 76, "ticker": "EURUSD-OTC"},
-    "EURJPY": {"symbol": "EUR/JPY", "active_id": 79, "ticker": "EURJPY-OTC"},
-    "GBPUSD": {"symbol": "GBP/USD", "active_id": 81, "ticker": "GBPUSD-OTC"},
-    "GBPJPY": {"symbol": "GBP/JPY", "active_id": 84, "ticker": "GBPJPY-OTC"},
-    "USDJPY": {"symbol": "USD/JPY", "active_id": 85, "ticker": "USDJPY-OTC"},
-    "EURGBP": {"symbol": "EUR/GBP", "active_id": 77, "ticker": "EURGBP-OTC"},
-    "USDCHF": {"symbol": "USD/CHF", "active_id": 78, "ticker": "USDCHF-OTC"},
-    "NZDUSD": {"symbol": "NZD/USD", "active_id": 80, "ticker": "NZDUSD-OTC"},
-    "AUDUSD": {"symbol": "AUD/USD", "active_id": 2111, "ticker": "AUDUSD-OTC"},
-    "USDCAD": {"symbol": "USD/CAD", "active_id": 2112, "ticker": "USDCAD-OTC"},
-}
-
-OTC_TICKERS_PRIORITARIOS = {
-    cfg["ticker"].upper(): codigo
-    for codigo, cfg in OTC_PARES_PRIORITARIOS.items()
-}
-
-def _atualizar_ativos_otc(otcs, origem):
-    """Carrega somente os 10 pares OTC prioritários encontrados na Traderoom."""
-    global ATIVO_BULLEX
-    global ATIVOS
-    global _bullex_assets_detected
-    global _bullex_assets_last_error
-    global _bullex_assets_updated_at
-    global _bullex_assets_source
-
-    if not otcs:
-        raise RuntimeError("Nenhum ativo OTC foi encontrado na Traderoom.")
-
-    # Indexa a resposta automática por ticker.
-    encontrados = {}
-    for item in otcs:
-        ticker = str(item.get("ticker", "")).strip().upper()
-        if ticker:
-            encontrados[ticker] = item
-
-    novos_bullex = {}
-    novos_ativos = {}
-
-    # Mantém a ordem fixa dos 10 pares, independentemente da ordem
-    # em que a Traderoom devolver os 85 instrumentos.
-    for codigo, preferido in OTC_PARES_PRIORITARIOS.items():
-        item = encontrados.get(preferido["ticker"].upper())
-
-        if item is None:
-            # Fallback pelo active_id, caso a Traderoom altere apenas
-            # a grafia do ticker, mas preserve o ID conhecido.
-            for candidato in otcs:
-                try:
-                    if int(candidato.get("active_id")) == int(preferido["active_id"]):
-                        item = candidato
-                        break
-                except (TypeError, ValueError):
-                    continue
-
-        if item is None:
-            log(
-                f"[OTC FILTRO] {preferido['ticker']} não apareceu "
-                "na lista atual da Traderoom; será ignorado."
-            )
-            continue
-
-        novos_bullex[codigo] = {
-            "symbol": preferido["symbol"],
-            "active_id": int(item.get("active_id", preferido["active_id"])),
-            "ticker": preferido["ticker"],
-        }
-        novos_ativos[codigo] = preferido["symbol"]
-
-    if not novos_bullex:
-        raise RuntimeError(
-            "Nenhum dos 10 pares OTC prioritários está disponível na Traderoom."
-        )
-
-    with _bullex_assets_lock:
-        ATIVO_BULLEX = novos_bullex
-        ATIVOS = novos_ativos
-        _bullex_assets_detected = True
-        _bullex_assets_last_error = None
-        _bullex_assets_updated_at = agora_brt().isoformat()
-        _bullex_assets_source = origem
-
-    log(
-        "[OTC AUTO] Filtro ativo: "
-        f"{len(novos_bullex)}/10 pares prioritários carregados: "
-        + ", ".join(
-            f"{cfg['ticker']}={cfg['active_id']}"
-            for cfg in novos_bullex.values()
-        )
-    )
-
-    estado["ativos_info"] = {
-        "quantidade": len(novos_bullex),
-        "status": f"AUTOMÁTICO / FILTRO 10 PARES ({len(novos_bullex)}/10)",
-        "lista": ", ".join(
-            f"{cfg['ticker']} (id {cfg['active_id']})"
-            for cfg in novos_bullex.values()
-        ) or "-",
-    }
-
-def _descobrir_otcs_automaticamente():
-    """
-    Descobre OTCs diretamente da lista de instrumentos digitais da Traderoom.
-
-    O endpoint marginal-forex retornado pela Bullex contém Forex normal
-    (EURUSD, EURGBP, GBPJPY, etc.) e não deve ser usado como fonte principal
-    de OTC. A fonte digital é a que interessa para opções digitais.
-    """
-    nome_digital = "digital-option-instruments.get-underlying-list"
-
-    try:
-        resposta, otcs = _consultar_lista_instrumentos(nome_digital)
-        if otcs:
-            _atualizar_ativos_otc(
-                otcs,
-                nome_digital,
-            )
-            return otcs
-    except Exception as e:
-        log(f"[OTC AUTO] Falha na fonte digital {nome_digital}: {e}")
-
-    # O endpoint marginal é mantido somente como diagnóstico/suplemento.
-    # Ele pode retornar Forex normal e não contém necessariamente os OTCs.
-    nome_marginal = "marginal-forex-instruments.get-underlying-list"
-    try:
-        resposta_marginal, otcs_marginal = _consultar_lista_instrumentos(
-            nome_marginal
-        )
-        if otcs_marginal:
-            _atualizar_ativos_otc(
-                otcs_marginal,
-                nome_marginal,
-            )
-            return otcs_marginal
-    except Exception as e:
-        log(f"[OTC AUTO] Fonte marginal indisponível: {e}")
-
-    raise RuntimeError(
-        "A Traderoom não retornou nenhum OTC na lista de instrumentos digitais."
     )
 
 
@@ -1992,6 +1501,23 @@ def ema(values, period):
     return valor
 
 
+def ema_series(values, period):
+    """Retorna a EMA alinhada a cada candle disponível."""
+    if len(values) < period:
+        return [None] * len(values)
+
+    k = 2 / (period + 1)
+    resultado = [None] * (period - 1)
+    valor = sum(values[:period]) / period
+    resultado.append(valor)
+
+    for preco in values[period:]:
+        valor = preco * k + valor * (1 - k)
+        resultado.append(valor)
+
+    return resultado
+
+
 def rsi(values, period=14):
     if len(values) < period + 1:
         return None
@@ -2209,92 +1735,61 @@ def tendencia_timeframe(candles):
 # PULLBACK
 # ============================================================
 
-def pullback_call_na_vela(
-    info,
-    ema13,
-    ema21
-):
-    if not ema13 or not ema21:
+def pullback_na_vela(info, ema13, ema21, direcao):
+    """Detecta pullback real perto das EMAs, alinhado à direção.
+
+    CALL: a vela de pullback deve testar EMA13/EMA21 sem ser uma vela
+    fortemente compradora.
+    PUT: inverso.
+    """
+    if not info or ema13 is None or ema21 is None:
         return False
 
-    tocou_ema13 = (
-        info["low"]
-        <= ema13
-        <= info["high"]
-    )
-
-    tocou_ema21 = (
-        info["low"]
-        <= ema21
-        <= info["high"]
-    )
-
-    perto_ema13 = (
-        percentual_distancia(
-            info["low"],
-            ema13
+    if direcao == "CALL":
+        referencias = (ema13, ema21)
+        toque = any(
+            info["low"] <= ref <= info["high"]
+            for ref in referencias
         )
-        <= 0.0012
-    )
+        proximidade = min(
+            percentual_distancia(info["low"], ref)
+            for ref in referencias
+        ) <= 0.0007
 
-    perto_ema21 = (
-        percentual_distancia(
-            info["low"],
-            ema21
+        # Evita chamar uma vela de impulso forte de "pullback".
+        vela_retracao = (
+            info["close"] <= info["open"]
+            or info["body_ratio"] <= 0.55
         )
-        <= 0.0012
-    )
+        return (toque or proximidade) and vela_retracao
 
-    return (
-        tocou_ema13
-        or tocou_ema21
-        or perto_ema13
-        or perto_ema21
-    )
-
-
-def pullback_put_na_vela(
-    info,
-    ema13,
-    ema21
-):
-    if not ema13 or not ema21:
-        return False
-
-    tocou_ema13 = (
-        info["low"]
-        <= ema13
-        <= info["high"]
-    )
-
-    tocou_ema21 = (
-        info["low"]
-        <= ema21
-        <= info["high"]
-    )
-
-    perto_ema13 = (
-        percentual_distancia(
-            info["high"],
-            ema13
+    if direcao == "PUT":
+        referencias = (ema13, ema21)
+        toque = any(
+            info["low"] <= ref <= info["high"]
+            for ref in referencias
         )
-        <= 0.0012
-    )
+        proximidade = min(
+            percentual_distancia(info["high"], ref)
+            for ref in referencias
+        ) <= 0.0007
 
-    perto_ema21 = (
-        percentual_distancia(
-            info["high"],
-            ema21
+        vela_retracao = (
+            info["close"] >= info["open"]
+            or info["body_ratio"] <= 0.55
         )
-        <= 0.0012
-    )
+        return (toque or proximidade) and vela_retracao
 
-    return (
-        tocou_ema13
-        or tocou_ema21
-        or perto_ema13
-        or perto_ema21
-    )
+    return False
+
+
+# Compatibilidade com chamadas antigas.
+def pullback_call_na_vela(info, ema13, ema21):
+    return pullback_na_vela(info, ema13, ema21, "CALL")
+
+
+def pullback_put_na_vela(info, ema13, ema21):
+    return pullback_na_vela(info, ema13, ema21, "PUT")
 
 
 # ============================================================
@@ -2345,24 +1840,18 @@ def analisar_pullback(
     candles_5m,
     candles_15m
 ):
+    """Estratégia principal 5M + 15M + pullback + confirmação separada.
+
+    A lógica mantém o núcleo conservador, mas elimina filtros redundantes
+    que estavam transformando quase todos os setups válidos em AGUARDAR.
+    """
     if len(candles_5m) < 40:
         return {
             "sinal": "AGUARDAR",
             "score": 0,
-            "preco": (
-                float(
-                    candles_5m[-1]["close"]
-                )
-                if candles_5m
-                else 0
-            ),
-            "vela": (
-                candles_5m[-1]["_dt"]
-                if candles_5m
-                else None
-            ),
-            "mensagem":
-                "Poucas velas para análise.",
+            "preco": float(candles_5m[-1]["close"]) if candles_5m else 0,
+            "vela": candles_5m[-1]["_dt"] if candles_5m else None,
+            "mensagem": "Poucas velas para análise.",
             "score_call": 0,
             "score_put": 0,
         }
@@ -2371,426 +1860,222 @@ def analisar_pullback(
         return {
             "sinal": "AGUARDAR",
             "score": 0,
-            "preco":
-                float(
-                    candles_5m[-1]["close"]
-                ),
-            "vela":
-                candles_5m[-1]["_dt"],
-            "mensagem":
-                "Poucas velas de 15M.",
+            "preco": float(candles_5m[-1]["close"]),
+            "vela": candles_5m[-1]["_dt"],
+            "mensagem": "Poucas velas de 15M.",
             "score_call": 0,
             "score_put": 0,
         }
 
     c = closes(candles_5m)
-
     preco = c[-1]
 
     ema5 = ema(c, 5)
     ema13 = ema(c, 13)
     ema21 = ema(c, 21)
+    ema13_series = ema_series(c, 13)
+    ema21_series = ema_series(c, 21)
 
     rsi14 = rsi(c, 14)
     atr14 = atr(candles_5m, 14)
 
-    tendencia_5m = tendencia_timeframe(
-        candles_5m
+    tendencia_5m = tendencia_timeframe(candles_5m)
+    tendencia_15m = tendencia_timeframe(candles_15m)
+
+    confirmacao = candle_info(candles_5m[-1])
+    pullback_1 = candle_info(candles_5m[-2])
+    pullback_2 = candle_info(candles_5m[-3])
+
+    # EMA calculada no próprio candle do pullback, e não na vela atual.
+    pb1_ema13 = ema13_series[-2]
+    pb1_ema21 = ema21_series[-2]
+    pb2_ema13 = ema13_series[-3]
+    pb2_ema21 = ema21_series[-3]
+
+    pb1_call = pullback_na_vela(
+        pullback_1, pb1_ema13, pb1_ema21, "CALL"
+    )
+    pb2_call = pullback_na_vela(
+        pullback_2, pb2_ema13, pb2_ema21, "CALL"
+    )
+    pb1_put = pullback_na_vela(
+        pullback_1, pb1_ema13, pb1_ema21, "PUT"
+    )
+    pb2_put = pullback_na_vela(
+        pullback_2, pb2_ema13, pb2_ema21, "PUT"
     )
 
-    tendencia_15m = tendencia_timeframe(
-        candles_15m
-    )
+    pullback_call = pb1_call or pb2_call
+    pullback_put = pb1_put or pb2_put
 
-    confirmacao = candle_info(
-        candles_5m[-1]
-    )
-
-    pullback_1 = candle_info(
-        candles_5m[-2]
-    )
-
-    pullback_2 = candle_info(
-        candles_5m[-3]
-    )
-
-    pullback_call = (
-        pullback_call_na_vela(
-            pullback_1,
-            ema13,
-            ema21
-        )
-        or
-        pullback_call_na_vela(
-            pullback_2,
-            ema13,
-            ema21
-        )
-    )
-
-    pullback_put = (
-        pullback_put_na_vela(
-            pullback_1,
-            ema13,
-            ema21
-        )
-        or
-        pullback_put_na_vela(
-            pullback_2,
-            ema13,
-            ema21
-        )
-    )
+    # A confirmação rompe a máxima/mínima da vela que realmente fez o pullback.
+    pullback_call_info = pullback_1 if pb1_call else pullback_2 if pb2_call else None
+    pullback_put_info = pullback_1 if pb1_put else pullback_2 if pb2_put else None
 
     confirmacao_call = False
-
-    if (
-        confirmacao["close"]
-        >
-        confirmacao["open"]
-    ):
+    if confirmacao["close"] > confirmacao["open"] and pullback_call_info:
         rejeicao_inferior = (
-            confirmacao["lower_wick"]
-            >= confirmacao["body"] * 0.40
-            and
-            confirmacao["lower_wick"]
-            >
-            confirmacao["upper_wick"]
+            confirmacao["lower_wick"] >= confirmacao["body"] * 0.35
+            and confirmacao["lower_wick"] > confirmacao["upper_wick"]
         )
-
         fechamento_forte = (
-            confirmacao["body_ratio"]
-            >= 0.45
-            and
-            (
-                (
-                    confirmacao["high"]
-                    - confirmacao["close"]
-                )
-                /
-                confirmacao["range"]
-            )
-            <= 0.30
+            confirmacao["body_ratio"] >= 0.40
+            and (
+                (confirmacao["high"] - confirmacao["close"])
+                / confirmacao["range"]
+            ) <= 0.30
         )
-
-        rompeu_pullback = (
-            confirmacao["close"]
-            >
-            pullback_1["high"]
-        )
-
-        if (
-            (
-                rejeicao_inferior
-                or
-                fechamento_forte
-            )
-            and
-            rompeu_pullback
-        ):
-            confirmacao_call = True
+        rompeu_pullback = confirmacao["close"] > pullback_call_info["high"]
+        confirmacao_call = (rejeicao_inferior or fechamento_forte) and rompeu_pullback
 
     confirmacao_put = False
-
-    if (
-        confirmacao["close"]
-        <
-        confirmacao["open"]
-    ):
+    if confirmacao["close"] < confirmacao["open"] and pullback_put_info:
         rejeicao_superior = (
-            confirmacao["upper_wick"]
-            >= confirmacao["body"] * 0.40
-            and
-            confirmacao["upper_wick"]
-            >
-            confirmacao["lower_wick"]
+            confirmacao["upper_wick"] >= confirmacao["body"] * 0.35
+            and confirmacao["upper_wick"] > confirmacao["lower_wick"]
         )
-
         fechamento_forte = (
-            confirmacao["body_ratio"]
-            >= 0.45
-            and
-            (
-                (
-                    confirmacao["close"]
-                    - confirmacao["low"]
-                )
-                /
-                confirmacao["range"]
-            )
-            <= 0.30
+            confirmacao["body_ratio"] >= 0.40
+            and (
+                (confirmacao["close"] - confirmacao["low"])
+                / confirmacao["range"]
+            ) <= 0.30
         )
+        rompeu_pullback = confirmacao["close"] < pullback_put_info["low"]
+        confirmacao_put = (rejeicao_superior or fechamento_forte) and rompeu_pullback
 
-        rompeu_pullback = (
-            confirmacao["close"]
-            <
-            pullback_1["low"]
-        )
+    movimento_4 = c[-1] - c[-4]
+    movimento_8 = c[-1] - c[-8]
+    contexto_call = movimento_4 > 0 and movimento_8 > 0
+    contexto_put = movimento_4 < 0 and movimento_8 < 0
 
-        if (
-            (
-                rejeicao_superior
-                or
-                fechamento_forte
-            )
-            and
-            rompeu_pullback
-        ):
-            confirmacao_put = True
-
-    movimento_4 = (
-        c[-1] - c[-4]
-    )
-
-    movimento_8 = (
-        c[-1] - c[-8]
-    )
-
-    contexto_call = (
-        movimento_4 > 0
-        and
-        movimento_8 > 0
-    )
-
-    contexto_put = (
-        movimento_4 < 0
-        and
-        movimento_8 < 0
-    )
-
-    rsi_call_ok = (
-        rsi14 is not None
-        and
-        52 <= rsi14 <= 68
-    )
-
-    rsi_put_ok = (
-        rsi14 is not None
-        and
-        32 <= rsi14 <= 48
-    )
+    # RSI deixa de ser uma trava absoluta. Ele vira confirmação de qualidade,
+    # exceto quando está em extremo, situação que continua bloqueando a entrada.
+    rsi_call_ok = rsi14 is not None and 50 <= rsi14 <= 68
+    rsi_put_ok = rsi14 is not None and 32 <= rsi14 <= 50
 
     rsi_extremo = (
         rsi14 is not None
-        and
-        (
-            rsi14 >= 72
-            or
-            rsi14 <= 28
-        )
+        and (rsi14 >= 72 or rsi14 <= 28)
     )
 
     atr_ok = True
-
-    if (
-        atr14 is not None
-        and
-        preco != 0
-    ):
-        atr_ratio = (
-            atr14 / preco
-        )
-
-        if atr_ratio < 0.00008:
+    if atr14 is not None and preco != 0:
+        atr_ratio = atr14 / preco
+        if atr_ratio < 0.00008 or atr_ratio > 0.0035:
             atr_ok = False
 
-        if atr_ratio > 0.0035:
-            atr_ok = False
-
-    lateral = mercado_lateral(
-        preco,
-        ema5,
-        ema13,
-        ema21,
-        atr14
-    )
+    lateral = mercado_lateral(preco, ema5, ema13, ema21, atr14)
 
     score_call = 0
     score_put = 0
 
     if tendencia_5m == "ALTA":
         score_call += 3
-
-    if tendencia_5m == "BAIXA":
+    elif tendencia_5m == "BAIXA":
         score_put += 3
 
     if tendencia_15m == "ALTA":
         score_call += 2
-
-    if tendencia_15m == "BAIXA":
+    elif tendencia_15m == "BAIXA":
         score_put += 2
 
     if pullback_call:
         score_call += 2
-
     if pullback_put:
         score_put += 2
 
     if confirmacao_call:
         score_call += 2
-
     if confirmacao_put:
         score_put += 2
 
     if rsi_call_ok:
         score_call += 1
-
     if rsi_put_ok:
         score_put += 1
 
     if contexto_call:
         score_call += 1
-
     if contexto_put:
         score_put += 1
 
     if confirmacao["body_ratio"] >= 0.25:
-        if (
-            confirmacao["close"]
-            >
-            confirmacao["open"]
-        ):
+        if confirmacao["close"] > confirmacao["open"]:
             score_call += 1
-
-        elif (
-            confirmacao["close"]
-            <
-            confirmacao["open"]
-        ):
+        elif confirmacao["close"] < confirmacao["open"]:
             score_put += 1
 
     sinal = "AGUARDAR"
-
-    score = max(
-        score_call,
-        score_put
-    )
-
+    score = max(score_call, score_put)
     bloqueio = None
 
+    # Núcleo obrigatório: tendência nos dois TFs + pullback + confirmação.
+    # O 10º ponto vem de RSI OU contexto, evitando a antiga dupla trava.
     if lateral:
-        bloqueio = (
-            "Mercado lateral ou tendencia fraca."
-        )
-
+        bloqueio = "Mercado lateral ou tendência fraca."
     elif not atr_ok:
-        bloqueio = (
-            "ATR fora da faixa ideal."
-        )
-
+        bloqueio = "ATR fora da faixa ideal."
     elif rsi_extremo:
-        bloqueio = (
-            f"RSI extremo ({rsi14:.2f})."
-        )
-
+        bloqueio = f"RSI extremo ({rsi14:.2f})."
     elif tendencia_5m == "ALTA":
         if tendencia_15m != "ALTA":
-            bloqueio = (
-                "5M em alta, mas 15M nao confirma."
-            )
-
-        elif (
-            score_call >= 9
-            and
-            pullback_call
-            and
-            confirmacao_call
-            and
-            rsi_call_ok
-            and
-            contexto_call
-        ):
+            bloqueio = "5M em alta, mas 15M não confirma."
+        elif not pullback_call:
+            bloqueio = "Alta alinhada, mas sem pullback válido."
+        elif not confirmacao_call:
+            bloqueio = "Pullback encontrado, mas sem confirmação separada."
+        elif score_call < 10:
+            bloqueio = "Setup de alta sem confirmação adicional de qualidade."
+        else:
             sinal = "CALL"
-
     elif tendencia_5m == "BAIXA":
         if tendencia_15m != "BAIXA":
-            bloqueio = (
-                "5M em baixa, mas 15M nao confirma."
-            )
-
-        elif (
-            score_put >= 9
-            and
-            pullback_put
-            and
-            confirmacao_put
-            and
-            rsi_put_ok
-            and
-            contexto_put
-        ):
+            bloqueio = "5M em baixa, mas 15M não confirma."
+        elif not pullback_put:
+            bloqueio = "Baixa alinhada, mas sem pullback válido."
+        elif not confirmacao_put:
+            bloqueio = "Pullback encontrado, mas sem confirmação separada."
+        elif score_put < 10:
+            bloqueio = "Setup de baixa sem confirmação adicional de qualidade."
+        else:
             sinal = "PUT"
+    else:
+        bloqueio = "5M sem tendência clara."
 
     detalhes_pullback = (
         "CONFIRMADO EM VELA ANTERIOR"
-        if (
-            (
-                pullback_call
-                and
-                tendencia_5m == "ALTA"
-            )
-            or
-            (
-                pullback_put
-                and
-                tendencia_5m == "BAIXA"
-            )
-        )
-        else
-        "NAO"
+        if ((pullback_call and tendencia_5m == "ALTA") or
+            (pullback_put and tendencia_5m == "BAIXA"))
+        else "NÃO"
     )
 
     detalhes_confirmacao = (
         "CONFIRMADA"
-        if (
-            (
-                confirmacao_call
-                and
-                tendencia_5m == "ALTA"
-            )
-            or
-            (
-                confirmacao_put
-                and
-                tendencia_5m == "BAIXA"
-            )
-        )
-        else
-        "NAO"
+        if ((confirmacao_call and tendencia_5m == "ALTA") or
+            (confirmacao_put and tendencia_5m == "BAIXA"))
+        else "NÃO"
     )
 
     if sinal == "CALL":
         mensagem = (
-            "CALL FORTE | "
-            "5M ALTA + 15M ALTA | "
-            "Pullback em vela anterior | "
-            "Confirmacao separada | "
-            f"RSI={rsi14:.2f}"
+            "CALL FORTE | 5M ALTA + 15M ALTA | "
+            "Pullback real | Confirmação em vela separada | "
+            f"Score={score_call}/12 | RSI={rsi14:.2f}"
         )
-
     elif sinal == "PUT":
         mensagem = (
-            "PUT FORTE | "
-            "5M BAIXA + 15M BAIXA | "
-            "Pullback em vela anterior | "
-            "Confirmacao separada | "
-            f"RSI={rsi14:.2f}"
+            "PUT FORTE | 5M BAIXA + 15M BAIXA | "
+            "Pullback real | Confirmação em vela separada | "
+            f"Score={score_put}/12 | RSI={rsi14:.2f}"
         )
-
     elif bloqueio:
-        mensagem = (
-            f"AGUARDAR | {bloqueio}"
-        )
-
+        mensagem = f"AGUARDAR | {bloqueio}"
     else:
         mensagem = (
-            f"AGUARDAR | "
-            f"5M={tendencia_5m} | "
-            f"15M={tendencia_15m} | "
-            f"Pullback={detalhes_pullback} | "
-            f"Confirmacao={detalhes_confirmacao} | "
-            f"CALL={score_call} | "
-            f"PUT={score_put}"
+            f"AGUARDAR | 5M={tendencia_5m} | 15M={tendencia_15m} | "
+            f"Pullback={detalhes_pullback} | Confirmação={detalhes_confirmacao} | "
+            f"CALL={score_call} | PUT={score_put}"
         )
 
     return {
@@ -2810,7 +2095,14 @@ def analisar_pullback(
         "tendencia": tendencia_5m,
         "tendencia_5m": tendencia_5m,
         "tendencia_15m": tendencia_15m,
-        "lateral": "SIM" if lateral else "NAO",
+        "lateral": "SIM" if lateral else "NÃO",
+        "rsi_call_ok": rsi_call_ok,
+        "rsi_put_ok": rsi_put_ok,
+        "contexto_call": contexto_call,
+        "contexto_put": contexto_put,
+        "confirmacao_call": confirmacao_call,
+        "confirmacao_put": confirmacao_put,
+        "bloqueio": bloqueio or "SINAL",
         "mensagem": mensagem,
     }
 
@@ -3266,20 +2558,6 @@ def processar_ativo(
     symbol
 ):
     try:
-        with _bullex_diag_lock:
-            _bullex_diag["processamentos"] += 1
-            numero_processamento = _bullex_diag["processamentos"]
-            _bullex_diag["ultimo_processamento"] = {
-                "numero": numero_processamento,
-                "codigo": chave,
-                "symbol": symbol,
-                "inicio": agora_brt().isoformat(),
-            }
-
-        log(
-            f"[DIAG PROCESS] inicio #{numero_processamento}: "
-            f"codigo={chave} symbol={symbol}"
-        )
         log(
             f"Consultando 5M: {symbol}"
         )
@@ -3515,6 +2793,11 @@ def processar_ativo(
                 )
                 else "-"
             ),
+
+            "bloqueio": resultado.get(
+                "bloqueio",
+                "-"
+            ),
         }
 
         log(
@@ -3538,6 +2821,8 @@ def processar_ativo(
             f"{resultado.get('lateral', '-')} | "
             f"preco="
             f"{estado['preco']}"
+            f" | bloqueio="
+            f"{resultado.get('bloqueio', '-')}"
         )
 
         if resultado["sinal"] in (
@@ -3560,14 +2845,8 @@ def processar_ativo(
         ] = calcular_estatisticas()
 
     except Exception as e:
-        with _bullex_diag_lock:
-            _bullex_diag["erros_processamento"] += 1
-            ultimo = _bullex_diag.get("ultimo_processamento")
-            if isinstance(ultimo, dict):
-                ultimo["erro"] = str(e)
-                ultimo["fim"] = agora_brt().isoformat()
         log(
-            f"[DIAG PROCESS] ERRO em {symbol}: {e}"
+            f"ERRO em {symbol}: {e}"
         )
 
         estado["ativo"] = symbol
@@ -4121,32 +3400,6 @@ Filtros da entrada
 <div class="card">
 
 <h3>
-OTC detectados automaticamente
-</h3>
-
-<div class="linha">
-<span>Quantidade</span>
-<span class="valor">
-{{ estado.ativos_info.quantidade }}
-</span>
-</div>
-
-<div class="linha">
-<span>Status</span>
-<span class="valor">
-{{ estado.ativos_info.status }}
-</span>
-</div>
-
-<div class="observacao">
-{{ estado.ativos_info.lista }}
-</div>
-
-</div>
-
-<div class="card">
-
-<h3>
 Estatísticas
 </h3>
 
@@ -4341,41 +3594,10 @@ def health():
             _bullex_last_error,
         "telegram_configurado":
             telegram_configurado(),
-        "bullex_diagnostico": (lambda d: {
-            "mensagens": d["messages"],
-            "candle_generated": d["generated"],
-            "respostas_candles": d["responses"],
-            "candles_armazenados": d["stored"],
-            "pares_timeframes_armazenados": len(d["last_stored"]),
-            "processamentos_ativos": d["processamentos"],
-            "erros_processamento": d["erros_processamento"],
-            "ultimo_processamento": d["ultimo_processamento"],
-            "ultimo_candle": {
-                "active_id": d["last_active_id"],
-                "size": d["last_size"],
-                "name": d["last_name"],
-            },
-        })(dict(_bullex_diag)),
         "operacoes_pendentes":
             len(_operacoes_pendentes),
         "estatisticas":
             calcular_estatisticas(),
-        "otc_automatico": {
-            "detectado": _bullex_assets_detected,
-            "quantidade": len(ATIVO_BULLEX),
-            "atualizado_em": _bullex_assets_updated_at,
-            "fonte": _bullex_assets_source,
-            "erro": _bullex_assets_last_error,
-            "ativos": [
-                {
-                    "codigo": codigo,
-                    "symbol": config["symbol"],
-                    "ticker": config["ticker"],
-                    "active_id": config["active_id"],
-                }
-                for codigo, config in ATIVO_BULLEX.items()
-            ],
-        },
     })
 
 
