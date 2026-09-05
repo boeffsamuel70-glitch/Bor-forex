@@ -63,6 +63,7 @@ BULLEX_USER_AGENT = os.getenv(
 
 ATIVO_BULLEX = {
     "EURUSD": {"symbol": "EUR/USD", "active_id": 76, "ticker": "EURUSD-OTC"},
+    "EURJPY": {"symbol": "EUR/JPY", "active_id": 79, "ticker": "EURJPY-OTC"},
     "GBPUSD": {"symbol": "GBP/USD", "active_id": 81, "ticker": "GBPUSD-OTC"},
     "USDJPY": {"symbol": "USD/JPY", "active_id": 85, "ticker": "USDJPY-OTC"},
     "GBPJPY": {"symbol": "GBP/JPY", "active_id": 84, "ticker": "GBPJPY-OTC"},
@@ -558,6 +559,36 @@ def _mensagem_indica_auth_erro(data):
     )
 
 
+def _armazenar_candles_resposta(active_id, msg):
+    """Armazena respostas candles/first-candles preservando o size."""
+    if not isinstance(msg, dict):
+        return
+
+    por_tamanho = msg.get("candles_by_size")
+    if isinstance(por_tamanho, dict):
+        for size_key, valores in por_tamanho.items():
+            try:
+                size = int(size_key)
+            except (TypeError, ValueError):
+                continue
+
+            if isinstance(valores, dict):
+                valores = [valores]
+            if not isinstance(valores, list):
+                continue
+
+            for item in valores:
+                if isinstance(item, dict):
+                    _armazenar_candle_ws(active_id, size, item)
+
+    size = msg.get("size")
+    dados = msg.get("candles")
+    if size is not None and isinstance(dados, list):
+        for item in dados:
+            if isinstance(item, dict):
+                _armazenar_candle_ws(active_id, size, item)
+
+
 def _on_bullex_message(ws, raw_message):
     global _bullex_last_error
     global _bullex_authenticated
@@ -614,6 +645,15 @@ def _on_bullex_message(ws, raw_message):
             log(
                 "Autenticacao Bullex confirmada."
             )
+
+        # A Traderoom autentica primeiro e, em seguida, assina
+        # candle-generated. Fazemos a assinatura somente depois
+        # da confirmacao real da autenticacao.
+        threading.Thread(
+            target=_assinar_candles_otc,
+            daemon=True,
+            name="bullex-candle-subscriptions",
+        ).start()
 
         return
 
@@ -672,6 +712,11 @@ def _on_bullex_message(ws, raw_message):
                     active_id = msg.get("active_id")
 
                 if active_id is not None:
+                    _armazenar_candles_resposta(
+                        active_id,
+                        msg
+                    )
+
                     for item in dados:
                         if not isinstance(item, dict):
                             continue
@@ -929,6 +974,65 @@ def _aguardar_autenticacao(timeout=15):
         "Timeout aguardando confirmacao explicita "
         "da autenticacao Bullex."
     )
+
+
+def _montar_subscribe_candle(active_id, size, request_id=None):
+    """Monta a assinatura real observada no Traderoom."""
+    return {
+        "name": "subscribeMessage",
+        "request_id": str(request_id or _next_request_id()),
+        "local_time": int(time.time() * 1000) % 1_000_000,
+        "msg": {
+            "name": "candle-generated",
+            "params": {
+                "routingFilters": {
+                    "active_id": int(active_id),
+                    "size": int(size),
+                }
+            },
+        },
+    }
+
+
+def _assinar_candle(active_id, size):
+    """Assina atualizações em tempo real do candle informado."""
+    ws = conectar_bullex()
+    _aguardar_autenticacao(timeout=15)
+
+    payload = _montar_subscribe_candle(active_id, size)
+    texto = json.dumps(payload, separators=(",", ":"))
+
+    try:
+        ws.send(texto)
+        log(
+            f"Assinatura candle-generated enviada: "
+            f"active_id={active_id} size={size}"
+        )
+    except Exception as e:
+        raise RuntimeError(
+            f"Falha ao assinar candle-generated "
+            f"active_id={active_id} size={size}: {e}"
+        )
+
+
+def _assinar_candles_otc():
+    """Assina 5M e 15M dos ativos usados pelo robô."""
+    assinaturas = set()
+
+    for config in ATIVO_BULLEX.values():
+        active_id = int(config["active_id"])
+        for size in (300, 900):
+            chave = (active_id, size)
+            if chave in assinaturas:
+                continue
+            assinaturas.add(chave)
+            try:
+                _assinar_candle(active_id, size)
+            except Exception as e:
+                log(
+                    f"Nao foi possivel assinar candle-generated "
+                    f"active_id={active_id} size={size}: {e}"
+                )
 
 
 def _enviar_e_aguardar(
