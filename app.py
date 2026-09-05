@@ -20,17 +20,42 @@ BULLEX_WS_URL = os.getenv(
     "wss://ws.trade.bull-ex.com/echo/websocket"
 ).strip()
 
+# O HAR mostrou Origin: https://bull-ex.com.
+# Pode ser sobrescrito pelo Render se necessário.
 BULLEX_ORIGIN = os.getenv(
     "BULLEX_ORIGIN",
-    "https://trade.bull-ex.com"
+    "https://bull-ex.com"
 ).strip()
 
 BULLEX_SSID = os.getenv("BULLEX_SSID", "").strip()
+
+# Mantido por compatibilidade com versões anteriores.
+# A autenticação agora é montada no formato real observado no HAR.
 BULLEX_AUTH_BODY_JSON = os.getenv(
     "BULLEX_AUTH_BODY_JSON", ""
 ).strip()
 
 BULLEX_COOKIE = os.getenv("BULLEX_COOKIE", "").strip()
+
+BULLEX_PROTOCOL = int(
+    os.getenv("BULLEX_PROTOCOL", "3").strip() or "3"
+)
+
+# O HAR fornecido mostrou local_time=9087.
+# Deixamos configurável para não prender o valor ao código.
+try:
+    BULLEX_LOCAL_TIME = int(
+        os.getenv("BULLEX_LOCAL_TIME", "9087").strip()
+    )
+except ValueError:
+    BULLEX_LOCAL_TIME = 9087
+
+BULLEX_USER_AGENT = os.getenv(
+    "BULLEX_USER_AGENT",
+    "Mozilla/5.0 (Linux; Android 10; K) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/152.0.0.0 Mobile Safari/537.36"
+).strip()
 
 # ============================================================
 # ATIVOS BULLEX
@@ -60,6 +85,8 @@ _bullex_cv = threading.Condition(_bullex_ws_lock)
 
 _bullex_ws_thread_started = False
 _bullex_auth_event = threading.Event()
+_bullex_auth_request_id = None
+_bullex_client_session_id = None
 
 TELEGRAM_BOT_TOKEN = os.getenv(
     "TELEGRAM_BOT_TOKEN", ""
@@ -231,40 +258,87 @@ def idade_do_ultimo_candle(candles):
 # ============================================================
 
 def _auth_body():
-    if BULLEX_AUTH_BODY_JSON:
-        try:
-            body = json.loads(BULLEX_AUTH_BODY_JSON)
+    """
+    Valida a configuração de autenticação.
 
-            if not isinstance(body, dict):
-                raise ValueError(
-                    "BULLEX_AUTH_BODY_JSON precisa ser um objeto JSON."
-                )
-
-            return body
-
-        except Exception as e:
-            raise RuntimeError(
-                f"BULLEX_AUTH_BODY_JSON invalido: {e}"
-            )
+    O protocolo real observado no HAR NÃO usa este objeto como
+    {"name":"sendMessage", ...}. A função é mantida apenas para
+    compatibilidade/configuração e retorna a msg interna da autenticação.
+    """
 
     if not BULLEX_SSID:
         raise RuntimeError(
-            "Configure BULLEX_SSID ou BULLEX_AUTH_BODY_JSON no Render. "
+            "Configure BULLEX_SSID no Render. "
             "Nao coloque o segredo no codigo/GitHub."
         )
 
-    return {"ssid": BULLEX_SSID}
+    return {
+        "ssid": BULLEX_SSID,
+        "protocol": BULLEX_PROTOCOL,
+        "session_id": "",
+        "client_session_id": "",
+    }
 
 
 def _next_request_id():
+    """
+    Gera request_id no formato observado no HAR:
+    <unix_seconds>_<numero>.
+    """
+
     global _bullex_request_counter
 
     with _bullex_request_lock:
         _bullex_request_counter += 1
-        return str(_bullex_request_counter)
+        contador = _bullex_request_counter
+
+    return f"{int(time.time())}_{contador}"
+
+
+def _montar_auth_message():
+    """
+    Monta EXATAMENTE a estrutura principal observada no HAR:
+
+    {
+      "name": "authenticate",
+      "request_id": "...",
+      "local_time": 9087,
+      "msg": {
+        "ssid": "...",
+        "protocol": 3,
+        "session_id": "",
+        "client_session_id": ""
+      }
+    }
+    """
+
+    if not BULLEX_SSID:
+        raise RuntimeError(
+            "Configure BULLEX_SSID no Render. "
+            "Nao coloque o segredo no codigo/GitHub."
+        )
+
+    return {
+        "name": "authenticate",
+        "request_id": _next_request_id(),
+        "local_time": BULLEX_LOCAL_TIME,
+        "msg": {
+            "ssid": BULLEX_SSID,
+            "protocol": BULLEX_PROTOCOL,
+            "session_id": "",
+            "client_session_id": "",
+        },
+    }
 
 
 def _montar_send_message(nome, version, body=None):
+    """
+    Mantém o formato anterior para comandos posteriores à autenticação.
+
+    IMPORTANTE:
+    authenticate NÃO passa por esta função.
+    """
+
     payload = {
         "name": "sendMessage",
         "request_id": _next_request_id(),
@@ -303,7 +377,7 @@ def _normalizar_candle_ws(item):
     try:
         timestamp = float(timestamp)
 
-        # Aceita timestamp em segundos ou nanossegundos.
+        # Aceita timestamp em segundos, milissegundos ou nanossegundos.
         if timestamp > 10_000_000_000_000:
             timestamp /= 1_000_000_000
         elif timestamp > 10_000_000_000:
@@ -339,24 +413,33 @@ def _armazenar_candle_ws(active_id, size, item):
     if candle is None:
         return
 
+    try:
+        active_id_int = int(active_id)
+        size_int = int(size)
+    except (TypeError, ValueError):
+        return
+
+    if size_int <= 0:
+        return
+
     candle_id = candle.get("id")
 
     if candle_id is not None:
         chave = (
-            int(active_id),
-            int(size),
+            active_id_int,
+            size_int,
             str(candle_id),
         )
     else:
         chave = (
-            int(active_id),
-            int(size),
+            active_id_int,
+            size_int,
             candle["datetime"],
         )
 
     with _bullex_cv:
         bucket = _bullex_candles.setdefault(
-            (int(active_id), int(size)),
+            (active_id_int, size_int),
             {}
         )
 
@@ -410,36 +493,47 @@ def _extrair_candles_da_resposta(msg):
 # ============================================================
 
 def _mensagem_indica_auth_sucesso(data):
-    nome = str(data.get("name", "")).lower()
-    msg = data.get("msg")
+    """
+    O sucesso agora é reconhecido somente no formato real
+    observado no HAR:
 
-    texto = json.dumps(
-        data,
-        ensure_ascii=False
-    ).lower()
+        name == "authenticated"
+        msg is True
 
-    if nome in (
-        "authenticated",
-        "auth-success",
-        "authenticate-success",
+    Se houver request_id na resposta, ele precisa corresponder
+    ao request_id enviado para authenticate.
+    """
+
+    global _bullex_client_session_id
+
+    if not isinstance(data, dict):
+        return False
+
+    if data.get("name") != "authenticated":
+        return False
+
+    if data.get("msg") is not True:
+        return False
+
+    request_id_recebido = data.get("request_id")
+
+    if (
+        _bullex_auth_request_id
+        and request_id_recebido is not None
+        and str(request_id_recebido)
+        != str(_bullex_auth_request_id)
     ):
-        return True
+        log(
+            "Resposta authenticated recebida, "
+            "mas request_id nao corresponde ao authenticate enviado."
+        )
+        return False
 
-    if "authenticated" in texto and (
-        "true" in texto
-        or "success" in texto
-        or "ok" in texto
-    ):
-        return True
+    _bullex_client_session_id = (
+        data.get("client_session_id")
+    )
 
-    if isinstance(msg, dict):
-        if msg.get("authenticated") is True:
-            return True
-
-        if msg.get("success") is True:
-            return True
-
-    return False
+    return True
 
 
 def _mensagem_indica_auth_erro(data):
@@ -476,7 +570,7 @@ def _on_bullex_message(ws, raw_message):
     if not isinstance(data, dict):
         return
 
-    # Alguns servidores enviam JSON dentro de data.
+    # Alguns ambientes podem entregar JSON encapsulado em "data".
     if isinstance(data.get("data"), str):
         try:
             inner = json.loads(data["data"])
@@ -499,6 +593,7 @@ def _on_bullex_message(ws, raw_message):
                 ws,
                 json.dumps(inner)
             )
+            return
 
     # ========================================================
     # AUTENTICAÇÃO
@@ -507,7 +602,19 @@ def _on_bullex_message(ws, raw_message):
     if _mensagem_indica_auth_sucesso(data):
         _bullex_authenticated = True
         _bullex_auth_event.set()
-        log("Autenticacao Bullex confirmada.")
+
+        session = _bullex_client_session_id
+
+        if session:
+            log(
+                "Autenticacao Bullex confirmada. "
+                f"client_session_id={session}"
+            )
+        else:
+            log(
+                "Autenticacao Bullex confirmada."
+            )
+
         return
 
     if _mensagem_indica_auth_erro(data):
@@ -555,9 +662,6 @@ def _on_bullex_message(ws, raw_message):
                 str(request_id)
             ] = data
 
-            # Também extrai candles diretamente
-            # da resposta para não depender
-            # somente do request_id.
             dados = _extrair_candles_da_resposta(data)
 
             if dados:
@@ -567,16 +671,24 @@ def _on_bullex_message(ws, raw_message):
                 if isinstance(msg, dict):
                     active_id = msg.get("active_id")
 
-                # Quando a resposta traz active_id.
                 if active_id is not None:
                     for item in dados:
-                        _armazenar_candle_ws(
-                            active_id,
-                            item.get("size", 0)
-                            if isinstance(item, dict)
-                            else 0,
-                            item
-                        )
+                        if not isinstance(item, dict):
+                            continue
+
+                        # O tamanho pode vir no candle individual.
+                        item_size = item.get("size")
+
+                        # Ou na resposta.
+                        if item_size is None and isinstance(msg, dict):
+                            item_size = msg.get("size")
+
+                        if item_size is not None:
+                            _armazenar_candle_ws(
+                                active_id,
+                                item_size,
+                                item
+                            )
 
             _bullex_cv.notify_all()
 
@@ -587,14 +699,22 @@ def _on_bullex_error(ws, error):
     _bullex_last_error = str(error)
     log(f"Bullex WebSocket erro: {error}")
 
+    with _bullex_cv:
+        _bullex_cv.notify_all()
+
 
 def _on_bullex_close(ws, code, reason):
     global _bullex_connected
     global _bullex_authenticated
+    global _bullex_client_session_id
 
     _bullex_connected = False
     _bullex_authenticated = False
+    _bullex_client_session_id = None
     _bullex_auth_event.clear()
+
+    with _bullex_cv:
+        _bullex_cv.notify_all()
 
     log(
         f"Bullex WebSocket fechado: "
@@ -606,19 +726,25 @@ def _on_bullex_open(ws):
     global _bullex_connected
     global _bullex_last_error
     global _bullex_authenticated
+    global _bullex_auth_request_id
+    global _bullex_client_session_id
 
     _bullex_last_error = None
     _bullex_connected = True
     _bullex_authenticated = False
+    _bullex_client_session_id = None
+    _bullex_auth_request_id = None
     _bullex_auth_event.clear()
 
     log("Bullex WebSocket conectado.")
 
     try:
-        auth = _montar_send_message(
-            "authenticate",
-            "1.0",
-            _auth_body()
+        # IMPORTANTE:
+        # authenticate é enviado diretamente no topo.
+        auth = _montar_auth_message()
+
+        _bullex_auth_request_id = str(
+            auth["request_id"]
         )
 
         texto = json.dumps(
@@ -629,7 +755,10 @@ def _on_bullex_open(ws):
         ws.send(texto)
 
         log(
-            "Autenticacao WebSocket enviada."
+            "Autenticacao WebSocket enviada "
+            f"(request_id={_bullex_auth_request_id}, "
+            f"protocol={BULLEX_PROTOCOL}, "
+            f"local_time={BULLEX_LOCAL_TIME})."
         )
 
     except Exception as e:
@@ -638,6 +767,8 @@ def _on_bullex_open(ws):
         log(
             f"Erro ao enviar autenticacao Bullex: {e}"
         )
+
+        _bullex_auth_event.set()
 
 
 # ============================================================
@@ -651,9 +782,14 @@ def _thread_bullex_ws():
 
     while True:
         try:
+            headers = [
+                f"User-Agent: {BULLEX_USER_AGENT}"
+            ]
+
             ws = websocket.WebSocketApp(
                 BULLEX_WS_URL,
                 cookie=BULLEX_COOKIE or None,
+                header=headers,
                 on_open=_on_bullex_open,
                 on_message=_on_bullex_message,
                 on_error=_on_bullex_error,
@@ -663,7 +799,9 @@ def _thread_bullex_ws():
             with _bullex_ws_lock:
                 _bullex_ws = ws
 
-            log("Iniciando conexão WebSocket Bullex.")
+            log(
+                "Iniciando conexão WebSocket Bullex."
+            )
 
             ws.run_forever(
                 ping_interval=20,
@@ -676,6 +814,9 @@ def _thread_bullex_ws():
             _bullex_authenticated = False
             _bullex_auth_event.clear()
 
+            with _bullex_cv:
+                _bullex_cv.notify_all()
+
             log(
                 f"Falha no WebSocket Bullex: {e}"
             )
@@ -685,6 +826,9 @@ def _thread_bullex_ws():
                 _bullex_connected = False
                 _bullex_authenticated = False
                 _bullex_ws = None
+
+            with _bullex_cv:
+                _bullex_cv.notify_all()
 
         time.sleep(5)
 
@@ -700,7 +844,6 @@ def conectar_bullex():
             and _bullex_connected
         ):
             ws = _bullex_ws
-
         else:
             ws = None
 
@@ -714,6 +857,9 @@ def conectar_bullex():
             )
 
             thread.start()
+
+    if ws is not None:
+        return ws
 
     limite = time.time() + 20
 
@@ -733,6 +879,12 @@ def conectar_bullex():
 
 
 def _aguardar_autenticacao(timeout=15):
+    """
+    Aguarda confirmação REAL do servidor.
+
+    Não considera mais um socket aberto como autenticado.
+    """
+
     limite = time.time() + timeout
 
     while time.time() < limite:
@@ -747,6 +899,12 @@ def _aguardar_autenticacao(timeout=15):
                 "Conexao Bullex fechou antes da "
                 "confirmacao da autenticacao: "
                 f"{_bullex_last_error}"
+            )
+
+        if not _bullex_connected:
+            raise RuntimeError(
+                "Conexao Bullex fechou antes da "
+                "confirmacao da autenticacao."
             )
 
         restante = limite - time.time()
@@ -767,19 +925,9 @@ def _aguardar_autenticacao(timeout=15):
             f"{_bullex_last_error}"
         )
 
-    # Algumas versões do protocolo não enviam
-    # um evento explícito de autenticação.
-    # Se o socket continuar aberto depois do
-    # tempo de espera, permitimos a consulta.
-    if _bullex_connected:
-        log(
-            "Nenhuma confirmação explicita de "
-            "autenticacao recebida; WebSocket continua aberto."
-        )
-        return True
-
     raise RuntimeError(
-        "Bullex fechou a conexão antes da autenticacao."
+        "Timeout aguardando confirmacao explicita "
+        "da autenticacao Bullex."
     )
 
 
@@ -847,6 +995,11 @@ def _enviar_e_aguardar(
                     f"{nome}: {_bullex_last_error}"
                 )
 
+            if not _bullex_connected:
+                raise RuntimeError(
+                    f"Bullex fechou a conexão durante {nome}."
+                )
+
             restante = (
                 limite - time.time()
             )
@@ -901,17 +1054,18 @@ def _obter_ultimo_id(active_id, size):
             valor = por_tamanho.get(size)
 
         if isinstance(valor, list) and valor:
-            ultimo = max(
-                valor,
-                key=lambda x: int(
-                    x.get("id", 0)
-                )
-            )
+            ids_validos = []
 
-            return int(ultimo["id"])
+            for x in valor:
+                if isinstance(x, dict) and x.get("id") is not None:
+                    try:
+                        ids_validos.append(int(x["id"]))
+                    except Exception:
+                        pass
 
-    # Fallback: procura candles em qualquer
-    # estrutura de resposta.
+            if ids_validos:
+                return max(ids_validos)
+
     dados = _extrair_candles_da_resposta(
         resposta
     )
@@ -987,11 +1141,6 @@ def obter_candles(
             f"Timeframe nao suportado: {interval}"
         )
 
-    # ========================================================
-    # PRIMEIRA TENTATIVA:
-    # CANDLES EM CACHE / FEED
-    # ========================================================
-
     cache = _candidatos_candles_cache(
         active_id,
         size
@@ -1001,11 +1150,6 @@ def obter_candles(
 
     if len(cache) >= outputsize:
         return cache[-int(outputsize):]
-
-    # ========================================================
-    # HISTÓRICO:
-    # DESCOBRIR ÚLTIMO ID
-    # ========================================================
 
     ultimo_id = _obter_ultimo_id(
         active_id,
@@ -1055,20 +1199,12 @@ def obter_candles(
             normalizado
         )
 
-    # ========================================================
-    # FEED EM TEMPO REAL
-    # ========================================================
-
     candles.extend(
         _candidatos_candles_cache(
             active_id,
             size
         )
     )
-
-    # ========================================================
-    # REMOVER DUPLICADOS
-    # ========================================================
 
     unicos = {}
 
@@ -2733,8 +2869,7 @@ def executar_leitura():
         estado["sinal"] = "AGUARDAR"
         estado["score"] = 0
         estado["mensagem"] = (
-            "Configure BULLEX_SSID ou "
-            "BULLEX_AUTH_BODY_JSON no Render."
+            "Configure BULLEX_SSID no Render."
         )
         estado["atualizado"] = (
             agora_brt().strftime(
@@ -2842,9 +2977,6 @@ def loop_robo():
         "Loop do robo iniciado."
     )
 
-    # Inicializa o WebSocket uma única vez.
-    # A conexão fica persistente e recebe
-    # candle-generated em tempo real.
     try:
         _auth_body()
 
@@ -3422,6 +3554,12 @@ def health():
             _bullex_connected,
         "websocket_autenticado":
             _bullex_authenticated,
+        "websocket_client_session_id":
+            _bullex_client_session_id,
+        "websocket_auth_request_id":
+            _bullex_auth_request_id,
+        "websocket_origin":
+            BULLEX_ORIGIN,
         "websocket_ultimo_erro":
             _bullex_last_error,
         "telegram_configurado":
