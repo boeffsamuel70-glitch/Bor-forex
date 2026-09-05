@@ -112,7 +112,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OTC-AUTO-RAW-UNDERLYING-20260905-02"
+BULLEX_DIAGNOSTIC_VERSION = "OTC-AUTO-FIX-FUNCOES-20260905-03"
 
 _bullex_diag = {
     "messages": 0,
@@ -1284,6 +1284,146 @@ def _extrair_otcs_da_resposta(resposta):
     resultado.sort(key=lambda x: (x["ticker"].upper(), x["active_id"]))
     return resultado
 
+
+
+
+# ============================================================
+# BULLEX - COMANDOS ASSINCRONOS / INICIALIZACAO OTC
+# ============================================================
+
+def _enviar_e_aguardar(
+    nome,
+    version,
+    body=None,
+    timeout=15
+):
+    ws = conectar_bullex()
+
+    _aguardar_autenticacao(
+        timeout=15
+    )
+
+    payload = _montar_send_message(
+        nome,
+        version,
+        body
+    )
+
+    request_id = str(
+        payload["request_id"]
+    )
+
+    with _bullex_cv:
+        _bullex_response_store.pop(
+            request_id,
+            None
+        )
+
+    try:
+        ws.send(
+            json.dumps(
+                payload,
+                separators=(",", ":")
+            )
+        )
+
+    except Exception as e:
+        raise RuntimeError(
+            f"Falha ao enviar {nome}: {e}"
+        )
+
+    limite = time.time() + timeout
+
+    with _bullex_cv:
+        while time.time() < limite:
+            resposta = (
+                _bullex_response_store.pop(
+                    request_id,
+                    None
+                )
+            )
+
+            if resposta is not None:
+                return resposta
+
+            if (
+                not _bullex_connected
+                and _bullex_last_error
+            ):
+                raise RuntimeError(
+                    f"Bullex fechou a conexão durante "
+                    f"{nome}: {_bullex_last_error}"
+                )
+
+            if not _bullex_connected:
+                raise RuntimeError(
+                    f"Bullex fechou a conexão durante {nome}."
+                )
+
+            restante = (
+                limite - time.time()
+            )
+
+            if restante <= 0:
+                break
+
+            _bullex_cv.wait(
+                timeout=min(
+                    0.5,
+                    restante
+                )
+            )
+
+    raise RuntimeError(
+        f"Timeout aguardando resposta Bullex: "
+        f"{nome} request_id={request_id}"
+    )
+
+def _assinar_candles_otc():
+    """Assina 5M e 15M dos ativos usados pelo robô."""
+    assinaturas = set()
+
+    for config in ATIVO_BULLEX.values():
+        active_id = int(config["active_id"])
+        for size in (300, 900):
+            chave = (active_id, size)
+            if chave in assinaturas:
+                continue
+            assinaturas.add(chave)
+            try:
+                _assinar_candle(active_id, size)
+            except Exception as e:
+                log(
+                    f"Nao foi possivel assinar candle-generated "
+                    f"active_id={active_id} size={size}: {e}"
+                )
+
+def _inicializar_ativos_otc():
+    """Descobre OTCs e, somente depois, assina os candles."""
+    global _bullex_assets_last_error
+
+    try:
+        otcs = _descobrir_otcs_automaticamente()
+
+        # Assina somente após a tabela dinâmica estar pronta.
+        _assinar_candles_otc()
+
+        log(
+            f"[OTC AUTO] Inicialização concluída com {len(otcs)} ativos OTC."
+        )
+    except Exception as e:
+        _bullex_assets_last_error = str(e)
+        log(f"[OTC AUTO] ERRO na descoberta automática: {e}")
+
+        # Fallback: não derruba o robô se a lista automática falhar.
+        log(
+            "[OTC AUTO] Mantendo ativos de fallback já conhecidos "
+            "para não interromper o robô."
+        )
+        try:
+            _assinar_candles_otc()
+        except Exception as sube:
+            log(f"[OTC AUTO] Erro no fallback de assinaturas: {sube}")
 
 def _corpo_lista_instrumentos(nome):
     """
