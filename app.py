@@ -89,6 +89,24 @@ _bullex_auth_event = threading.Event()
 _bullex_auth_request_id = None
 _bullex_client_session_id = None
 
+# ============================================================
+# DIAGNOSTICO DA VERSAO DEPLOYADA
+# ============================================================
+BULLEX_DIAGNOSTIC_VERSION = "OTC-WS-DIAG-20260905-01"
+
+_bullex_diag = {
+    "messages": 0,
+    "generated": 0,
+    "responses": 0,
+    "stored": 0,
+    "last_name": None,
+    "last_request_id": None,
+    "last_active_id": None,
+    "last_size": None,
+    "last_keys": [],
+}
+_bullex_diag_lock = threading.Lock()
+
 TELEGRAM_BOT_TOKEN = os.getenv(
     "TELEGRAM_BOT_TOKEN", ""
 ).strip()
@@ -117,6 +135,7 @@ MAX_ATRASO_MINUTOS = 8
 
 ATIVOS = {
     "EURUSD": "EUR/USD",
+    "EURJPY": "EUR/JPY",
     "GBPUSD": "GBP/USD",
     "USDJPY": "USD/JPY",
     "GBPJPY": "GBP/JPY",
@@ -449,44 +468,50 @@ def _armazenar_candle_ws(active_id, size, item):
 
 
 def _extrair_candles_da_resposta(msg):
-    nome = msg.get("name")
+    """Extrai candles sem depender exclusivamente do campo name."""
+    if not isinstance(msg, dict):
+        return []
+
     conteudo = msg.get("msg")
 
-    if nome in (
-        "candles",
-        "first-candles",
-        "get-candles",
-    ):
-        if isinstance(conteudo, list):
-            return conteudo
+    # Respostas normais: {name, msg:{...}}.
+    if isinstance(conteudo, list):
+        return [x for x in conteudo if isinstance(x, dict)]
 
-        if isinstance(conteudo, dict):
-            encontrados = []
+    if not isinstance(conteudo, dict):
+        # Alguns envelopes podem trazer candles diretamente.
+        conteudo = msg
 
-            for chave in (
-                "candles",
-                "data",
-                "values",
-            ):
-                valor = conteudo.get(chave)
+    encontrados = []
 
-                if isinstance(valor, list):
-                    encontrados.extend(valor)
-
-            por_tamanho = conteudo.get(
-                "candles_by_size"
+    for chave in ("candles", "data", "values"):
+        valor = conteudo.get(chave)
+        if isinstance(valor, list):
+            encontrados.extend(
+                x for x in valor if isinstance(x, dict)
             )
+        elif isinstance(valor, dict) and all(
+            k in valor for k in ("open", "close")
+        ):
+            encontrados.append(valor)
 
-            if isinstance(por_tamanho, dict):
-                for valor in por_tamanho.values():
-                    if isinstance(valor, list):
-                        encontrados.extend(valor)
-                    elif isinstance(valor, dict):
-                        encontrados.append(valor)
+    por_tamanho = conteudo.get("candles_by_size")
+    if isinstance(por_tamanho, dict):
+        for valor in por_tamanho.values():
+            if isinstance(valor, list):
+                encontrados.extend(
+                    x for x in valor if isinstance(x, dict)
+                )
+            elif isinstance(valor, dict):
+                encontrados.append(valor)
 
-            return encontrados
+    # Fallback para uma única vela direta no msg.
+    if not encontrados and all(
+        k in conteudo for k in ("open", "close")
+    ):
+        encontrados.append(conteudo)
 
-    return []
+    return encontrados
 
 
 # ============================================================
@@ -601,30 +626,54 @@ def _on_bullex_message(ws, raw_message):
     if not isinstance(data, dict):
         return
 
-    # Alguns ambientes podem entregar JSON encapsulado em "data".
+    # Alguns ambientes entregam JSON encapsulado em "data".
     if isinstance(data.get("data"), str):
         try:
             inner = json.loads(data["data"])
-
             if isinstance(inner, dict):
-                _on_bullex_message(
-                    ws,
-                    json.dumps(inner)
-                )
+                _on_bullex_message(ws, json.dumps(inner))
                 return
-
         except Exception:
             pass
 
     if isinstance(data.get("data"), dict):
         inner = data["data"]
-
         if isinstance(inner, dict):
-            _on_bullex_message(
-                ws,
-                json.dumps(inner)
-            )
+            _on_bullex_message(ws, json.dumps(inner))
             return
+
+    nome = data.get("name")
+    request_id = data.get("request_id")
+    msg = data.get("msg")
+
+    active_id = None
+    size = None
+    if isinstance(msg, dict):
+        active_id = msg.get("active_id")
+        size = msg.get("size")
+
+    with _bullex_diag_lock:
+        _bullex_diag["messages"] += 1
+        _bullex_diag["last_name"] = nome
+        _bullex_diag["last_request_id"] = request_id
+        _bullex_diag["last_active_id"] = active_id
+        _bullex_diag["last_size"] = size
+        _bullex_diag["last_keys"] = list(data.keys())[:25]
+
+    # Log somente mensagens relevantes para não inundar o Render.
+    if nome in (
+        "authenticated",
+        "get-first-candles",
+        "first-candles",
+        "get-candles",
+        "candles",
+        "candle-generated",
+    ):
+        log(
+            f"[DIAG WS] name={nome} request_id={request_id} "
+            f"active_id={active_id} size={size} "
+            f"msg_type={type(msg).__name__} keys={list(data.keys())[:12]}"
+        )
 
     # ========================================================
     # AUTENTICAÇÃO
@@ -635,106 +684,119 @@ def _on_bullex_message(ws, raw_message):
         _bullex_auth_event.set()
 
         session = _bullex_client_session_id
-
         if session:
             log(
                 "Autenticacao Bullex confirmada. "
                 f"client_session_id={session}"
             )
         else:
-            log(
-                "Autenticacao Bullex confirmada."
-            )
+            log("Autenticacao Bullex confirmada.")
 
-        # A Traderoom autentica primeiro e, em seguida, assina
-        # candle-generated. Fazemos a assinatura somente depois
-        # da confirmacao real da autenticacao.
         threading.Thread(
             target=_assinar_candles_otc,
             daemon=True,
             name="bullex-candle-subscriptions",
         ).start()
-
         return
 
     if _mensagem_indica_auth_erro(data):
         _bullex_authenticated = False
-        _bullex_last_error = (
-            "Bullex recusou a autenticacao."
-        )
+        _bullex_last_error = "Bullex recusou a autenticacao."
         _bullex_auth_event.set()
-
-        log(
-            "Bullex recusou a autenticacao."
-        )
-
+        log("Bullex recusou a autenticacao.")
         return
 
     # ========================================================
     # CANDLE-GENERATED
     # ========================================================
 
-    if data.get("name") == "candle-generated":
-        msg = data.get("msg", {})
+    if nome == "candle-generated":
+        with _bullex_diag_lock:
+            _bullex_diag["generated"] += 1
 
         if isinstance(msg, dict):
             active_id = msg.get("active_id")
             size = msg.get("size")
-
             if active_id is not None and size is not None:
-                _armazenar_candle_ws(
-                    active_id,
-                    size,
-                    msg
-                )
-
+                _armazenar_candle_ws(active_id, size, msg)
+                with _bullex_diag_lock:
+                    _bullex_diag["stored"] += 1
         return
 
     # ========================================================
-    # RESPOSTAS DE CANDLES
+    # RESPOSTAS / EVENTOS DE CANDLES
     # ========================================================
 
-    request_id = data.get("request_id")
+    dados = _extrair_candles_da_resposta(data)
+    is_candle_response = nome in (
+        "candles",
+        "first-candles",
+        "get-candles",
+    ) or bool(dados)
 
+    if is_candle_response:
+        with _bullex_diag_lock:
+            _bullex_diag["responses"] += 1
+
+        qtd = len(dados)
+        log(
+            f"[DIAG CANDLE] resposta name={nome} "
+            f"request_id={request_id} active_id={active_id} "
+            f"size={size} qtd={qtd}"
+        )
+
+        if isinstance(msg, dict):
+            log(
+                f"[DIAG CANDLE] chaves_msg={list(msg.keys())[:30]}"
+            )
+
+            if isinstance(msg.get("candles_by_size"), dict):
+                log(
+                    "[DIAG CANDLE] candles_by_size="
+                    f"{[(str(k), len(v) if isinstance(v, list) else 1) for k, v in msg['candles_by_size'].items()]}"
+                )
+
+        # Guarda a resposta para quem estiver esperando request_id.
+        if request_id is not None:
+            with _bullex_cv:
+                _bullex_response_store[str(request_id)] = data
+
+        # Armazena independentemente de existir request_id.
+        if isinstance(msg, dict):
+            response_active_id = msg.get("active_id")
+            if response_active_id is not None:
+                _armazenar_candles_resposta(
+                    response_active_id,
+                    msg
+                )
+
+                for item in dados:
+                    if not isinstance(item, dict):
+                        continue
+
+                    item_size = item.get("size")
+                    if item_size is None:
+                        item_size = msg.get("size")
+
+                    # candles_by_size não coloca size dentro de cada item.
+                    if item_size is not None:
+                        _armazenar_candle_ws(
+                            response_active_id,
+                            item_size,
+                            item
+                        )
+                        with _bullex_diag_lock:
+                            _bullex_diag["stored"] += 1
+
+        with _bullex_cv:
+            _bullex_cv.notify_all()
+        return
+
+    # Outras respostas continuam disponíveis para chamadas que
+    # eventualmente dependam de request_id.
     if request_id is not None:
         with _bullex_cv:
-            _bullex_response_store[
-                str(request_id)
-            ] = data
-
-            dados = _extrair_candles_da_resposta(data)
-
-            if dados:
-                msg = data.get("msg", {})
-
-                active_id = None
-                if isinstance(msg, dict):
-                    active_id = msg.get("active_id")
-
-                if active_id is not None:
-                    _armazenar_candles_resposta(
-                        active_id,
-                        msg
-                    )
-
-                    for item in dados:
-                        if not isinstance(item, dict):
-                            continue
-
-                        # O tamanho pode vir no candle individual.
-                        item_size = item.get("size")
-
-                        # Ou na resposta.
-                        if item_size is None and isinstance(msg, dict):
-                            item_size = msg.get("size")
-
-                        if item_size is not None:
-                            _armazenar_candle_ws(
-                                active_id,
-                                item_size,
-                                item
-                            )
-
+            _bullex_response_store[str(request_id)] = data
             _bullex_cv.notify_all()
 
 
@@ -3678,6 +3740,12 @@ def health():
 # ============================================================
 # EXECUÇÃO
 # ============================================================
+
+log(
+    f"VERSAO DO APP: {BULLEX_DIAGNOSTIC_VERSION} | "
+    f"ATIVOS={list(ATIVO_BULLEX.keys())} | "
+    f"WS={BULLEX_WS_URL}"
+)
 
 if __name__ == "__main__":
     garantir_robo_iniciado()
