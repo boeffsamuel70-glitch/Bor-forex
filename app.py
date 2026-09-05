@@ -4,6 +4,7 @@ import threading
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import json
+import re
 import requests
 import websocket
 
@@ -61,12 +62,31 @@ BULLEX_USER_AGENT = os.getenv(
 # ATIVOS BULLEX
 # ============================================================
 
+# Fallback inicial. Depois da autenticação o robô consulta
+# automaticamente as listas de instrumentos da Traderoom e substitui
+# esta tabela pelos OTC realmente disponíveis na conta.
 ATIVO_BULLEX = {
     "EURUSD": {"symbol": "EUR/USD", "active_id": 76, "ticker": "EURUSD-OTC"},
     "EURJPY": {"symbol": "EUR/JPY", "active_id": 79, "ticker": "EURJPY-OTC"},
     "GBPUSD": {"symbol": "GBP/USD", "active_id": 81, "ticker": "GBPUSD-OTC"},
     "USDJPY": {"symbol": "USD/JPY", "active_id": 85, "ticker": "USDJPY-OTC"},
     "GBPJPY": {"symbol": "GBP/JPY", "active_id": 84, "ticker": "GBPJPY-OTC"},
+}
+
+_bullex_assets_lock = threading.RLock()
+_bullex_assets_detected = False
+_bullex_assets_last_error = None
+_bullex_assets_updated_at = None
+_bullex_assets_source = None
+
+# Mantém a estratégia funcionando imediatamente enquanto a lista automática
+# ainda está sendo carregada.
+ATIVOS = {
+    "EURUSD": "EUR/USD",
+    "EURJPY": "EUR/JPY",
+    "GBPUSD": "GBP/USD",
+    "USDJPY": "USD/JPY",
+    "GBPJPY": "GBP/JPY",
 }
 
 _BULLEX_CANDLE_SIZES = {"5min": 300, "15min": 900}
@@ -92,7 +112,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OTC-WS-HISTORY-FIX-20260905-02"
+BULLEX_DIAGNOSTIC_VERSION = "OTC-AUTO-UNDERLYING-LIST-20260905-01"
 
 _bullex_diag = {
     "messages": 0,
@@ -133,13 +153,7 @@ MAX_ATRASO_MINUTOS = 8
 # ATIVOS
 # ============================================================
 
-ATIVOS = {
-    "EURUSD": "EUR/USD",
-    "EURJPY": "EUR/JPY",
-    "GBPUSD": "GBP/USD",
-    "USDJPY": "USD/JPY",
-    "GBPJPY": "GBP/JPY",
-}
+
 
 # ============================================================
 # ESTADO
@@ -177,6 +191,16 @@ estado = {
         "dojis": 0,
         "taxa": 0.0,
     },
+}
+
+# Informações expostas no dashboard sobre a descoberta automática.
+estado["ativos_info"] = {
+    "quantidade": len(ATIVO_BULLEX),
+    "status": "FALLBACK / aguardando descoberta",
+    "lista": ", ".join(
+        f"{cfg['ticker']} (id {cfg['active_id']})"
+        for cfg in ATIVO_BULLEX.values()
+    ) or "-",
 }
 
 _robo_lock = threading.Lock()
@@ -693,7 +717,7 @@ def _on_bullex_message(ws, raw_message):
             log("Autenticacao Bullex confirmada.")
 
         threading.Thread(
-            target=_assinar_candles_otc,
+            target=_inicializar_ativos_otc,
             daemon=True,
             name="bullex-candle-subscriptions",
         ).start()
@@ -1075,6 +1099,351 @@ def _assinar_candle(active_id, size):
             f"Falha ao assinar candle-generated "
             f"active_id={active_id} size={size}: {e}"
         )
+
+
+def _texto_tem_otc(valor):
+    """Retorna True quando o valor representa claramente um instrumento OTC."""
+    if valor is None:
+        return False
+    texto = str(valor).strip().upper()
+    return (
+        "OTC" in texto
+        or texto.endswith("-OTC")
+        or texto.endswith("_OTC")
+        or texto.endswith("/OTC")
+    )
+
+
+def _iter_dicts_recursivo(obj):
+    """Percorre listas/dicionários de qualquer formato retornado pela Traderoom."""
+    if isinstance(obj, dict):
+        yield obj
+        for valor in obj.values():
+            yield from _iter_dicts_recursivo(valor)
+    elif isinstance(obj, list):
+        for valor in obj:
+            yield from _iter_dicts_recursivo(valor)
+
+
+def _primeiro_valor(item, chaves):
+    for chave in chaves:
+        if chave in item and item[chave] not in (None, ""):
+            return item[chave]
+    return None
+
+
+def _normalizar_instrumento_otc(item):
+    """
+    Converte diferentes formatos de underlying_list em:
+    codigo -> {symbol, active_id, ticker}.
+
+    A Traderoom pode mudar a posição/nome de campos entre versões.
+    Por isso procuramos por aliases conhecidos em vez de depender de
+    um único JSON rígido.
+    """
+    if not isinstance(item, dict):
+        return None
+
+    active_id = _primeiro_valor(
+        item,
+        (
+            "active_id",
+            "activeId",
+            "activeID",
+            "asset_id",
+            "assetId",
+            "instrument_id",
+            "instrumentId",
+            "id",
+        ),
+    )
+
+    try:
+        active_id = int(active_id)
+    except (TypeError, ValueError):
+        return None
+
+    ticker = _primeiro_valor(
+        item,
+        (
+            "ticker",
+            "ticker_name",
+            "tickerName",
+            "display_name",
+            "displayName",
+            "instrument_name",
+            "instrumentName",
+            "name",
+            "symbol",
+            "underlying",
+            "underlying_name",
+            "underlyingName",
+        ),
+    )
+
+    symbol = _primeiro_valor(
+        item,
+        (
+            "symbol",
+            "asset_name",
+            "assetName",
+            "underlying",
+            "underlying_name",
+            "underlyingName",
+            "name",
+        ),
+    )
+
+    # Alguns retornos trazem o OTC em um campo e o par em outro.
+    campos_texto = [
+        item.get(chave)
+        for chave in (
+            "ticker",
+            "ticker_name",
+            "tickerName",
+            "display_name",
+            "displayName",
+            "instrument_name",
+            "instrumentName",
+            "name",
+            "symbol",
+            "underlying",
+            "underlying_name",
+            "underlyingName",
+            "type",
+            "instrument_type",
+        )
+    ]
+
+    texto_otc = " ".join(
+        str(x) for x in campos_texto if x not in (None, "")
+    ).upper()
+
+    if "OTC" not in texto_otc:
+        return None
+
+    # Ticker é preferido para identificar o ativo OTC.
+    ticker_text = str(ticker or symbol or "").strip()
+    symbol_text = str(symbol or ticker or "").strip()
+
+    if not ticker_text:
+        ticker_text = f"OTC-{active_id}"
+
+    # Se só veio EURUSD-OTC, cria EUR/USD para a estratégia.
+    base = ticker_text.upper()
+    base = re.sub(r"[^A-Z]", "", base.replace("OTC", ""))
+    if len(base) >= 6 and base[:6].isalpha():
+        par = base[:6]
+        symbol_normalizado = f"{par[:3]}/{par[3:6]}"
+    else:
+        base2 = re.sub(r"[^A-Z]", "", symbol_text.upper().replace("OTC", ""))
+        if len(base2) >= 6:
+            symbol_normalizado = f"{base2[:3]}/{base2[3:6]}"
+        else:
+            symbol_normalizado = symbol_text or ticker_text
+
+    # Código interno estável, derivado do ticker/par.
+    codigo_base = re.sub(r"[^A-Z0-9]", "", ticker_text.upper())
+    if not codigo_base:
+        codigo_base = re.sub(r"[^A-Z0-9]", "", symbol_normalizado.upper())
+    codigo = codigo_base
+    if not codigo.upper().endswith("OTC"):
+        codigo = f"{codigo}OTC"
+
+    return {
+        "codigo": codigo,
+        "symbol": symbol_normalizado,
+        "active_id": active_id,
+        "ticker": ticker_text,
+        "raw": item,
+    }
+
+
+def _extrair_otcs_da_resposta(resposta):
+    """Extrai todos os OTCs de uma resposta, mesmo com envelopes diferentes."""
+    encontrados = {}
+
+    for item in _iter_dicts_recursivo(resposta):
+        normalizado = _normalizar_instrumento_otc(item)
+        if not normalizado:
+            continue
+
+        active_id = normalizado["active_id"]
+        atual = encontrados.get(active_id)
+
+        # Prefere a ocorrência que tenha ticker explícito com OTC.
+        if atual is None:
+            encontrados[active_id] = normalizado
+        else:
+            atual_ticker = str(atual.get("ticker", "")).upper()
+            novo_ticker = str(normalizado.get("ticker", "")).upper()
+            if "OTC" in novo_ticker and "OTC" not in atual_ticker:
+                encontrados[active_id] = normalizado
+
+    resultado = list(encontrados.values())
+    resultado.sort(key=lambda x: (x["ticker"].upper(), x["active_id"]))
+    return resultado
+
+
+def _consultar_lista_instrumentos(nome, versoes=("2.0", "1.0")):
+    """
+    Consulta um microserviço de instrumentos.
+
+    Tentamos as duas versões mais comuns porque a Traderoom pode variar a
+    versão do comando entre ambientes/deploys.
+    """
+    ultimo_erro = None
+
+    for versao in versoes:
+        try:
+            resposta = _enviar_e_aguardar(
+                nome,
+                versao,
+                None,
+                timeout=12,
+            )
+            otcs = _extrair_otcs_da_resposta(resposta)
+            if otcs:
+                log(
+                    f"[OTC AUTO] {nome} v{versao}: "
+                    f"{len(otcs)} OTC encontrados."
+                )
+                return resposta, otcs
+            log(
+                f"[OTC AUTO] {nome} v{versao}: resposta recebida, "
+                "mas nenhum OTC foi reconhecido."
+            )
+        except Exception as e:
+            ultimo_erro = e
+            log(
+                f"[OTC AUTO] Falha em {nome} v{versao}: {e}"
+            )
+
+    if ultimo_erro:
+        raise ultimo_erro
+    return None, []
+
+
+def _atualizar_ativos_otc(otcs, origem):
+    """Substitui ATIVO_BULLEX/ATIVOS pela lista OTC descoberta."""
+    global ATIVO_BULLEX
+    global ATIVOS
+    global _bullex_assets_detected
+    global _bullex_assets_last_error
+    global _bullex_assets_updated_at
+    global _bullex_assets_source
+
+    if not otcs:
+        raise RuntimeError("Nenhum ativo OTC foi encontrado na Traderoom.")
+
+    novos_bullex = {}
+    novos_ativos = {}
+
+    for item in otcs:
+        codigo = item["codigo"]
+        # Evita colisão de código caso a Traderoom envie dois registros
+        # com o mesmo ticker textual.
+        if codigo in novos_bullex:
+            codigo = f"{codigo}_{item['active_id']}"
+
+        novos_bullex[codigo] = {
+            "symbol": item["symbol"],
+            "active_id": int(item["active_id"]),
+            "ticker": item["ticker"],
+        }
+        novos_ativos[codigo] = item["symbol"]
+
+    with _bullex_assets_lock:
+        ATIVO_BULLEX = novos_bullex
+        ATIVOS = novos_ativos
+        _bullex_assets_detected = True
+        _bullex_assets_last_error = None
+        _bullex_assets_updated_at = agora_brt().isoformat()
+        _bullex_assets_source = origem
+
+    log(
+        "[OTC AUTO] Ativos carregados automaticamente: "
+        + ", ".join(
+            f"{cfg['ticker']}={cfg['active_id']}"
+            for cfg in novos_bullex.values()
+        )
+    )
+
+    estado["ativos_info"] = {
+        "quantidade": len(novos_bullex),
+        "status": "AUTOMÁTICO",
+        "lista": ", ".join(
+            f"{cfg['ticker']} (id {cfg['active_id']})"
+            for cfg in novos_bullex.values()
+        ) or "-",
+    }
+
+
+def _descobrir_otcs_automaticamente():
+    """
+    Descobre OTCs diretamente pelos serviços de instrumentos da Traderoom.
+
+    Digital é a fonte principal. Marginal/forex é mesclada como segunda
+    fonte para capturar OTCs adicionais, sempre filtrando somente OTC.
+    """
+    globais = {}
+
+    fontes = (
+        "digital-option-instruments.get-underlying-list",
+        "marginal-forex-instruments.get-underlying-list",
+    )
+
+    for nome in fontes:
+        try:
+            resposta, otcs = _consultar_lista_instrumentos(nome)
+            if resposta is not None:
+                for item in otcs:
+                    globais[item["active_id"]] = item
+        except Exception as e:
+            log(f"[OTC AUTO] Fonte indisponível {nome}: {e}")
+
+    if not globais:
+        raise RuntimeError(
+            "A Traderoom não retornou nenhum OTC nas listas de instrumentos."
+        )
+
+    resultado = list(globais.values())
+    resultado.sort(key=lambda x: (x["ticker"].upper(), x["active_id"]))
+
+    _atualizar_ativos_otc(
+        resultado,
+        "digital-option-instruments + marginal-forex-instruments",
+    )
+
+    return resultado
+
+
+def _inicializar_ativos_otc():
+    """Descobre OTCs e, somente depois, assina os candles."""
+    global _bullex_assets_last_error
+
+    try:
+        otcs = _descobrir_otcs_automaticamente()
+
+        # Assina somente após a tabela dinâmica estar pronta.
+        _assinar_candles_otc()
+
+        log(
+            f"[OTC AUTO] Inicialização concluída com {len(otcs)} ativos OTC."
+        )
+    except Exception as e:
+        _bullex_assets_last_error = str(e)
+        log(f"[OTC AUTO] ERRO na descoberta automática: {e}")
+
+        # Fallback: não derruba o robô se a lista automática falhar.
+        log(
+            "[OTC AUTO] Mantendo ativos de fallback já conhecidos "
+            "para não interromper o robô."
+        )
+        try:
+            _assinar_candles_otc()
+        except Exception as sube:
+            log(f"[OTC AUTO] Erro no fallback de assinaturas: {sube}")
 
 
 def _assinar_candles_otc():
@@ -3608,6 +3977,32 @@ Filtros da entrada
 <div class="card">
 
 <h3>
+OTC detectados automaticamente
+</h3>
+
+<div class="linha">
+<span>Quantidade</span>
+<span class="valor">
+{{ estado.ativos_info.quantidade }}
+</span>
+</div>
+
+<div class="linha">
+<span>Status</span>
+<span class="valor">
+{{ estado.ativos_info.status }}
+</span>
+</div>
+
+<div class="observacao">
+{{ estado.ativos_info.lista }}
+</div>
+
+</div>
+
+<div class="card">
+
+<h3>
 Estatísticas
 </h3>
 
@@ -3806,6 +4201,22 @@ def health():
             len(_operacoes_pendentes),
         "estatisticas":
             calcular_estatisticas(),
+        "otc_automatico": {
+            "detectado": _bullex_assets_detected,
+            "quantidade": len(ATIVO_BULLEX),
+            "atualizado_em": _bullex_assets_updated_at,
+            "fonte": _bullex_assets_source,
+            "erro": _bullex_assets_last_error,
+            "ativos": [
+                {
+                    "codigo": codigo,
+                    "symbol": config["symbol"],
+                    "ticker": config["ticker"],
+                    "active_id": config["active_id"],
+                }
+                for codigo, config in ATIVO_BULLEX.items()
+            ],
+        },
     })
 
 
