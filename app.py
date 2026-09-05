@@ -122,7 +122,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OTC-10-PARES-20260905-04"
+BULLEX_DIAGNOSTIC_VERSION = "OTC-10-PARES-20260905-05"
 
 _bullex_diag = {
     "messages": 0,
@@ -134,6 +134,10 @@ _bullex_diag = {
     "last_active_id": None,
     "last_size": None,
     "last_keys": [],
+    "last_stored": {},
+    "processamentos": 0,
+    "ultimo_processamento": None,
+    "erros_processamento": 0,
 }
 _bullex_diag_lock = threading.Lock()
 
@@ -499,6 +503,26 @@ def _armazenar_candle_ws(active_id, size, item):
 
         bucket[chave] = candle
         _bullex_cv.notify_all()
+
+    # Diagnóstico leve: registra apenas a primeira vela armazenada de cada
+    # ativo/timeframe, evitando inundar o log (o feed é contínuo).
+    diag_key = f"{active_id_int}:{size_int}"
+    with _bullex_diag_lock:
+        primeiro_armazenamento = diag_key not in _bullex_diag["last_stored"]
+        if primeiro_armazenamento:
+            _bullex_diag["last_stored"][diag_key] = {
+                "active_id": active_id_int,
+                "size": size_int,
+                "candle_id": candle.get("id"),
+                "datetime": candle.get("datetime"),
+            }
+
+    if primeiro_armazenamento:
+        log(
+            f"[DIAG STORE] candle armazenado: active_id={active_id_int} "
+            f"size={size_int} id={candle.get('id')} "
+            f"datetime={candle.get('datetime')}"
+        )
 
 
 def _extrair_candles_da_resposta(msg):
@@ -3242,6 +3266,20 @@ def processar_ativo(
     symbol
 ):
     try:
+        with _bullex_diag_lock:
+            _bullex_diag["processamentos"] += 1
+            numero_processamento = _bullex_diag["processamentos"]
+            _bullex_diag["ultimo_processamento"] = {
+                "numero": numero_processamento,
+                "codigo": chave,
+                "symbol": symbol,
+                "inicio": agora_brt().isoformat(),
+            }
+
+        log(
+            f"[DIAG PROCESS] inicio #{numero_processamento}: "
+            f"codigo={chave} symbol={symbol}"
+        )
         log(
             f"Consultando 5M: {symbol}"
         )
@@ -3522,8 +3560,14 @@ def processar_ativo(
         ] = calcular_estatisticas()
 
     except Exception as e:
+        with _bullex_diag_lock:
+            _bullex_diag["erros_processamento"] += 1
+            ultimo = _bullex_diag.get("ultimo_processamento")
+            if isinstance(ultimo, dict):
+                ultimo["erro"] = str(e)
+                ultimo["fim"] = agora_brt().isoformat()
         log(
-            f"ERRO em {symbol}: {e}"
+            f"[DIAG PROCESS] ERRO em {symbol}: {e}"
         )
 
         estado["ativo"] = symbol
@@ -4297,6 +4341,21 @@ def health():
             _bullex_last_error,
         "telegram_configurado":
             telegram_configurado(),
+        "bullex_diagnostico": (lambda d: {
+            "mensagens": d["messages"],
+            "candle_generated": d["generated"],
+            "respostas_candles": d["responses"],
+            "candles_armazenados": d["stored"],
+            "pares_timeframes_armazenados": len(d["last_stored"]),
+            "processamentos_ativos": d["processamentos"],
+            "erros_processamento": d["erros_processamento"],
+            "ultimo_processamento": d["ultimo_processamento"],
+            "ultimo_candle": {
+                "active_id": d["last_active_id"],
+                "size": d["last_size"],
+                "name": d["last_name"],
+            },
+        })(dict(_bullex_diag)),
         "operacoes_pendentes":
             len(_operacoes_pendentes),
         "estatisticas":
