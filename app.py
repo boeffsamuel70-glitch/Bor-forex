@@ -92,7 +92,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OTC-WS-DIAG-20260905-01"
+BULLEX_DIAGNOSTIC_VERSION = "OTC-WS-HISTORY-FIX-20260905-02"
 
 _bullex_diag = {
     "messages": 0,
@@ -1190,76 +1190,126 @@ def _enviar_e_aguardar(
 # BULLEX - OBTENÇÃO DE CANDLES
 # ============================================================
 
-def _obter_ultimo_id(active_id, size):
+def _obter_ultimo_id(active_id, size, timeout=15):
+    """Obtém o ID mais recente a partir do feed candle-generated.
+
+    IMPORTANTE: no protocolo da Bullex, get-first-candles retorna o
+    PRIMEIRO candle disponível para cada tamanho, e não o último.
+    Portanto ele não pode ser usado para montar from_id/to_id do
+    histórico recente. O último ID vem do candle-generated.
+    """
+    active_id = int(active_id)
+    size = int(size)
+
+    def _ultimo_do_cache():
+        with _bullex_cv:
+            bucket = _bullex_candles.get((active_id, size), {})
+            candles = list(bucket.values())
+
+        ids = []
+        for candle in candles:
+            try:
+                cid = int(candle.get("id"))
+            except (TypeError, ValueError, AttributeError):
+                continue
+            ids.append((cid, candle))
+
+        if not ids:
+            return None
+
+        return max(ids, key=lambda x: x[0])
+
+    limite = time.time() + float(timeout)
+    while time.time() < limite:
+        resultado = _ultimo_do_cache()
+        if resultado is not None:
+            ultimo_id, candle = resultado
+            log(
+                f"[DIAG CANDLE] ultimo_id pelo feed: "
+                f"active_id={active_id} size={size} "
+                f"id={ultimo_id} from={candle.get('from')} "
+                f"to={candle.get('to')}"
+            )
+            return int(ultimo_id)
+
+        with _bullex_cv:
+            restante = limite - time.time()
+            if restante <= 0:
+                break
+            _bullex_cv.wait(timeout=min(0.5, restante))
+
+    # Fallback: get-first-candles é útil para descobrir o PRIMEIRO ID
+    # disponível, mas não representa o candle atual. Retornamos esse ID
+    # somente como último recurso e deixamos isso explícito no log.
     resposta = _enviar_e_aguardar(
         "get-first-candles",
         "1.0",
         {
-            "active_id": int(active_id),
+            "active_id": active_id,
             "split_normalization": True,
         },
         timeout=15,
     )
 
     msg = resposta.get("msg", {})
-
     if not isinstance(msg, dict):
         raise RuntimeError(
             "Resposta invalida em get-first-candles."
         )
 
-    por_tamanho = msg.get(
-        "candles_by_size",
-        {}
-    )
-
+    por_tamanho = msg.get("candles_by_size", {})
+    valor = None
     if isinstance(por_tamanho, dict):
         valor = por_tamanho.get(str(size))
-
         if valor is None:
             valor = por_tamanho.get(size)
 
-        if isinstance(valor, list) and valor:
-            ids_validos = []
-
-            for x in valor:
-                if isinstance(x, dict) and x.get("id") is not None:
-                    try:
-                        ids_validos.append(int(x["id"]))
-                    except Exception:
-                        pass
-
-            if ids_validos:
-                return max(ids_validos)
-
-    dados = _extrair_candles_da_resposta(
-        resposta
-    )
+    itens = []
+    if isinstance(valor, list):
+        itens = valor
+    elif isinstance(valor, dict):
+        itens = [valor]
 
     ids = []
-
-    for item in dados:
+    for item in itens:
         if not isinstance(item, dict):
             continue
-
-        if item.get("id") is None:
-            continue
-
         try:
-            ids.append(
-                int(item["id"])
-            )
-        except Exception:
+            ids.append(int(item["id"]))
+        except (KeyError, TypeError, ValueError):
             pass
 
     if ids:
-        return max(ids)
+        primeiro_id = min(ids)
+        log(
+            f"[DIAG CANDLE] AVISO: sem candle-generated para "
+            f"active_id={active_id} size={size}; "
+            f"get-first-candles forneceu PRIMEIRO id={primeiro_id}."
+        )
+        return primeiro_id
+
+    dados = _extrair_candles_da_resposta(resposta)
+    ids = []
+    for item in dados:
+        if not isinstance(item, dict):
+            continue
+        try:
+            ids.append(int(item["id"]))
+        except (KeyError, TypeError, ValueError):
+            pass
+
+    if ids:
+        primeiro_id = min(ids)
+        log(
+            f"[DIAG CANDLE] AVISO: fallback genérico para "
+            f"active_id={active_id} size={size}; primeiro_id={primeiro_id}."
+        )
+        return primeiro_id
 
     raise RuntimeError(
-        f"get-first-candles nao retornou candle "
-        f"para active_id={active_id}, size={size}."
+        f"Nao foi possivel descobrir o ID do candle para "
+        f"active_id={active_id}, size={size}."
     )
-
 
 def _candidatos_candles_cache(
     active_id,
@@ -1319,12 +1369,34 @@ def obter_candles(
 
     ultimo_id = _obter_ultimo_id(
         active_id,
-        size
+        size,
+        timeout=15,
     )
+
+    # candle-generated normalmente aponta para a vela corrente (phase T).
+    # Como o histórico solicitado usa only_closed=true, ela deve ficar fora
+    # do intervalo. A Traderoom confirma esse comportamento no HAR.
+    to_id = int(ultimo_id)
+    cache_atual = _candidatos_candles_cache(active_id, size)
+    for candle in cache_atual:
+        try:
+            if int(candle.get("id")) == int(ultimo_id):
+                if candle.get("phase") == "T":
+                    to_id = max(1, int(ultimo_id) - 1)
+                break
+        except (TypeError, ValueError, AttributeError):
+            pass
 
     from_id = max(
         1,
-        ultimo_id - int(outputsize) + 1
+        to_id - int(outputsize) + 1
+    )
+
+    log(
+        f"[DIAG CANDLE] get-candles solicitado: "
+        f"active_id={active_id} size={size} "
+        f"from_id={from_id} to_id={to_id} "
+        f"outputsize={outputsize}"
     )
 
     resposta = _enviar_e_aguardar(
@@ -1334,7 +1406,7 @@ def obter_candles(
             "active_id": int(active_id),
             "size": int(size),
             "from_id": int(from_id),
-            "to_id": int(ultimo_id),
+            "to_id": int(to_id),
             "split_normalization": True,
             "only_closed": True,
         },
