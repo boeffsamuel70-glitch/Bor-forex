@@ -1285,21 +1285,37 @@ def _extrair_otcs_da_resposta(resposta):
     return resultado
 
 
+def _corpo_lista_instrumentos(nome):
+    """
+    Corpo exigido pelo serviço de lista de instrumentos.
+
+    A resposta bruta da Bullex confirmou que enviar body vazio para
+    digital-option-instruments.get-underlying-list provoca:
+    "body unmarshal error" + "EOF".
+
+    Para o serviço digital, a estrutura compatível é informar o tipo
+    digital-option. Para o serviço marginal, o endpoint observado já
+    responde com body vazio, então mantemos None.
+    """
+    if nome == "digital-option-instruments.get-underlying-list":
+        return {"type": "digital-option"}
+    return None
+
+
 def _consultar_lista_instrumentos(nome, versoes=("2.0", "1.0")):
     """
-    Consulta um microserviço de instrumentos.
-
-    Tentamos as duas versões mais comuns porque a Traderoom pode variar a
-    versão do comando entre ambientes/deploys.
+    Consulta um microserviço de instrumentos usando o body correto para
+    cada serviço.
     """
     ultimo_erro = None
+    body = _corpo_lista_instrumentos(nome)
 
     for versao in versoes:
         try:
             resposta = _enviar_e_aguardar(
                 nome,
                 versao,
-                None,
+                body,
                 timeout=12,
             )
             # DIAGNÓSTICO TEMPORÁRIO: imprime a resposta bruta para descobrirmos
@@ -1310,8 +1326,8 @@ def _consultar_lista_instrumentos(nome, versoes=("2.0", "1.0")):
                 bruto = repr(resposta)
 
             # Evita explodir o log do Render, mas preserva uma amostra grande.
-            if len(bruto) > 30000:
-                bruto_log = bruto[:30000] + "... [TRUNCADO EM 30000 CARACTERES]"
+            if len(bruto) > 50000:
+                bruto_log = bruto[:50000] + "... [TRUNCADO EM 50000 CARACTERES]"
             else:
                 bruto_log = bruto
 
@@ -1396,177 +1412,43 @@ def _atualizar_ativos_otc(otcs, origem):
 
 def _descobrir_otcs_automaticamente():
     """
-    Descobre OTCs diretamente pelos serviços de instrumentos da Traderoom.
+    Descobre OTCs diretamente da lista de instrumentos digitais da Traderoom.
 
-    Digital é a fonte principal. Marginal/forex é mesclada como segunda
-    fonte para capturar OTCs adicionais, sempre filtrando somente OTC.
+    O endpoint marginal-forex retornado pela Bullex contém Forex normal
+    (EURUSD, EURGBP, GBPJPY, etc.) e não deve ser usado como fonte principal
+    de OTC. A fonte digital é a que interessa para opções digitais.
     """
-    globais = {}
-
-    fontes = (
-        "digital-option-instruments.get-underlying-list",
-        "marginal-forex-instruments.get-underlying-list",
-    )
-
-    for nome in fontes:
-        try:
-            resposta, otcs = _consultar_lista_instrumentos(nome)
-            if resposta is not None:
-                for item in otcs:
-                    globais[item["active_id"]] = item
-        except Exception as e:
-            log(f"[OTC AUTO] Fonte indisponível {nome}: {e}")
-
-    if not globais:
-        raise RuntimeError(
-            "A Traderoom não retornou nenhum OTC nas listas de instrumentos."
-        )
-
-    resultado = list(globais.values())
-    resultado.sort(key=lambda x: (x["ticker"].upper(), x["active_id"]))
-
-    _atualizar_ativos_otc(
-        resultado,
-        "digital-option-instruments + marginal-forex-instruments",
-    )
-
-    return resultado
-
-
-def _inicializar_ativos_otc():
-    """Descobre OTCs e, somente depois, assina os candles."""
-    global _bullex_assets_last_error
+    nome_digital = "digital-option-instruments.get-underlying-list"
 
     try:
-        otcs = _descobrir_otcs_automaticamente()
-
-        # Assina somente após a tabela dinâmica estar pronta.
-        _assinar_candles_otc()
-
-        log(
-            f"[OTC AUTO] Inicialização concluída com {len(otcs)} ativos OTC."
-        )
+        resposta, otcs = _consultar_lista_instrumentos(nome_digital)
+        if otcs:
+            _atualizar_ativos_otc(
+                otcs,
+                nome_digital,
+            )
+            return otcs
     except Exception as e:
-        _bullex_assets_last_error = str(e)
-        log(f"[OTC AUTO] ERRO na descoberta automática: {e}")
+        log(f"[OTC AUTO] Falha na fonte digital {nome_digital}: {e}")
 
-        # Fallback: não derruba o robô se a lista automática falhar.
-        log(
-            "[OTC AUTO] Mantendo ativos de fallback já conhecidos "
-            "para não interromper o robô."
-        )
-        try:
-            _assinar_candles_otc()
-        except Exception as sube:
-            log(f"[OTC AUTO] Erro no fallback de assinaturas: {sube}")
-
-
-def _assinar_candles_otc():
-    """Assina 5M e 15M dos ativos usados pelo robô."""
-    assinaturas = set()
-
-    for config in ATIVO_BULLEX.values():
-        active_id = int(config["active_id"])
-        for size in (300, 900):
-            chave = (active_id, size)
-            if chave in assinaturas:
-                continue
-            assinaturas.add(chave)
-            try:
-                _assinar_candle(active_id, size)
-            except Exception as e:
-                log(
-                    f"Nao foi possivel assinar candle-generated "
-                    f"active_id={active_id} size={size}: {e}"
-                )
-
-
-def _enviar_e_aguardar(
-    nome,
-    version,
-    body=None,
-    timeout=15
-):
-    ws = conectar_bullex()
-
-    _aguardar_autenticacao(
-        timeout=15
-    )
-
-    payload = _montar_send_message(
-        nome,
-        version,
-        body
-    )
-
-    request_id = str(
-        payload["request_id"]
-    )
-
-    with _bullex_cv:
-        _bullex_response_store.pop(
-            request_id,
-            None
-        )
-
+    # O endpoint marginal é mantido somente como diagnóstico/suplemento.
+    # Ele pode retornar Forex normal e não contém necessariamente os OTCs.
+    nome_marginal = "marginal-forex-instruments.get-underlying-list"
     try:
-        ws.send(
-            json.dumps(
-                payload,
-                separators=(",", ":")
-            )
+        resposta_marginal, otcs_marginal = _consultar_lista_instrumentos(
+            nome_marginal
         )
-
+        if otcs_marginal:
+            _atualizar_ativos_otc(
+                otcs_marginal,
+                nome_marginal,
+            )
+            return otcs_marginal
     except Exception as e:
-        raise RuntimeError(
-            f"Falha ao enviar {nome}: {e}"
-        )
-
-    limite = time.time() + timeout
-
-    with _bullex_cv:
-        while time.time() < limite:
-            resposta = (
-                _bullex_response_store.pop(
-                    request_id,
-                    None
-                )
-            )
-
-            if resposta is not None:
-                return resposta
-
-            if (
-                not _bullex_connected
-                and _bullex_last_error
-            ):
-                raise RuntimeError(
-                    f"Bullex fechou a conexão durante "
-                    f"{nome}: {_bullex_last_error}"
-                )
-
-            if not _bullex_connected:
-                raise RuntimeError(
-                    f"Bullex fechou a conexão durante {nome}."
-                )
-
-            restante = (
-                limite - time.time()
-            )
-
-            if restante <= 0:
-                break
-
-            _bullex_cv.wait(
-                timeout=min(
-                    0.5,
-                    restante
-                )
-            )
+        log(f"[OTC AUTO] Fonte marginal indisponível: {e}")
 
     raise RuntimeError(
-        f"Timeout aguardando resposta Bullex: "
-        f"{nome} request_id={request_id}"
+        "A Traderoom não retornou nenhum OTC na lista de instrumentos digitais."
     )
 
 
