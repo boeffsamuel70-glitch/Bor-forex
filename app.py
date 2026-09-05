@@ -112,7 +112,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OTC-AUTO-UNDERLYING-LIST-20260905-01"
+BULLEX_DIAGNOSTIC_VERSION = "OTC-AUTO-RAW-UNDERLYING-20260905-02"
 
 _bullex_diag = {
     "messages": 0,
@@ -1302,6 +1302,21 @@ def _consultar_lista_instrumentos(nome, versoes=("2.0", "1.0")):
                 None,
                 timeout=12,
             )
+            # DIAGNÓSTICO TEMPORÁRIO: imprime a resposta bruta para descobrirmos
+            # o formato EXATO usado pela Traderoom. Não altera a lógica de candles.
+            try:
+                bruto = json.dumps(resposta, ensure_ascii=False, separators=(",", ":"))
+            except Exception:
+                bruto = repr(resposta)
+
+            # Evita explodir o log do Render, mas preserva uma amostra grande.
+            if len(bruto) > 30000:
+                bruto_log = bruto[:30000] + "... [TRUNCADO EM 30000 CARACTERES]"
+            else:
+                bruto_log = bruto
+
+            log(f"[OTC RAW] {nome} v{versao} RESPOSTA={bruto_log}")
+
             otcs = _extrair_otcs_da_resposta(resposta)
             if otcs:
                 log(
