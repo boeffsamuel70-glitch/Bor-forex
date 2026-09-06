@@ -496,60 +496,119 @@ def find_5m_instrument(active_id):
     return None
 
 def force_order(symbol, direction, amount):
+    """
+    TESTE ISOLADO DE ORDEM DEMO.
+
+    Nesta versão não dependemos de instrument_id 5M. O endpoint
+    binary-options.open-option usa diretamente o active_id e é o
+    fluxo de abertura de opção conhecido no protocolo Traderoom.
+
+    O objetivo é simples: descobrir se a conta DEMO consegue chegar
+    até a abertura da ordem e qual resposta a Bullex devolve.
+    """
     if symbol not in ATIVOS:
         raise ValueError('Ativo inválido.')
     if direction not in ('CALL', 'PUT'):
         raise ValueError('Direção deve ser CALL ou PUT.')
+
     amount = float(amount)
     if amount <= 0 or amount > 100:
         raise ValueError('Valor deve estar entre R$0,01 e R$100,00.')
 
     if not _test_lock.acquire(blocking=False):
         raise RuntimeError('Já existe um teste de entrada em andamento.')
+
     try:
         balance = get_demo_balance()
         active_id = ATIVOS[symbol]['active_id']
-        instrument = find_5m_instrument(active_id)
-        if not instrument:
-            raise RuntimeError(f'Instrumento 5M não encontrado para {symbol}. Veja os IDs retornados no log.')
+        ticker = ATIVOS[symbol]['ticker']
+
+        # ========================================================
+        # TESTE DIRETO DE ABERTURA
+        # ========================================================
+        # option_type_id=3 = turbo-option.
+        # expired=1 = próxima expiração relativa usada pelo
+        # protocolo para opções de curtíssimo prazo.
+        # ========================================================
         body = {
             'user_balance_id': str(balance),
-            'instrument_id': instrument['instrument_id'],
-            'amount': str(amount),
-            'instrument_index': instrument.get('instrument_index'),
-            'asset_id': active_id,
-            'instrument_dir': 'call' if direction == 'CALL' else 'put',
+            'active_id': int(active_id),
+            'option_type_id': 3,
+            'direction': 'call' if direction == 'CALL' else 'put',
+            'expired': 1,
+            'price': amount,
+            'refund_value': 0,
         }
-        log(f'FORÇANDO ENTRADA DEMO: {symbol} {direction} R${amount:.2f}')
-        resposta = request_wait('digital-options.place-digital-option', '3.0', body, 15)
-        bruto = json.dumps(resposta, ensure_ascii=False).lower()
-        sucesso = (
-            resposta.get('msg') is True or
-            resposta.get('success') is True or
-            (isinstance(resposta.get('msg'), dict) and resposta['msg'].get('success') is True) or
-            'digital-option-placed' in bruto or
-            'success":true' in bruto
+
+        log('============================================================')
+        log(f'FORÇANDO ENTRADA DEMO: {symbol} ({ticker}) {direction} R${amount:.2f}')
+        log(f'active_id={active_id} balance_id={balance}')
+        log('TESTE: binary-options.open-option v1.0')
+        log('TESTE: body=' + json.dumps(body, ensure_ascii=False))
+        log('============================================================')
+
+        resposta = request_wait(
+            'binary-options.open-option',
+            '1.0',
+            body,
+            20,
         )
+
+        bruto = json.dumps(resposta, ensure_ascii=False).lower()
+        msg = resposta.get('msg')
+
+        # A resposta de abertura normalmente contém um objeto da
+        # opção quando a compra foi aceita. Mensagens de erro também
+        # são preservadas integralmente no resultado.
+        sucesso = False
+        option = None
+
+        if isinstance(msg, dict):
+            option = msg
+            if msg.get('id') not in (None, ''):
+                sucesso = True
+            if msg.get('success') is True:
+                sucesso = True
+
+        if resposta.get('success') is True:
+            sucesso = True
+
+        if '"success":true' in bruto or 'digital-option-placed' in bruto:
+            sucesso = True
+
         result = {
             'confirmada': bool(sucesso),
             'symbol': symbol,
+            'ticker': ticker,
             'direction': direction,
             'amount': amount,
             'active_id': active_id,
-            'instrument_id': instrument['instrument_id'],
-            'instrument_index': instrument.get('instrument_index'),
+            'balance_id': str(balance),
             'balance_source': _balance_source,
+            'endpoint': 'binary-options.open-option',
+            'version': '1.0',
+            'request_body': body,
             'response': resposta,
+            'option': option,
         }
+
         global _last_test
         _last_test = result
-        log('ORDEM CONFIRMADA!' if sucesso else f'ORDEM NÃO CONFIRMADA: {resposta}')
+
+        if sucesso:
+            log('ORDEM DEMO ACEITA!')
+            if option:
+                log('DADOS DA OPÇÃO: ' + json.dumps(option, ensure_ascii=False))
+        else:
+            log('ORDEM DEMO NÃO CONFIRMADA.')
+            log('RESPOSTA COMPLETA: ' + json.dumps(resposta, ensure_ascii=False))
+
         return result
+
     finally:
         _test_lock.release()
 
-
-HTML = '''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Teste Bullex DEMO</title><style>body{font-family:Arial;background:#111;color:#fff;margin:0;padding:20px}.box{max-width:650px;margin:auto;background:#1d1d1d;padding:22px;border-radius:15px}select,input,button{width:100%;padding:14px;margin:7px 0;border-radius:9px;border:0;font-size:16px;box-sizing:border-box}button{cursor:pointer;font-weight:bold}.row{display:flex;gap:10px}.row button{width:50%}.call{background:#16834b;color:#fff}.put{background:#b52b35;color:#fff}.test{background:#ddd;color:#111}.status{background:#292929;padding:15px;border-radius:10px;margin:15px 0;line-height:1.7}pre{white-space:pre-wrap;word-break:break-word;background:#090909;padding:12px;border-radius:8px;font-size:12px}</style></head><body><div class="box"><h1>Teste de Entrada DEMO</h1><p>Este app ignora completamente a estratégia. Ele serve somente para testar o caminho de execução.</p><div class="status" id="status">Carregando...</div><label>Ativo</label><select id="symbol"><option>EUR/USD</option><option>EUR/JPY</option><option>GBP/USD</option><option>USD/JPY</option><option>GBP/JPY</option></select><label>Valor</label><input id="amount" type="number" min="0.01" max="100" step="0.01" value="5.00"><div class="row"><button class="call" onclick="test('CALL')">FORÇAR CALL</button><button class="put" onclick="test('PUT')">FORÇAR PUT</button></div><div class="status" id="result">Aguardando teste.</div></div><script>async function status(){try{let r=await fetch('/status');let d=await r.json();document.getElementById('status').innerHTML='WebSocket: <b>'+d.websocket+'</b><br>Autenticado: <b>'+d.authenticated+'</b><br>Balance DEMO: <b>'+d.balance+'</b><br>Fonte: <b>'+d.balance_source+'</b><br>Último erro: <b>'+((d.error)||'-')+'</b>';}catch(e){document.getElementById('status').textContent=e}}async function test(direction){let symbol=document.getElementById('symbol').value;let amount=document.getElementById('amount').value;document.getElementById('result').textContent='Iniciando teste '+symbol+' '+direction+'...';try{let r=await fetch('/teste/entrada',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol,direction,amount})});let d=await r.json();document.getElementById('result').innerHTML='<pre>'+JSON.stringify(d,null,2)+'</pre>';status();if(r.status===202){poll();}}catch(e){document.getElementById('result').textContent=e}}async function poll(){for(let i=0;i<90;i++){await new Promise(x=>setTimeout(x,1000));try{let r=await fetch('/status');let d=await r.json();if(d.last_test){document.getElementById('result').innerHTML='<pre>'+JSON.stringify(d.last_test,null,2)+'</pre>';}status();if(!d.test_running)return;}catch(e){}}}status();setInterval(status,5000)</script></body></html>'''
+HTML = '''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Teste Bullex DEMO</title><style>body{font-family:Arial;background:#111;color:#fff;margin:0;padding:20px}.box{max-width:650px;margin:auto;background:#1d1d1d;padding:22px;border-radius:15px}select,input,button{width:100%;padding:14px;margin:7px 0;border-radius:9px;border:0;font-size:16px;box-sizing:border-box}button{cursor:pointer;font-weight:bold}.row{display:flex;gap:10px}.row button{width:50%}.call{background:#16834b;color:#fff}.put{background:#b52b35;color:#fff}.test{background:#ddd;color:#111}.status{background:#292929;padding:15px;border-radius:10px;margin:15px 0;line-height:1.7}pre{white-space:pre-wrap;word-break:break-word;background:#090909;padding:12px;border-radius:8px;font-size:12px}</style></head><body><div class="box"><h1>Teste de Entrada DEMO</h1><p>Este app ignora completamente a estratégia. Ele testa SOMENTE a abertura de uma ordem DEMO pela API.</p><div class="status" id="status">Carregando...</div><label>Ativo</label><select id="symbol"><option>EUR/USD</option><option>EUR/JPY</option><option>GBP/USD</option><option>USD/JPY</option><option>GBP/JPY</option></select><label>Valor</label><input id="amount" type="number" min="0.01" max="100" step="0.01" value="5.00"><div class="row"><button class="call" onclick="test('CALL')">FORÇAR CALL</button><button class="put" onclick="test('PUT')">FORÇAR PUT</button></div><div class="status" id="result">Aguardando teste.</div></div><script>async function status(){try{let r=await fetch('/status');let d=await r.json();document.getElementById('status').innerHTML='WebSocket: <b>'+d.websocket+'</b><br>Autenticado: <b>'+d.authenticated+'</b><br>Balance DEMO: <b>'+d.balance+'</b><br>Fonte: <b>'+d.balance_source+'</b><br>Último erro: <b>'+((d.error)||'-')+'</b>';}catch(e){document.getElementById('status').textContent=e}}async function test(direction){let symbol=document.getElementById('symbol').value;let amount=document.getElementById('amount').value;document.getElementById('result').textContent='Iniciando teste '+symbol+' '+direction+'...';try{let r=await fetch('/teste/entrada',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol,direction,amount})});let d=await r.json();document.getElementById('result').innerHTML='<pre>'+JSON.stringify(d,null,2)+'</pre>';status();if(r.status===202){poll();}}catch(e){document.getElementById('result').textContent=e}}async function poll(){for(let i=0;i<90;i++){await new Promise(x=>setTimeout(x,1000));try{let r=await fetch('/status');let d=await r.json();if(d.last_test){document.getElementById('result').innerHTML='<pre>'+JSON.stringify(d.last_test,null,2)+'</pre>';}status();if(!d.test_running)return;}catch(e){}}}status();setInterval(status,5000)</script></body></html>'''
 
 
 @app.route('/')
