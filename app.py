@@ -92,7 +92,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OTC-AUTO-DEMO-5M-3S-V4-20260906"
+BULLEX_DIAGNOSTIC_VERSION = "OTC-AUTO-DEMO-5M-3S-LOW-LATENCY-20260906"
 
 _bullex_diag = {
     "messages": 0,
@@ -3125,6 +3125,7 @@ def processar_ativo(
     chave,
     symbol
 ):
+    inicio_processamento = time.time()
     try:
         log(
             f"Consultando 5M: {symbol}"
@@ -3397,16 +3398,29 @@ def processar_ativo(
             "CALL",
             "PUT"
         ):
-            enviar_sinal_telegram(
-                symbol,
-                resultado
+            janela_diag = _janela_execucao_5m()
+            log(
+                f"[LATENCIA] {symbol} sinal pronto em "
+                f"{time.time() - inicio_processamento:.3f}s | "
+                f"atraso_na_vela={janela_diag['atraso_segundos']:.3f}s"
             )
 
+            # CAMINHO CRÍTICO:
+            # primeiro tenta registrar/enviar a ordem automática.
+            # Telegram fica fora do caminho crítico para não consumir
+            # a janela máxima de 3 segundos.
             registrar_operacao(
                 symbol,
                 resultado,
                 fechadas_5m
             )
+
+            threading.Thread(
+                target=enviar_sinal_telegram,
+                args=(symbol, resultado),
+                daemon=True,
+                name=f"telegram-sinal-{chave}",
+            ).start()
 
         estado[
             "estatisticas"
@@ -3540,15 +3554,15 @@ def esperar_ate_proxima_leitura():
             agora + timedelta(hours=1)
         ).replace(
             minute=0,
-            second=5,
-            microsecond=0,
+            second=0,
+            microsecond=100000,
         )
 
     else:
         proxima = agora.replace(
             minute=proximo_bloco,
-            second=5,
-            microsecond=0,
+            second=0,
+            microsecond=100000,
         )
 
     segundos = max(
