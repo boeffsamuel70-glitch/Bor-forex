@@ -21,6 +21,7 @@ BULLEX_USER_AGENT = os.getenv(
 ).strip()
 BULLEX_USER_BALANCE_ID = os.getenv('BULLEX_USER_BALANCE_ID', '').strip()
 VALOR_PADRAO = float(os.getenv('TESTE_VALOR', '5.00'))
+MAX_ATRASO_ENTRADA_SEGUNDOS = int(os.getenv('MAX_ATRASO_ENTRADA_SEGUNDOS', '3'))
 
 ATIVOS = {
     'EUR/USD': {'active_id': 76, 'ticker': 'EURUSD-OTC'},
@@ -118,23 +119,32 @@ def _get_server_timestamp():
     return time.time(), "LOCAL_FALLBACK"
 
 
-def _expiration_timestamp(duration_minutes=1):
+def _janela_5m():
+    """
+    Retorna dados da vela de 5 minutos atual, usando horário do servidor
+    quando disponível.
+
+    Regra:
+    - vela abre em múltiplos de 5 minutos;
+    - entrada só é permitida nos primeiros 3 segundos;
+    - expiração é exatamente no fechamento da mesma vela de 5M.
+    """
     server_ts, source = _get_server_timestamp()
     current = int(server_ts)
 
-    # Turbo: alinha a expiração ao minuto.
-    # Após 30s, pula uma janela para evitar comprar uma opção
-    # cuja janela de aquisição já esteja encerrando.
-    base = current - (current % 60)
-    if current % 60 > 30:
-        expired = base + 60 * (duration_minutes + 1)
-    else:
-        expired = base + 60 * duration_minutes
+    candle_open = current - (current % 300)
+    candle_close = candle_open + 300
+    atraso = max(0.0, server_ts - candle_open)
 
-    if expired <= server_ts:
-        expired += 60
+    return {
+        "server_ts": server_ts,
+        "source": source,
+        "candle_open": int(candle_open),
+        "candle_close": int(candle_close),
+        "atraso_segundos": float(atraso),
+        "permitida": atraso <= MAX_ATRASO_ENTRADA_SEGUNDOS,
+    }
 
-    return int(expired), source, server_ts
 
 
 
@@ -681,11 +691,14 @@ def _build_option_bodies(balance, active_id, direction, amount):
 
 def force_order(symbol, direction, amount):
     """
-    V4 - TESTE ISOLADO DE UMA ÚNICA ORDEM DEMO.
+    TESTE ISOLADO 5M - DEMO.
 
-    Usa expired como timestamp Unix calculado pelo relógio do servidor
-    quando houver timeSync. Se timeSync ainda não tiver sido recebido,
-    o resultado informa explicitamente LOCAL_FALLBACK.
+    Regras:
+    - só envia ordem nos primeiros 3 segundos da vela de 5 minutos;
+    - exemplo: abriu 17:30:00 -> aceita até 17:30:03;
+    - expiração obrigatória em 17:35:00;
+    - passou do limite, NÃO envia ordem e retorna ATRASADA;
+    - nunca empurra a mesma entrada para a vela seguinte.
     """
     global _last_test
 
@@ -708,32 +721,87 @@ def force_order(symbol, direction, amount):
         active_id = int(ATIVOS[symbol]["active_id"])
         ticker = ATIVOS[symbol]["ticker"]
 
-        expired, time_source, server_ts = _expiration_timestamp(1)
+        janela = _janela_5m()
+
+        server_ts = janela["server_ts"]
+        time_source = janela["source"]
+        candle_open = janela["candle_open"]
+        candle_close = janela["candle_close"]
+        atraso = janela["atraso_segundos"]
 
         local_now = datetime.now(TZ)
         server_dt = datetime.fromtimestamp(server_ts, TZ)
-        expired_dt = datetime.fromtimestamp(expired, TZ)
+        open_dt = datetime.fromtimestamp(candle_open, TZ)
+        close_dt = datetime.fromtimestamp(candle_close, TZ)
+
+        # Se já passou dos 3 segundos, não envia nada.
+        if not janela["permitida"]:
+            result = {
+                "diagnostico": "TESTE_5M_JANELA_3S",
+                "mode": "DEMO_ONLY_5M",
+                "confirmada": False,
+                "em_andamento": False,
+                "status_execucao": "ATRASADA",
+                "ordem_enviada": False,
+                "motivo": (
+                    f"Entrada bloqueada: atraso de {atraso:.3f}s. "
+                    f"Máximo permitido: {MAX_ATRASO_ENTRADA_SEGUNDOS}s."
+                ),
+                "symbol": symbol,
+                "ticker": ticker,
+                "direction": direction,
+                "amount": amount,
+                "active_id": active_id,
+                "balance_id": str(balance),
+                "balance_source": _balance_source,
+                "fonte_horario": time_source,
+                "horario_local": local_now.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+                "server_time_local": server_dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+                "candle_open_timestamp": candle_open,
+                "candle_open_local": open_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                "expired_timestamp": candle_close,
+                "expired_time_local": close_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                "atraso_segundos": round(atraso, 3),
+                "max_atraso_segundos": MAX_ATRASO_ENTRADA_SEGUNDOS,
+                "response": None,
+            }
+
+            _last_test = result
+
+            log("============================================================")
+            log(
+                f"[TESTE 5M] ENTRADA BLOQUEADA POR ATRASO | "
+                f"{symbol} {direction} | atraso={atraso:.3f}s"
+            )
+            log(
+                f"Vela: {open_dt.strftime('%H:%M:%S')} -> "
+                f"{close_dt.strftime('%H:%M:%S')}"
+            )
+            log("Nenhuma ordem foi enviada.")
+            log("============================================================")
+
+            return result
 
         body = {
             "user_balance_id": int(balance),
             "active_id": active_id,
             "option_type_id": 3,
             "direction": "call" if direction == "CALL" else "put",
-            "expired": int(expired),
+            "expired": int(candle_close),
             "price": amount,
             "refund_value": 0,
         }
 
         log("============================================================")
-        log(f"V4 - TESTE DE ENTRADA DEMO: {symbol} ({ticker})")
+        log(f"[TESTE 5M] ENVIANDO ORDEM DEMO: {symbol} ({ticker})")
         log(f"Direção={direction} valor=R${amount:.2f}")
-        log(f"active_id={active_id} balance_id={balance}")
-        log(f"horario_local={local_now.strftime('%Y-%m-%d %H:%M:%S')}")
-        log(f"horario_servidor={server_dt.strftime('%Y-%m-%d %H:%M:%S')}")
+        log(f"atraso={atraso:.3f}s limite={MAX_ATRASO_ENTRADA_SEGUNDOS}s")
+        log(
+            f"vela={open_dt.strftime('%H:%M:%S')} -> "
+            f"{close_dt.strftime('%H:%M:%S')}"
+        )
+        log(f"expired_timestamp={candle_close}")
         log(f"fonte_horario={time_source}")
-        log(f"expired_timestamp={expired}")
-        log(f"expiracao={expired_dt.strftime('%Y-%m-%d %H:%M:%S')}")
-        log("Endpoint: binary-options.open-option v1.0")
         log("body=" + json.dumps(body, ensure_ascii=False))
         log("============================================================")
 
@@ -765,9 +833,12 @@ def force_order(symbol, direction, amount):
         mensagem = _extract_error_message(resposta)
 
         result = {
-            "diagnostico": "V4_SERVER_TIMESTAMP",
-            "mode": "DEMO_ONLY_V4",
+            "diagnostico": "TESTE_5M_JANELA_3S",
+            "mode": "DEMO_ONLY_5M",
             "confirmada": bool(sucesso),
+            "em_andamento": False,
+            "status_execucao": "CONFIRMADA" if sucesso else "NAO_CONFIRMADA",
+            "ordem_enviada": True,
             "symbol": symbol,
             "ticker": ticker,
             "direction": direction,
@@ -778,12 +849,15 @@ def force_order(symbol, direction, amount):
             "endpoint": "binary-options.open-option",
             "version": "1.0",
             "option_type_id": 3,
-            "horario_local": local_now.strftime("%Y-%m-%d %H:%M:%S"),
             "fonte_horario": time_source,
-            "server_timestamp": server_ts,
-            "server_time_local": server_dt.strftime("%Y-%m-%d %H:%M:%S"),
-            "expired_timestamp": expired,
-            "expired_time_local": expired_dt.strftime("%Y-%m-%d %H:%M:%S"),
+            "horario_local": local_now.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+            "server_time_local": server_dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+            "candle_open_timestamp": candle_open,
+            "candle_open_local": open_dt.strftime("%Y-%m-%d %H:%M:%S"),
+            "expired_timestamp": candle_close,
+            "expired_time_local": close_dt.strftime("%Y-%m-%d %H:%M:%S"),
+            "atraso_segundos": round(atraso, 3),
+            "max_atraso_segundos": MAX_ATRASO_ENTRADA_SEGUNDOS,
             "request_body": body,
             "response": resposta,
             "option": option,
@@ -793,12 +867,12 @@ def force_order(symbol, direction, amount):
         _last_test = result
 
         if sucesso:
-            log("ORDEM DEMO ACEITA NA V4!")
+            log("[TESTE 5M] ORDEM DEMO ACEITA!")
         else:
-            log("ORDEM DEMO NÃO CONFIRMADA NA V4.")
+            log("[TESTE 5M] ORDEM NÃO CONFIRMADA.")
             if mensagem:
                 log("MENSAGEM: " + mensagem)
-            log("RESPOSTA COMPLETA: " + json.dumps(resposta, ensure_ascii=False))
+            log("RESPOSTA: " + json.dumps(resposta, ensure_ascii=False))
 
         return result
 
@@ -818,7 +892,7 @@ def index():
 @app.route('/status')
 def status():
     return jsonify({
-        'mode': 'DEMO_ONLY_V4',
+        'mode': 'DEMO_ONLY_5M',
         'diagnostico': 'EXPIRACAO_4104',
         'websocket': 'CONECTADO' if _connected else 'DESCONECTADO',
         'authenticated': _authenticated,
@@ -895,7 +969,7 @@ def teste_entrada():
 
 @app.route('/health')
 def health():
-    return jsonify({'status':'ok','mode':'DEMO_ONLY_V4','diagnostico':'EXPIRACAO_4104','websocket':_connected,'authenticated':_authenticated,'balance':bool(_balance_id),'last_test':_last_test,'test_running':_test_running,'error':_last_error})
+    return jsonify({'status':'ok','mode':'DEMO_ONLY_5M','diagnostico':'EXPIRACAO_4104','websocket':_connected,'authenticated':_authenticated,'balance':bool(_balance_id),'last_test':_last_test,'test_running':_test_running,'error':_last_error})
 
 
 if __name__ == '__main__':
