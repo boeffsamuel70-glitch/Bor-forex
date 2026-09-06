@@ -92,7 +92,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OTC-AUTO-DEMO-5M-3S-LOW-LATENCY-20260906"
+BULLEX_DIAGNOSTIC_VERSION = "OTC-AUTO-DEMO-5M-1S-3S-20260906"
 
 _bullex_diag = {
     "messages": 0,
@@ -146,6 +146,7 @@ BULLEX_USER_BALANCE_ID = os.getenv(
 VALORES_ENTRADA = [5.00, 10.50, 23.00]
 EXPIRACAO_MINUTOS = 5
 MAX_ATRASO_ENTRADA_SEGUNDOS = 3
+DELAY_MINIMO_ENTRADA_SEGUNDOS = 1.0
 UMA_OPERACAO_GLOBAL = True
 
 # ============================================================
@@ -784,6 +785,21 @@ def executar_ordem_demo(symbol, sinal, resultado):
 
     janela = _janela_execucao_5m()
     atraso = float(janela["atraso_segundos"])
+
+    # Evita enviar exatamente no instante 00.000 da nova vela.
+    # A Bullex pode ainda estar liberando a nova janela de compra.
+    if atraso < DELAY_MINIMO_ENTRADA_SEGUNDOS:
+        espera = DELAY_MINIMO_ENTRADA_SEGUNDOS - atraso
+        log(
+            f"[AUTO DEMO V4] Aguardando {espera:.3f}s "
+            "para liberação técnica da nova vela."
+        )
+        time.sleep(espera)
+
+        # Recalcula após a espera para garantir que continuamos
+        # dentro da janela máxima de 3 segundos.
+        janela = _janela_execucao_5m()
+        atraso = float(janela["atraso_segundos"])
 
     candle_open_dt = datetime.fromtimestamp(
         janela["candle_open"],
