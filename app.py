@@ -92,7 +92,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OTC-AUTO-DEMO-5M-1S-3S-20260906"
+BULLEX_DIAGNOSTIC_VERSION = "OTC-AUTO-DEMO-5M-LOCK-FIX-20260906"
 
 _bullex_diag = {
     "messages": 0,
@@ -1263,7 +1263,6 @@ def _on_bullex_message(ws, raw_message):
         "first-candles",
         "get-candles",
         "candles",
-        "candle-generated",
     ):
         log(
             f"[DIAG WS] name={nome} request_id={request_id} "
@@ -2998,6 +2997,8 @@ def avaliar_operacao(
     symbol,
     candles
 ):
+    global _operacao_global_ativa
+
     operacao = (
         _operacoes_pendentes.get(
             symbol
@@ -3063,6 +3064,28 @@ def avaliar_operacao(
         del _operacoes_pendentes[
             symbol
         ]
+
+        # A ordem automática confirmada ocupa a trava global.
+        # Ao finalizar WIN/LOSS/DOJI, libera a trava para permitir
+        # que o próximo sinal possa executar uma nova ordem.
+        with _execucao_lock:
+            if (
+                _operacao_global_ativa is not None
+                and _operacao_global_ativa.get("symbol") == symbol
+            ):
+                _operacao_global_ativa = None
+
+        # Atualiza o Soros/Martingale configurado:
+        # WIN volta para R$ 5,00; LOSS avança 5 -> 10,50 -> 23.
+        # DOJI mantém o nível atual.
+        _atualizar_progressao(resultado)
+        _atualizar_estado_execucao()
+
+        log(
+            f"[AUTO DEMO] Operação finalizada e trava global liberada | "
+            f"{symbol} resultado={resultado} | "
+            f"próximo_valor=R${_valor_entrada_atual():.2f}"
+        )
 
         estatisticas = (
             calcular_estatisticas()
