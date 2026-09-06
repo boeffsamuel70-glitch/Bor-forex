@@ -124,8 +124,8 @@ TZ = ZoneInfo(TIMEZONE)
 OUTPUTSIZE = 150
 OUTPUTSIZE_15M = 100
 
-HORA_INICIO = 4
-HORA_FIM = 23
+HORA_INICIO = 6
+HORA_FIM = 22
 
 MAX_ATRASO_MINUTOS = 8
 
@@ -1883,34 +1883,26 @@ def analisar_pullback(
     tendencia_15m = tendencia_timeframe(candles_15m)
 
     confirmacao = candle_info(candles_5m[-1])
+    # Pullback somente na vela imediatamente anterior (-2).
     pullback_1 = candle_info(candles_5m[-2])
-    pullback_2 = candle_info(candles_5m[-3])
 
     # EMA calculada no próprio candle do pullback, e não na vela atual.
     pb1_ema13 = ema13_series[-2]
     pb1_ema21 = ema21_series[-2]
-    pb2_ema13 = ema13_series[-3]
-    pb2_ema21 = ema21_series[-3]
 
     pb1_call = pullback_na_vela(
         pullback_1, pb1_ema13, pb1_ema21, "CALL"
     )
-    pb2_call = pullback_na_vela(
-        pullback_2, pb2_ema13, pb2_ema21, "CALL"
-    )
     pb1_put = pullback_na_vela(
         pullback_1, pb1_ema13, pb1_ema21, "PUT"
     )
-    pb2_put = pullback_na_vela(
-        pullback_2, pb2_ema13, pb2_ema21, "PUT"
-    )
 
-    pullback_call = pb1_call or pb2_call
-    pullback_put = pb1_put or pb2_put
+    pullback_call = pb1_call
+    pullback_put = pb1_put
 
-    # A confirmação rompe a máxima/mínima da vela que realmente fez o pullback.
-    pullback_call_info = pullback_1 if pb1_call else pullback_2 if pb2_call else None
-    pullback_put_info = pullback_1 if pb1_put else pullback_2 if pb2_put else None
+    # A confirmação rompe a máxima/mínima da vela que fez o pullback.
+    pullback_call_info = pullback_1 if pb1_call else None
+    pullback_put_info = pullback_1 if pb1_put else None
 
     confirmacao_call = False
     if confirmacao["close"] > confirmacao["open"] and pullback_call_info:
@@ -1949,10 +1941,9 @@ def analisar_pullback(
     contexto_call = movimento_4 > 0 and movimento_8 > 0
     contexto_put = movimento_4 < 0 and movimento_8 < 0
 
-    # RSI deixa de ser uma trava absoluta. Ele vira confirmação de qualidade,
-    # exceto quando está em extremo, situação que continua bloqueando a entrada.
-    rsi_call_ok = rsi14 is not None and 50 <= rsi14 <= 68
-    rsi_put_ok = rsi14 is not None and 32 <= rsi14 <= 50
+    # RSI volta a ser confirmação obrigatória da direção.
+    rsi_call_ok = rsi14 is not None and 52 <= rsi14 <= 68
+    rsi_put_ok = rsi14 is not None and 32 <= rsi14 <= 48
 
     rsi_extremo = (
         rsi14 is not None
@@ -2010,8 +2001,7 @@ def analisar_pullback(
     score = max(score_call, score_put)
     bloqueio = None
 
-    # Núcleo obrigatório: tendência nos dois TFs + pullback + confirmação.
-    # O 10º ponto vem de RSI OU contexto, evitando a antiga dupla trava.
+    # Núcleo obrigatório: tendência nos dois TFs + pullback + confirmação + RSI + contexto.
     if lateral:
         bloqueio = "Mercado lateral ou tendência fraca."
     elif not atr_ok:
@@ -2025,8 +2015,12 @@ def analisar_pullback(
             bloqueio = "Alta alinhada, mas sem pullback válido."
         elif not confirmacao_call:
             bloqueio = "Pullback encontrado, mas sem confirmação separada."
+        elif not rsi_call_ok:
+            bloqueio = f"RSI não confirma CALL ({rsi14:.2f})."
+        elif not contexto_call:
+            bloqueio = "Contexto de movimento não confirma CALL."
         elif score_call < 10:
-            bloqueio = "Setup de alta sem confirmação adicional de qualidade."
+            bloqueio = "Setup de alta abaixo do score mínimo de 10."
         else:
             sinal = "CALL"
     elif tendencia_5m == "BAIXA":
@@ -2036,8 +2030,12 @@ def analisar_pullback(
             bloqueio = "Baixa alinhada, mas sem pullback válido."
         elif not confirmacao_put:
             bloqueio = "Pullback encontrado, mas sem confirmação separada."
+        elif not rsi_put_ok:
+            bloqueio = f"RSI não confirma PUT ({rsi14:.2f})."
+        elif not contexto_put:
+            bloqueio = "Contexto de movimento não confirma PUT."
         elif score_put < 10:
-            bloqueio = "Setup de baixa sem confirmação adicional de qualidade."
+            bloqueio = "Setup de baixa abaixo do score mínimo de 10."
         else:
             sinal = "PUT"
     else:
