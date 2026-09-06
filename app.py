@@ -20,17 +20,35 @@ BULLEX_WS_URL = os.getenv(
     "wss://ws.trade.bull-ex.com/echo/websocket"
 ).strip()
 
+# O HAR mostrou Origin: https://bull-ex.com.
+# Pode ser sobrescrito pelo Render se necessário.
 BULLEX_ORIGIN = os.getenv(
     "BULLEX_ORIGIN",
     "https://bull-ex.com"
 ).strip()
 
 BULLEX_SSID = os.getenv("BULLEX_SSID", "").strip()
+
+# Mantido por compatibilidade com versões anteriores.
+# A autenticação agora é montada no formato real observado no HAR.
+BULLEX_AUTH_BODY_JSON = os.getenv(
+    "BULLEX_AUTH_BODY_JSON", ""
+).strip()
+
 BULLEX_COOKIE = os.getenv("BULLEX_COOKIE", "").strip()
 
 BULLEX_PROTOCOL = int(
-    os.getenv("BULLEX_PROTOCOL", "3") or "3"
+    os.getenv("BULLEX_PROTOCOL", "3").strip() or "3"
 )
+
+# O HAR fornecido mostrou local_time=9087.
+# Deixamos configurável para não prender o valor ao código.
+try:
+    BULLEX_LOCAL_TIME = int(
+        os.getenv("BULLEX_LOCAL_TIME", "9087").strip()
+    )
+except ValueError:
+    BULLEX_LOCAL_TIME = 9087
 
 BULLEX_USER_AGENT = os.getenv(
     "BULLEX_USER_AGENT",
@@ -39,104 +57,66 @@ BULLEX_USER_AGENT = os.getenv(
     "Chrome/152.0.0.0 Mobile Safari/537.36"
 ).strip()
 
-try:
-    BULLEX_LOCAL_TIME = int(
-        os.getenv("BULLEX_LOCAL_TIME", "9087")
-    )
-except Exception:
-    BULLEX_LOCAL_TIME = 9087
-
-
-# ============================================================
-# EXECUÇÃO AUTOMÁTICA DEMO
-# ============================================================
-
-BULLEX_AUTO_TRADE = (
-    os.getenv(
-        "BULLEX_AUTO_TRADE",
-        "true"
-    ).strip().lower()
-    in ("1", "true", "yes", "sim", "on")
-)
-
-BULLEX_USER_BALANCE_ID = os.getenv(
-    "BULLEX_USER_BALANCE_ID",
-    ""
-).strip()
-
-# Progressão:
-# R$5 -> R$10,50 -> R$23
-VALORES_ENTRADA = [5.00, 10.50, 23.00]
-
-EXPIRACAO_MINUTOS = 5
-
-UMA_OPERACAO_GLOBAL = True
-
-
-# ============================================================
-# TELEGRAM
-# ============================================================
-
-TELEGRAM_BOT_TOKEN = os.getenv(
-    "TELEGRAM_BOT_TOKEN",
-    ""
-).strip()
-
-TELEGRAM_CHAT_ID = os.getenv(
-    "TELEGRAM_CHAT_ID",
-    ""
-).strip()
-
-
 # ============================================================
 # ATIVOS BULLEX
 # ============================================================
 
 ATIVO_BULLEX = {
-    "EURUSD": {
-        "symbol": "EUR/USD",
-        "active_id": 76,
-        "ticker": "EURUSD-OTC",
-    },
-    "EURJPY": {
-        "symbol": "EUR/JPY",
-        "active_id": 79,
-        "ticker": "EURJPY-OTC",
-    },
-    "GBPUSD": {
-        "symbol": "GBP/USD",
-        "active_id": 81,
-        "ticker": "GBPUSD-OTC",
-    },
-    "USDJPY": {
-        "symbol": "USD/JPY",
-        "active_id": 85,
-        "ticker": "USDJPY-OTC",
-    },
-    "GBPJPY": {
-        "symbol": "GBP/JPY",
-        "active_id": 84,
-        "ticker": "GBPJPY-OTC",
-    },
+    "EURUSD": {"symbol": "EUR/USD", "active_id": 76, "ticker": "EURUSD-OTC"},
+    "EURJPY": {"symbol": "EUR/JPY", "active_id": 79, "ticker": "EURJPY-OTC"},
+    "GBPUSD": {"symbol": "GBP/USD", "active_id": 81, "ticker": "GBPUSD-OTC"},
+    "USDJPY": {"symbol": "USD/JPY", "active_id": 85, "ticker": "USDJPY-OTC"},
+    "GBPJPY": {"symbol": "GBP/JPY", "active_id": 84, "ticker": "GBPJPY-OTC"},
 }
 
-ATIVOS = {
-    chave: valor["symbol"]
-    for chave, valor in ATIVO_BULLEX.items()
+_BULLEX_CANDLE_SIZES = {"5min": 300, "15min": 900}
+
+_bullex_ws = None
+_bullex_ws_lock = threading.RLock()
+_bullex_request_lock = threading.Lock()
+_bullex_request_counter = 1000
+
+_bullex_connected = False
+_bullex_authenticated = False
+_bullex_last_error = None
+
+_bullex_candles = {}
+_bullex_response_store = {}
+_bullex_cv = threading.Condition(_bullex_ws_lock)
+
+_bullex_ws_thread_started = False
+_bullex_auth_event = threading.Event()
+_bullex_auth_request_id = None
+_bullex_client_session_id = None
+
+# ============================================================
+# DIAGNOSTICO DA VERSAO DEPLOYADA
+# ============================================================
+BULLEX_DIAGNOSTIC_VERSION = "OTC-AUTO-DEMO-5M-BALANCE-20260906-03"
+
+_bullex_diag = {
+    "messages": 0,
+    "generated": 0,
+    "responses": 0,
+    "stored": 0,
+    "last_name": None,
+    "last_request_id": None,
+    "last_active_id": None,
+    "last_size": None,
+    "last_keys": [],
 }
+_bullex_diag_lock = threading.Lock()
 
+TELEGRAM_BOT_TOKEN = os.getenv(
+    "TELEGRAM_BOT_TOKEN", ""
+).strip()
 
-# ============================================================
-# TIMEFRAMES
-# ============================================================
+TELEGRAM_CHAT_ID = os.getenv(
+    "TELEGRAM_CHAT_ID", ""
+).strip()
 
 TIMEFRAME = "5min"
 TIMEFRAME_TREND = "15min"
-
-BULLEX_CANDLE_SIZES = {
-    "5min": 300,
-    "15min": 900,
-}
 
 TIMEZONE = "America/Sao_Paulo"
 TZ = ZoneInfo(TIMEZONE)
@@ -149,62 +129,38 @@ HORA_FIM = 22
 
 MAX_ATRASO_MINUTOS = 8
 
-
 # ============================================================
-# ESTADO DO WEBSOCKET
-# ============================================================
-
-_bullex_ws = None
-_bullex_ws_lock = threading.RLock()
-_bullex_request_lock = threading.Lock()
-_bullex_cv = threading.Condition(_bullex_ws_lock)
-
-_bullex_request_counter = 1000
-
-_bullex_connected = False
-_bullex_authenticated = False
-_bullex_last_error = None
-
-_bullex_ws_thread_started = False
-
-_bullex_auth_event = threading.Event()
-_bullex_auth_request_id = None
-_bullex_client_session_id = None
-
-_bullex_response_store = {}
-_bullex_candles = {}
-
-_bullex_balance_id = None
-_bullex_instrument_cache = {}
-
-
-# ============================================================
-# DIAGNÓSTICO
+# EXECUÇÃO AUTOMÁTICA - DEMO
 # ============================================================
 
-BULLEX_DIAGNOSTIC_VERSION = (
-    "OTC-AUTO-DEMO-5M-BALANCE-20260906-03"
-)
+BULLEX_AUTO_TRADE = os.getenv(
+    "BULLEX_AUTO_TRADE",
+    "true"
+).strip().lower() in ("1", "true", "yes", "sim", "on")
 
-_bullex_diag = {
-    "messages": 0,
-    "generated": 0,
-    "responses": 0,
-    "stored": 0,
-    "orders_sent": 0,
-    "orders_confirmed": 0,
-    "orders_errors": 0,
-    "last_name": None,
-    "last_request_id": None,
-    "last_active_id": None,
-    "last_size": None,
+BULLEX_USER_BALANCE_ID = os.getenv(
+    "BULLEX_USER_BALANCE_ID",
+    ""
+).strip()
+
+VALORES_ENTRADA = [5.00, 10.50, 23.00]
+EXPIRACAO_MINUTOS = 5
+UMA_OPERACAO_GLOBAL = True
+
+# ============================================================
+# ATIVOS
+# ============================================================
+
+ATIVOS = {
+    "EURUSD": "EUR/USD",
+    "EURJPY": "EUR/JPY",
+    "GBPUSD": "GBP/USD",
+    "USDJPY": "USD/JPY",
+    "GBPJPY": "GBP/JPY",
 }
 
-_bullex_diag_lock = threading.Lock()
-
-
 # ============================================================
-# ESTADO DO ROBÔ
+# ESTADO
 # ============================================================
 
 estado = {
@@ -240,47 +196,47 @@ estado = {
         "dojis": 0,
         "taxa": 0.0,
     },
-
-    "execucao": {
-        "automatica": BULLEX_AUTO_TRADE,
-        "modo": "DEMO",
-        "valor_atual": VALORES_ENTRADA[0],
-        "nivel_progressao": 0,
-        "operacao_ativa": False,
-        "ultima_ordem": None,
-        "ultimo_erro": None,
-    },
 }
 
+estado["execucao"] = {
+    "automatica": BULLEX_AUTO_TRADE,
+    "modo": "DEMO",
+    "valor_atual": VALORES_ENTRADA[0],
+    "nivel_progressao": 0,
+    "operacao_ativa": False,
+    "ultima_ordem": None,
+    "ultimo_erro": None,
+    "balance_id_disponivel": bool(BULLEX_USER_BALANCE_ID),
+    "balance_source": "ENV" if BULLEX_USER_BALANCE_ID else None,
+}
 
 _robo_lock = threading.Lock()
 _robo_started = False
 
 _ultimos_sinais_telegram = {}
-
 _operacoes_pendentes = {}
 _ultimas_operacoes_registradas = {}
-
 _historico_resultados = []
-
 _execucao_lock = threading.RLock()
 _operacao_global_ativa = None
-
 _nivel_progressao = 0
+_bullex_balance_id = None
+_bullex_balance_source = None
+_bullex_instrument_cache = {}
 
+_bullex_diag.update({
+    "orders_sent": 0,
+    "orders_confirmed": 0,
+    "orders_errors": 0,
+})
 
 # ============================================================
 # UTILITÁRIOS
 # ============================================================
 
 def log(msg):
-    agora = datetime.now(TZ).strftime(
-        "%Y-%m-%d %H:%M:%S"
-    )
-    print(
-        f"[BOT {agora}] {msg}",
-        flush=True
-    )
+    agora = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[BOT] {msg}", flush=True)
 
 
 def agora_brt():
@@ -305,23 +261,16 @@ def parse_datetime_candle(txt):
         return dt.astimezone(TZ)
 
     except Exception:
-        pass
-
-    formatos = (
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%d %H:%M",
-        "%Y-%m-%dT%H:%M:%S",
-        "%Y-%m-%dT%H:%M",
-    )
-
-    for fmt in formatos:
-        try:
-            return datetime.strptime(
-                txt,
-                fmt
-            ).replace(tzinfo=TZ)
-        except Exception:
-            pass
+        for fmt in (
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d %H:%M",
+            "%Y-%m-%dT%H:%M:%S",
+            "%Y-%m-%dT%H:%M",
+        ):
+            try:
+                return datetime.strptime(txt, fmt).replace(tzinfo=TZ)
+            except Exception:
+                pass
 
     return None
 
@@ -330,26 +279,14 @@ def ordenar_candles(candles):
     resultado = []
 
     for candle in candles:
-        try:
-            item = dict(candle)
+        item = dict(candle)
+        dt = parse_datetime_candle(item.get("datetime"))
 
-            dt = parse_datetime_candle(
-                item.get("datetime")
-            )
-
-            if dt is None:
-                continue
-
+        if dt is not None:
             item["_dt"] = dt
             resultado.append(item)
 
-        except Exception:
-            continue
-
-    resultado.sort(
-        key=lambda x: x["_dt"]
-    )
-
+    resultado.sort(key=lambda x: x["_dt"])
     return resultado
 
 
@@ -360,11 +297,7 @@ def somente_velas_fechadas(candles, minutos):
     return [
         candle
         for candle in candles
-        if (
-            candle["_dt"]
-            + timedelta(minutes=minutos)
-            <= agora
-        )
+        if candle["_dt"] + timedelta(minutes=minutos) <= agora
     ]
 
 
@@ -377,8 +310,7 @@ def idade_do_ultimo_candle(candles):
     ultimo = ordenadas[-1]
 
     idade = (
-        agora_brt()
-        - ultimo["_dt"]
+        agora_brt() - ultimo["_dt"]
     ).total_seconds() / 60
 
     return ultimo, idade
@@ -389,9 +321,18 @@ def idade_do_ultimo_candle(candles):
 # ============================================================
 
 def _auth_body():
+    """
+    Valida a configuração de autenticação.
+
+    O protocolo real observado no HAR NÃO usa este objeto como
+    {"name":"sendMessage", ...}. A função é mantida apenas para
+    compatibilidade/configuração e retorna a msg interna da autenticação.
+    """
+
     if not BULLEX_SSID:
         raise RuntimeError(
-            "Configure BULLEX_SSID no Render."
+            "Configure BULLEX_SSID no Render. "
+            "Nao coloque o segredo no codigo/GitHub."
         )
 
     return {
@@ -403,18 +344,43 @@ def _auth_body():
 
 
 def _next_request_id():
+    """
+    Gera request_id no formato observado no HAR:
+    <unix_seconds>_<numero>.
+    """
+
     global _bullex_request_counter
 
     with _bullex_request_lock:
         _bullex_request_counter += 1
         contador = _bullex_request_counter
 
-    return (
-        f"{int(time.time())}_{contador}"
-    )
+    return f"{int(time.time())}_{contador}"
 
 
 def _montar_auth_message():
+    """
+    Monta EXATAMENTE a estrutura principal observada no HAR:
+
+    {
+      "name": "authenticate",
+      "request_id": "...",
+      "local_time": 9087,
+      "msg": {
+        "ssid": "...",
+        "protocol": 3,
+        "session_id": "",
+        "client_session_id": ""
+      }
+    }
+    """
+
+    if not BULLEX_SSID:
+        raise RuntimeError(
+            "Configure BULLEX_SSID no Render. "
+            "Nao coloque o segredo no codigo/GitHub."
+        )
+
     return {
         "name": "authenticate",
         "request_id": _next_request_id(),
@@ -428,18 +394,18 @@ def _montar_auth_message():
     }
 
 
-def _montar_send_message(
-    nome,
-    version,
-    body=None
-):
+def _montar_send_message(nome, version, body=None):
+    """
+    Mantém o formato anterior para comandos posteriores à autenticação.
+
+    IMPORTANTE:
+    authenticate NÃO passa por esta função.
+    """
+
     payload = {
         "name": "sendMessage",
         "request_id": _next_request_id(),
-        "local_time": (
-            int(time.time() * 1000)
-            % 1_000_000
-        ),
+        "local_time": int(time.time() * 1000) % 1_000_000,
         "msg": {
             "name": nome,
             "version": version,
@@ -453,18 +419,287 @@ def _montar_send_message(
 
 
 # ============================================================
-# BULLEX - CANDLE NORMALIZATION
+# BULLEX - BALANCE DEMO / EXECUÇÃO
+# ============================================================
+
+def _valor_entrada_atual():
+    global _nivel_progressao
+    _nivel_progressao = max(0, min(_nivel_progressao, len(VALORES_ENTRADA) - 1))
+    return float(VALORES_ENTRADA[_nivel_progressao])
+
+
+def _atualizar_estado_execucao():
+    estado["execucao"].update({
+        "automatica": BULLEX_AUTO_TRADE,
+        "modo": "DEMO",
+        "valor_atual": _valor_entrada_atual(),
+        "nivel_progressao": _nivel_progressao,
+        "operacao_ativa": _operacao_global_ativa is not None,
+        "balance_id_disponivel": _bullex_balance_id is not None,
+        "balance_source": _bullex_balance_source,
+    })
+
+
+def _extrair_balance_id(obj):
+    """Procura exclusivamente uma conta DEMO (type=4), sem escolher saldo real por engano."""
+    encontrados_demo = []
+    encontrados_explicitos = []
+
+    def walk(value):
+        if isinstance(value, dict):
+            for key in ("user_balance_id", "userBalanceId", "balance_id", "balanceId"):
+                val = value.get(key)
+                if val not in (None, ""):
+                    encontrados_explicitos.append(str(val))
+
+            if value.get("id") not in (None, ""):
+                tipo = value.get("type")
+                if str(tipo) == "4":
+                    encontrados_demo.append(str(value["id"]))
+
+            for v in value.values():
+                walk(v)
+        elif isinstance(value, list):
+            for v in value:
+                walk(v)
+
+    walk(obj)
+
+    # A variável de ambiente sempre tem prioridade.
+    if BULLEX_USER_BALANCE_ID:
+        return str(BULLEX_USER_BALANCE_ID), "ENV"
+
+    # Se o servidor entregar explicitamente user_balance_id, aceitamos.
+    if encontrados_explicitos:
+        return encontrados_explicitos[0], "RESPONSE_EXPLICIT"
+
+    # Fallback seguro: somente type=4 (DEMO).
+    if encontrados_demo:
+        return encontrados_demo[0], "DEMO_TYPE_4"
+
+    return None, None
+
+
+def _solicitar_balance_id_demo():
+    global _bullex_balance_id, _bullex_balance_source, _bullex_last_error
+
+    if BULLEX_USER_BALANCE_ID:
+        _bullex_balance_id = str(BULLEX_USER_BALANCE_ID)
+        _bullex_balance_source = "ENV"
+        _atualizar_estado_execucao()
+        log(f"Balance DEMO definido por BULLEX_USER_BALANCE_ID: {_bullex_balance_id}")
+        return _bullex_balance_id
+
+    try:
+        resposta = _enviar_e_aguardar("get-balances", "1.0", None, timeout=15)
+        balance_id, source = _extrair_balance_id(resposta)
+        if balance_id is None:
+            log("[BALANCE] Nenhum user_balance_id DEMO (type=4) encontrado.")
+            return None
+
+        _bullex_balance_id = str(balance_id)
+        _bullex_balance_source = source
+        _atualizar_estado_execucao()
+        log(f"Balance DEMO encontrado: id={_bullex_balance_id} fonte={source}")
+        return _bullex_balance_id
+    except Exception as e:
+        _bullex_last_error = str(e)
+        log(f"[BALANCE] Falha ao consultar get-balances: {e}")
+        return None
+
+
+def _obter_balance_id():
+    if _bullex_balance_id:
+        return str(_bullex_balance_id)
+    return _solicitar_balance_id_demo()
+
+
+def _instrument_time():
+    agora = agora_brt()
+    minuto = (agora.minute // 5) * 5
+    return agora.replace(minute=minuto, second=0, microsecond=0)
+
+
+def _montar_instrument_id(active_id, dt=None):
+    if dt is None:
+        dt = _instrument_time()
+    return f"do{int(active_id)}{dt.strftime('%Y%m%d')}D{dt.strftime('%H%M')}T5MPSPT"
+
+
+def _extrair_instrumentos_recursivo(obj, active_id, out=None):
+    if out is None:
+        out = []
+    if isinstance(obj, dict):
+        aid = obj.get("asset_id", obj.get("active_id", obj.get("underlying_id")))
+        iid = obj.get("instrument_id", obj.get("instrumentId", obj.get("id")))
+        idx = obj.get("instrument_index", obj.get("instrumentIndex", obj.get("index")))
+        if iid is not None and (aid is None or str(aid) == str(active_id)):
+            out.append({"instrument_id": str(iid), "instrument_index": idx, "asset_id": aid or active_id})
+        for v in obj.values():
+            _extrair_instrumentos_recursivo(v, active_id, out)
+    elif isinstance(obj, list):
+        for v in obj:
+            _extrair_instrumentos_recursivo(v, active_id, out)
+    return out
+
+
+def _instrumento_eh_5m(item, expected_id):
+    iid = str(item.get("instrument_id", ""))
+    return iid == expected_id or "T5M" in iid.upper()
+
+
+def _buscar_instrumento(active_id, dt=None):
+    expected = _montar_instrument_id(active_id, dt)
+    cache_key = (int(active_id), expected)
+    cached = _bullex_instrument_cache.get(cache_key)
+    if cached:
+        return cached
+
+    for version, body in (("3.0", {"asset_id": int(active_id), "instrument_type": "digital"}),
+                          ("2.0", {"asset_id": int(active_id)})):
+        try:
+            resposta = _enviar_e_aguardar("digital-options.get-instruments", version, body, timeout=15)
+            candidatos = [x for x in _extrair_instrumentos_recursivo(resposta, active_id)
+                          if _instrumento_eh_5m(x, expected)]
+            if not candidatos:
+                continue
+            escolhido = next((x for x in candidatos if x["instrument_id"] == expected), candidatos[0])
+            _bullex_instrument_cache[cache_key] = escolhido
+            return escolhido
+        except Exception as e:
+            log(f"[INSTRUMENT] Falha get-instruments v{version} active_id={active_id}: {e}")
+
+    return None
+
+
+def _direcao_instrumento(sinal):
+    return "call" if sinal == "CALL" else "put"
+
+
+def executar_ordem_demo(symbol, sinal, resultado):
+    global _operacao_global_ativa, _bullex_last_error
+
+    if not BULLEX_AUTO_TRADE:
+        return None
+    if sinal not in ("CALL", "PUT"):
+        return None
+
+    with _execucao_lock:
+        if UMA_OPERACAO_GLOBAL and _operacao_global_ativa is not None:
+            log(f"[AUTO DEMO] Ordem bloqueada: já existe operação global ativa em {_operacao_global_ativa.get('symbol')}.")
+            return "BLOQUEADA_GLOBAL"
+
+    balance_id = _obter_balance_id()
+    if not balance_id:
+        estado["execucao"]["ultimo_erro"] = "user_balance_id DEMO não encontrado."
+        _atualizar_estado_execucao()
+        log("[AUTO DEMO] user_balance_id DEMO não encontrado.")
+        return "SEM_BALANCE_ID"
+
+    config = next((cfg for cfg in ATIVO_BULLEX.values() if cfg["symbol"] == symbol), None)
+    if not config:
+        return "SEM_ATIVO"
+
+    active_id = int(config["active_id"])
+    valor = _valor_entrada_atual()
+    dt = _instrument_time()
+    instrumento = _buscar_instrumento(active_id, dt)
+    if not instrumento:
+        estado["execucao"]["ultimo_erro"] = f"Instrumento 5M não encontrado para {symbol}."
+        _atualizar_estado_execucao()
+        return "SEM_INSTRUMENTO"
+
+    instrument_id = instrumento["instrument_id"]
+    instrument_index = instrumento.get("instrument_index")
+    body = {
+        "user_balance_id": str(balance_id),
+        "instrument_id": instrument_id,
+        "amount": str(valor),
+        "instrument_index": instrument_index,
+        "asset_id": active_id,
+        "instrument_dir": _direcao_instrumento(sinal),
+    }
+
+    log(f"[AUTO DEMO] Enviando ordem: {symbol} {sinal} valor={valor:.2f}")
+    log(f"Balance ID={balance_id}")
+    log(f"Instrument ID={instrument_id} index={instrument_index} asset_id={active_id}")
+
+    try:
+        with _bullex_diag_lock:
+            _bullex_diag["orders_sent"] += 1
+        resposta = _enviar_e_aguardar("digital-options.place-digital-option", "3.0", body, timeout=15)
+        bruto = json.dumps(resposta, ensure_ascii=False).lower()
+        sucesso = (
+            resposta.get("msg") is True
+            or resposta.get("success") is True
+            or (isinstance(resposta.get("msg"), dict) and resposta["msg"].get("success") is True)
+            or "digital-option-placed" in bruto
+            or '"success":true' in bruto
+        )
+        if not sucesso:
+            with _bullex_diag_lock:
+                _bullex_diag["orders_errors"] += 1
+            estado["execucao"]["ultimo_erro"] = f"Ordem não confirmada: {resposta}"
+            _atualizar_estado_execucao()
+            log(f"[AUTO DEMO] Ordem não confirmada: {resposta}")
+            return "SEM_CONFIRMACAO"
+
+        with _bullex_diag_lock:
+            _bullex_diag["orders_confirmed"] += 1
+
+        _operacao_global_ativa = {
+            "symbol": symbol,
+            "sinal": sinal,
+            "valor": valor,
+            "asset_id": active_id,
+            "instrument_id": instrument_id,
+            "instrument_index": instrument_index,
+            "balance_id": str(balance_id),
+            "enviada_em": agora_brt().isoformat(),
+            "resultado": "PENDENTE",
+            "response": resposta,
+        }
+        estado["execucao"]["ultima_ordem"] = _operacao_global_ativa.copy()
+        estado["execucao"]["ultimo_erro"] = None
+        _atualizar_estado_execucao()
+        log(f"[AUTO DEMO] ORDEM CONFIRMADA: {symbol} {sinal} R${valor:.2f}")
+        return "CONFIRMADA"
+    except Exception as e:
+        with _bullex_diag_lock:
+            _bullex_diag["orders_errors"] += 1
+        estado["execucao"]["ultimo_erro"] = str(e)
+        _atualizar_estado_execucao()
+        log(f"[AUTO DEMO] ERRO ao enviar ordem: {e}")
+        return "ERRO"
+
+
+def _atualizar_progressao(resultado):
+    global _nivel_progressao
+    if resultado == "WIN":
+        _nivel_progressao = 0
+    elif resultado == "LOSS":
+        if _nivel_progressao < len(VALORES_ENTRADA) - 1:
+            _nivel_progressao += 1
+        else:
+            _nivel_progressao = 0
+    _atualizar_estado_execucao()
+
+
+# ============================================================
+# BULLEX - CANDLES
 # ============================================================
 
 def _normalizar_candle_ws(item):
     if not isinstance(item, dict):
         return None
 
-    timestamp = (
-        item.get("from")
-        or item.get("timestamp")
-        or item.get("time")
-    )
+    timestamp = item.get("from")
+
+    if timestamp is None:
+        timestamp = item.get("timestamp")
+
+    if timestamp is None:
+        timestamp = item.get("time")
 
     if timestamp is None:
         return None
@@ -472,25 +707,16 @@ def _normalizar_candle_ws(item):
     try:
         timestamp = float(timestamp)
 
+        # Aceita timestamp em segundos, milissegundos ou nanossegundos.
         if timestamp > 10_000_000_000_000:
             timestamp /= 1_000_000_000
         elif timestamp > 10_000_000_000:
             timestamp /= 1_000
 
-        dt = datetime.fromtimestamp(
-            timestamp,
-            tz=TZ
-        )
+        dt = datetime.fromtimestamp(timestamp, tz=TZ)
 
-        high = item.get(
-            "max",
-            item.get("high")
-        )
-
-        low = item.get(
-            "min",
-            item.get("low")
-        )
+        high = item.get("max", item.get("high"))
+        low = item.get("min", item.get("low"))
 
         return {
             "id": item.get("id"),
@@ -499,43 +725,52 @@ def _normalizar_candle_ws(item):
             "high": float(high),
             "low": float(low),
             "close": float(item["close"]),
-            "volume": float(
-                item.get("volume", 0) or 0
-            ),
+            "volume": float(item.get("volume", 0) or 0),
             "phase": item.get("phase"),
         }
 
-    except Exception:
+    except (
+        TypeError,
+        ValueError,
+        OverflowError,
+        KeyError,
+    ):
         return None
 
 
-def _armazenar_candle_ws(
-    active_id,
-    size,
-    item
-):
+def _armazenar_candle_ws(active_id, size, item):
     candle = _normalizar_candle_ws(item)
 
     if candle is None:
         return
 
     try:
-        active_id = int(active_id)
-        size = int(size)
-    except Exception:
+        active_id_int = int(active_id)
+        size_int = int(size)
+    except (TypeError, ValueError):
+        return
+
+    if size_int <= 0:
         return
 
     candle_id = candle.get("id")
 
-    chave = (
-        str(candle_id)
-        if candle_id is not None
-        else candle["datetime"]
-    )
+    if candle_id is not None:
+        chave = (
+            active_id_int,
+            size_int,
+            str(candle_id),
+        )
+    else:
+        chave = (
+            active_id_int,
+            size_int,
+            candle["datetime"],
+        )
 
     with _bullex_cv:
         bucket = _bullex_candles.setdefault(
-            (active_id, size),
+            (active_id_int, size_int),
             {}
         )
 
@@ -543,340 +778,68 @@ def _armazenar_candle_ws(
         _bullex_cv.notify_all()
 
 
-def _candidatos_candles_cache(
-    active_id,
-    size
-):
-    with _bullex_cv:
-        bucket = _bullex_candles.get(
-            (int(active_id), int(size)),
-            {}
-        )
-
-        return list(
-            bucket.values()
-        )
-
-
-# ============================================================
-# BULLEX - EXTRAÇÃO DE CANDLES
-# ============================================================
-
-def _extrair_candles_da_resposta(data):
-    if not isinstance(data, dict):
+def _extrair_candles_da_resposta(msg):
+    """Extrai candles sem depender exclusivamente do campo name."""
+    if not isinstance(msg, dict):
         return []
 
-    msg = data.get("msg")
+    conteudo = msg.get("msg")
 
-    if isinstance(msg, list):
-        return [
-            x for x in msg
-            if isinstance(x, dict)
-        ]
+    # Respostas normais: {name, msg:{...}}.
+    if isinstance(conteudo, list):
+        return [x for x in conteudo if isinstance(x, dict)]
 
-    if not isinstance(msg, dict):
-        msg = data
+    if not isinstance(conteudo, dict):
+        # Alguns envelopes podem trazer candles diretamente.
+        conteudo = msg
 
     encontrados = []
 
-    for chave in (
-        "candles",
-        "data",
-        "values"
-    ):
-        valor = msg.get(chave)
-
+    for chave in ("candles", "data", "values"):
+        valor = conteudo.get(chave)
         if isinstance(valor, list):
             encontrados.extend(
-                x for x in valor
-                if isinstance(x, dict)
+                x for x in valor if isinstance(x, dict)
             )
-
-        elif (
-            isinstance(valor, dict)
-            and "open" in valor
-            and "close" in valor
+        elif isinstance(valor, dict) and all(
+            k in valor for k in ("open", "close")
         ):
             encontrados.append(valor)
 
-    por_tamanho = msg.get(
-        "candles_by_size"
-    )
-
+    por_tamanho = conteudo.get("candles_by_size")
     if isinstance(por_tamanho, dict):
         for valor in por_tamanho.values():
-
             if isinstance(valor, list):
                 encontrados.extend(
-                    x for x in valor
-                    if isinstance(x, dict)
+                    x for x in valor if isinstance(x, dict)
                 )
-
             elif isinstance(valor, dict):
                 encontrados.append(valor)
 
-    if (
-        not encontrados
-        and "open" in msg
-        and "close" in msg
+    # Fallback para uma única vela direta no msg.
+    if not encontrados and all(
+        k in conteudo for k in ("open", "close")
     ):
-        encontrados.append(msg)
+        encontrados.append(conteudo)
 
     return encontrados
 
 
 # ============================================================
-# BULLEX - EXTRAÇÃO DO BALANCE ID
-# ============================================================
-
-def _extrair_balance_id(data):
-    global _bullex_balance_id
-
-    if not isinstance(data, (dict, list)):
-        return
-
-    candidatos_demo = []
-    candidatos_balance = []
-
-    def adicionar_candidato(valor, origem):
-        if valor is None:
-            return
-
-        if isinstance(valor, bool):
-            return
-
-        texto = str(valor).strip()
-
-        if not texto:
-            return
-
-        if texto in (
-            "0",
-            "None",
-            "null"
-        ):
-            return
-
-        if texto not in [
-            x[0] for x in candidatos_balance
-        ]:
-            candidatos_balance.append(
-                (texto, origem)
-            )
-
-    def procurar(obj, contexto=None):
-
-        if isinstance(obj, dict):
-
-            for chave in (
-                "user_balance_id",
-                "balance_id",
-                "balanceId",
-                "userBalanceId",
-            ):
-                if obj.get(chave) is not None:
-                    adicionar_candidato(
-                        obj.get(chave),
-                        chave
-                    )
-
-            possui_caracteristicas_balance = any(
-                chave in obj
-                for chave in (
-                    "amount",
-                    "currency",
-                    "enrolled_amount",
-                    "is_fiat",
-                    "is_marginal",
-                    "type",
-                    "user_id",
-                )
-            )
-
-            if (
-                possui_caracteristicas_balance
-                and
-                obj.get("id") is not None
-            ):
-
-                balance_id = obj.get("id")
-                tipo = obj.get("type")
-
-                adicionar_candidato(
-                    balance_id,
-                    "balance.id"
-                )
-
-                if str(tipo) == "4":
-
-                    texto = str(
-                        balance_id
-                    ).strip()
-
-                    if texto:
-                        if not any(
-                            x[0] == texto
-                            for x in candidatos_demo
-                        ):
-                            candidatos_demo.append(
-                                (
-                                    texto,
-                                    "balance.id[type=4]"
-                                )
-                            )
-
-            for chave, valor in obj.items():
-                procurar(
-                    valor,
-                    contexto=chave
-                )
-
-        elif isinstance(obj, list):
-
-            for item in obj:
-                procurar(
-                    item,
-                    contexto=contexto
-                )
-
-    procurar(data)
-
-    # --------------------------------------------------------
-    # PRIMEIRA PRIORIDADE: CONTA DEMO
-    # --------------------------------------------------------
-
-    if candidatos_demo:
-
-        valor, origem = candidatos_demo[0]
-
-        if _bullex_balance_id != valor:
-
-            _bullex_balance_id = valor
-
-            log(
-                "BALANCE ID DEMO "
-                f"ENCONTRADO: {_bullex_balance_id} "
-                f"(origem={origem})"
-            )
-
-        return
-
-    # --------------------------------------------------------
-    # SEGUNDA PRIORIDADE: BALANCE ID EXPLÍCITO
-    # --------------------------------------------------------
-
-    if candidatos_balance:
-
-        valor, origem = candidatos_balance[0]
-
-        if _bullex_balance_id != valor:
-
-            _bullex_balance_id = valor
-
-            log(
-                "Balance ID encontrado: "
-                f"{_bullex_balance_id} "
-                f"(origem={origem})"
-            )
-
-
-def _solicitar_balance_id_demo():
-
-    global _bullex_balance_id
-
-    if BULLEX_USER_BALANCE_ID:
-
-        log(
-            "BULLEX_USER_BALANCE_ID "
-            "configurado no ambiente. "
-            "Consulta de saldo ignorada."
-        )
-
-        return
-
-    if _bullex_balance_id:
-
-        log(
-            "Balance ID já disponível: "
-            f"{_bullex_balance_id}"
-        )
-
-        return
-
-    if not _bullex_authenticated:
-
-        log(
-            "Não foi possível solicitar "
-            "balances: WebSocket não autenticado."
-        )
-
-        return
-
-    try:
-
-        log(
-            "Solicitando saldos da Bullex "
-            "para localizar conta DEMO..."
-        )
-
-        resposta = _enviar_e_aguardar(
-            "get-balances",
-            "1.0",
-            {},
-            timeout=10
-        )
-
-        _extrair_balance_id(
-            resposta
-        )
-
-        if _bullex_balance_id:
-
-            log(
-                "CONTA DEMO LOCALIZADA. "
-                f"user_balance_id="
-                f"{_bullex_balance_id}"
-            )
-
-        else:
-
-            log(
-                "get-balances respondeu, "
-                "mas nenhum balance DEMO "
-                "foi localizado."
-            )
-
-            log(
-                f"Resposta de balances: "
-                f"{str(resposta)[:2000]}"
-            )
-
-    except Exception as e:
-
-        log(
-            "Erro ao solicitar get-balances: "
-            f"{e}"
-        )
-
-
-def _obter_balance_id():
-
-    if BULLEX_USER_BALANCE_ID:
-        return BULLEX_USER_BALANCE_ID
-
-    if _bullex_balance_id:
-        return str(
-            _bullex_balance_id
-        )
-
-    return None
-
-
-# ============================================================
-# BULLEX - RESPOSTA AUTH
+# BULLEX - RESPOSTAS
 # ============================================================
 
 def _mensagem_indica_auth_sucesso(data):
+    """
+    O sucesso agora é reconhecido somente no formato real
+    observado no HAR:
+
+        name == "authenticated"
+        msg is True
+
+    Se houver request_id na resposta, ele precisa corresponder
+    ao request_id enviado para authenticate.
+    """
 
     global _bullex_client_session_id
 
@@ -889,17 +852,28 @@ def _mensagem_indica_auth_sucesso(data):
     if data.get("msg") is not True:
         return False
 
-    _bullex_client_session_id = (
-        data.get(
-            "client_session_id"
+    request_id_recebido = data.get("request_id")
+
+    if (
+        _bullex_auth_request_id
+        and request_id_recebido is not None
+        and str(request_id_recebido)
+        != str(_bullex_auth_request_id)
+    ):
+        log(
+            "Resposta authenticated recebida, "
+            "mas request_id nao corresponde ao authenticate enviado."
         )
+        return False
+
+    _bullex_client_session_id = (
+        data.get("client_session_id")
     )
 
     return True
 
 
 def _mensagem_indica_auth_erro(data):
-
     texto = json.dumps(
         data,
         ensure_ascii=False
@@ -916,218 +890,119 @@ def _mensagem_indica_auth_erro(data):
     )
 
     return any(
-        p in texto
-        for p in palavras
+        palavra in texto
+        for palavra in palavras
     )
 
 
-# ============================================================
-# BULLEX - ARMAZENAR RESPOSTA DE CANDLES
-# ============================================================
-
-def _armazenar_candles_resposta(
-    active_id,
-    msg
-):
-
+def _armazenar_candles_resposta(active_id, msg):
+    """Armazena respostas candles/first-candles preservando o size."""
     if not isinstance(msg, dict):
         return
 
-    por_tamanho = msg.get(
-        "candles_by_size"
-    )
-
-    if isinstance(
-        por_tamanho,
-        dict
-    ):
-
-        for size_key, valores in (
-            por_tamanho.items()
-        ):
-
+    por_tamanho = msg.get("candles_by_size")
+    if isinstance(por_tamanho, dict):
+        for size_key, valores in por_tamanho.items():
             try:
                 size = int(size_key)
-            except Exception:
+            except (TypeError, ValueError):
                 continue
 
-            if isinstance(
-                valores,
-                dict
-            ):
+            if isinstance(valores, dict):
                 valores = [valores]
-
-            if not isinstance(
-                valores,
-                list
-            ):
+            if not isinstance(valores, list):
                 continue
 
             for item in valores:
-
-                if isinstance(
-                    item,
-                    dict
-                ):
-                    _armazenar_candle_ws(
-                        active_id,
-                        size,
-                        item
-                    )
+                if isinstance(item, dict):
+                    _armazenar_candle_ws(active_id, size, item)
 
     size = msg.get("size")
     dados = msg.get("candles")
-
-    if (
-        size is not None
-        and isinstance(dados, list)
-    ):
-
+    if size is not None and isinstance(dados, list):
         for item in dados:
-
-            if isinstance(
-                item,
-                dict
-            ):
-                _armazenar_candle_ws(
-                    active_id,
-                    size,
-                    item
-                )
+            if isinstance(item, dict):
+                _armazenar_candle_ws(active_id, size, item)
 
 
-# ============================================================
-# BULLEX - MESSAGE HANDLER
-# ============================================================
-
-def _on_bullex_message(
-    ws,
-    raw_message
-):
-
+def _on_bullex_message(ws, raw_message):
     global _bullex_last_error
     global _bullex_authenticated
 
     try:
-        data = json.loads(
-            raw_message
-        )
+        data = json.loads(raw_message)
     except Exception:
         return
 
     if not isinstance(data, dict):
         return
 
-    if isinstance(
-        data.get("data"),
-        str
-    ):
-
+    # Alguns ambientes entregam JSON encapsulado em "data".
+    if isinstance(data.get("data"), str):
         try:
-            inner = json.loads(
-                data["data"]
-            )
-
-            if isinstance(
-                inner,
-                dict
-            ):
-
-                _on_bullex_message(
-                    ws,
-                    json.dumps(inner)
-                )
-
+            inner = json.loads(data["data"])
+            if isinstance(inner, dict):
+                _on_bullex_message(ws, json.dumps(inner))
                 return
-
         except Exception:
             pass
 
-    if isinstance(
-        data.get("data"),
-        dict
-    ):
-
+    if isinstance(data.get("data"), dict):
         inner = data["data"]
-
-        if isinstance(
-            inner,
-            dict
-        ):
-
-            _on_bullex_message(
-                ws,
-                json.dumps(inner)
-            )
-
+        if isinstance(inner, dict):
+            _on_bullex_message(ws, json.dumps(inner))
             return
 
-    # Sempre tenta extrair o balance antes
-    # de processar o restante da mensagem.
-    _extrair_balance_id(data)
-
     nome = data.get("name")
-
-    request_id = data.get(
-        "request_id"
-    )
-
-    msg = data.get(
-        "msg"
-    )
+    request_id = data.get("request_id")
+    msg = data.get("msg")
 
     active_id = None
     size = None
-
     if isinstance(msg, dict):
-
-        active_id = msg.get(
-            "active_id"
-        )
-
-        size = msg.get(
-            "size"
-        )
+        active_id = msg.get("active_id")
+        size = msg.get("size")
 
     with _bullex_diag_lock:
+        _bullex_diag["messages"] += 1
+        _bullex_diag["last_name"] = nome
+        _bullex_diag["last_request_id"] = request_id
+        _bullex_diag["last_active_id"] = active_id
+        _bullex_diag["last_size"] = size
+        _bullex_diag["last_keys"] = list(data.keys())[:25]
 
-        _bullex_diag[
-            "messages"
-        ] += 1
-
-        _bullex_diag[
-            "last_name"
-        ] = nome
-
-        _bullex_diag[
-            "last_request_id"
-        ] = request_id
-
-        _bullex_diag[
-            "last_active_id"
-        ] = active_id
-
-        _bullex_diag[
-            "last_size"
-        ] = size
-
-    # --------------------------------------------------------
-    # AUTH
-    # --------------------------------------------------------
-
-    if _mensagem_indica_auth_sucesso(
-        data
+    # Log somente mensagens relevantes para não inundar o Render.
+    if nome in (
+        "authenticated",
+        "get-first-candles",
+        "first-candles",
+        "get-candles",
+        "candles",
+        "candle-generated",
     ):
-
-        _bullex_authenticated = True
-
-        _bullex_auth_event.set()
-
         log(
-            "Autenticacao Bullex confirmada."
+            f"[DIAG WS] name={nome} request_id={request_id} "
+            f"active_id={active_id} size={size} "
+            f"msg_type={type(msg).__name__} keys={list(data.keys())[:12]}"
         )
 
-        # Buscar conta DEMO em thread separada.
+    # ========================================================
+    # AUTENTICAÇÃO
+    # ========================================================
+
+    if _mensagem_indica_auth_sucesso(data):
+        _bullex_authenticated = True
+        _bullex_auth_event.set()
+
+        session = _bullex_client_session_id
+        if session:
+            log(
+                "Autenticacao Bullex confirmada. "
+                f"client_session_id={session}"
+            )
+        else:
+            log("Autenticacao Bullex confirmada.")
+
         threading.Thread(
             target=_solicitar_balance_id_demo,
             daemon=True,
@@ -1137,208 +1012,122 @@ def _on_bullex_message(
         threading.Thread(
             target=_assinar_candles_otc,
             daemon=True,
-            name="bullex-subscriptions",
+            name="bullex-candle-subscriptions",
         ).start()
-
         return
 
-    if _mensagem_indica_auth_erro(
-        data
-    ):
-
+    if _mensagem_indica_auth_erro(data):
         _bullex_authenticated = False
-
-        _bullex_last_error = (
-            "Bullex recusou a autenticacao."
-        )
-
+        _bullex_last_error = "Bullex recusou a autenticacao."
         _bullex_auth_event.set()
-
-        log(
-            "Bullex recusou a autenticacao."
-        )
-
+        log("Bullex recusou a autenticacao.")
         return
 
-    # --------------------------------------------------------
-    # CANDLE GENERATED
-    # --------------------------------------------------------
+    # ========================================================
+    # CANDLE-GENERATED
+    # ========================================================
 
     if nome == "candle-generated":
-
         with _bullex_diag_lock:
-
-            _bullex_diag[
-                "generated"
-            ] += 1
+            _bullex_diag["generated"] += 1
 
         if isinstance(msg, dict):
-
-            active_id = msg.get(
-                "active_id"
-            )
-
-            size = msg.get(
-                "size"
-            )
-
-            if (
-                active_id is not None
-                and size is not None
-            ):
-
-                _armazenar_candle_ws(
-                    active_id,
-                    size,
-                    msg
-                )
-
+            active_id = msg.get("active_id")
+            size = msg.get("size")
+            if active_id is not None and size is not None:
+                _armazenar_candle_ws(active_id, size, msg)
                 with _bullex_diag_lock:
-
-                    _bullex_diag[
-                        "stored"
-                    ] += 1
-
+                    _bullex_diag["stored"] += 1
         return
 
-    # --------------------------------------------------------
-    # RESPOSTA DE CANDLES
-    # --------------------------------------------------------
+    # ========================================================
+    # RESPOSTAS / EVENTOS DE CANDLES
+    # ========================================================
 
-    dados = _extrair_candles_da_resposta(
-        data
-    )
-
-    is_candle_response = (
-        nome in (
-            "candles",
-            "first-candles",
-            "get-candles",
-        )
-        or bool(dados)
-    )
+    dados = _extrair_candles_da_resposta(data)
+    is_candle_response = nome in (
+        "candles",
+        "first-candles",
+        "get-candles",
+    ) or bool(dados)
 
     if is_candle_response:
-
         with _bullex_diag_lock:
+            _bullex_diag["responses"] += 1
 
-            _bullex_diag[
-                "responses"
-            ] += 1
-
-        if request_id is not None:
-
-            with _bullex_cv:
-
-                _bullex_response_store[
-                    str(request_id)
-                ] = data
+        qtd = len(dados)
+        log(
+            f"[DIAG CANDLE] resposta name={nome} "
+            f"request_id={request_id} active_id={active_id} "
+            f"size={size} qtd={qtd}"
+        )
 
         if isinstance(msg, dict):
-
-            response_active_id = (
-                msg.get("active_id")
+            log(
+                f"[DIAG CANDLE] chaves_msg={list(msg.keys())[:30]}"
             )
 
-            if response_active_id is not None:
+            if isinstance(msg.get("candles_by_size"), dict):
+                log(
+                    "[DIAG CANDLE] candles_by_size="
+                    f"{[(str(k), len(v) if isinstance(v, list) else 1) for k, v in msg['candles_by_size'].items()]}"
+                )
 
+        # Guarda a resposta para quem estiver esperando request_id.
+        if request_id is not None:
+            with _bullex_cv:
+                _bullex_response_store[str(request_id)] = data
+
+        # Armazena independentemente de existir request_id.
+        if isinstance(msg, dict):
+            response_active_id = msg.get("active_id")
+            if response_active_id is not None:
                 _armazenar_candles_resposta(
                     response_active_id,
                     msg
                 )
 
                 for item in dados:
-
-                    if not isinstance(
-                        item,
-                        dict
-                    ):
+                    if not isinstance(item, dict):
                         continue
 
-                    item_size = (
-                        item.get("size")
-                        or
-                        msg.get("size")
-                    )
+                    item_size = item.get("size")
+                    if item_size is None:
+                        item_size = msg.get("size")
 
+                    # candles_by_size não coloca size dentro de cada item.
                     if item_size is not None:
-
                         _armazenar_candle_ws(
                             response_active_id,
                             item_size,
                             item
                         )
+                        with _bullex_diag_lock:
+                            _bullex_diag["stored"] += 1
 
         with _bullex_cv:
             _bullex_cv.notify_all()
-
         return
 
-    # --------------------------------------------------------
-    # QUALQUER RESPOSTA COM REQUEST_ID
-    # --------------------------------------------------------
-
+    # Outras respostas continuam disponíveis para chamadas que
+    # eventualmente dependam de request_id.
     if request_id is not None:
-
         with _bullex_cv:
-
-            _bullex_response_store[
-                str(request_id)
-            ] = data
-
+            _bullex_response_store[str(request_id)] = data
             _bullex_cv.notify_all()
 
-    # --------------------------------------------------------
-    # LOG DE ORDENS
-    # --------------------------------------------------------
 
-    if nome in (
-        "digital-option-placed",
-        "position-changed",
-        "order-changed",
-    ):
-
-        log(
-            f"[ORDEM WS] {nome} "
-            f"request_id={request_id}"
-        )
-
-        with _bullex_diag_lock:
-
-            if nome == "digital-option-placed":
-
-                _bullex_diag[
-                    "orders_confirmed"
-                ] += 1
-
-
-# ============================================================
-# WEBSOCKET ERROR / CLOSE
-# ============================================================
-
-def _on_bullex_error(
-    ws,
-    error
-):
-
+def _on_bullex_error(ws, error):
     global _bullex_last_error
 
     _bullex_last_error = str(error)
-
-    log(
-        f"Bullex WebSocket erro: {error}"
-    )
+    log(f"Bullex WebSocket erro: {error}")
 
     with _bullex_cv:
         _bullex_cv.notify_all()
 
 
-def _on_bullex_close(
-    ws,
-    code,
-    reason
-):
-
+def _on_bullex_close(ws, code, reason):
     global _bullex_connected
     global _bullex_authenticated
     global _bullex_client_session_id
@@ -1346,7 +1135,6 @@ def _on_bullex_close(
     _bullex_connected = False
     _bullex_authenticated = False
     _bullex_client_session_id = None
-
     _bullex_auth_event.clear()
 
     with _bullex_cv:
@@ -1358,12 +1146,7 @@ def _on_bullex_close(
     )
 
 
-# ============================================================
-# WEBSOCKET OPEN
-# ============================================================
-
 def _on_bullex_open(ws):
-
     global _bullex_connected
     global _bullex_last_error
     global _bullex_authenticated
@@ -1374,59 +1157,55 @@ def _on_bullex_open(ws):
     _bullex_connected = True
     _bullex_authenticated = False
     _bullex_client_session_id = None
-
     _bullex_auth_request_id = None
-
     _bullex_auth_event.clear()
 
-    log(
-        "Bullex WebSocket conectado."
-    )
+    log("Bullex WebSocket conectado.")
 
     try:
-
+        # IMPORTANTE:
+        # authenticate é enviado diretamente no topo.
         auth = _montar_auth_message()
 
         _bullex_auth_request_id = str(
             auth["request_id"]
         )
 
-        ws.send(
-            json.dumps(
-                auth,
-                separators=(",", ":")
-            )
+        texto = json.dumps(
+            auth,
+            separators=(",", ":")
         )
 
+        ws.send(texto)
+
         log(
-            "Autenticacao WebSocket enviada."
+            "Autenticacao WebSocket enviada "
+            f"(request_id={_bullex_auth_request_id}, "
+            f"protocol={BULLEX_PROTOCOL}, "
+            f"local_time={BULLEX_LOCAL_TIME})."
         )
 
     except Exception as e:
-
         _bullex_last_error = str(e)
 
         log(
-            f"Erro ao enviar autenticacao: {e}"
+            f"Erro ao enviar autenticacao Bullex: {e}"
         )
 
         _bullex_auth_event.set()
 
 
 # ============================================================
-# THREAD PERSISTENTE DO WEBSOCKET
+# BULLEX - THREAD PERSISTENTE
 # ============================================================
 
 def _thread_bullex_ws():
-
     global _bullex_ws
     global _bullex_connected
     global _bullex_authenticated
 
     while True:
-
         try:
-
             headers = [
                 f"User-Agent: {BULLEX_USER_AGENT}"
             ]
@@ -1455,22 +1234,19 @@ def _thread_bullex_ws():
             )
 
         except Exception as e:
-
             _bullex_connected = False
             _bullex_authenticated = False
             _bullex_auth_event.clear()
+
+            with _bullex_cv:
+                _bullex_cv.notify_all()
 
             log(
                 f"Falha no WebSocket Bullex: {e}"
             )
 
-            with _bullex_cv:
-                _bullex_cv.notify_all()
-
         finally:
-
             with _bullex_ws_lock:
-
                 _bullex_connected = False
                 _bullex_authenticated = False
                 _bullex_ws = None
@@ -1482,21 +1258,20 @@ def _thread_bullex_ws():
 
 
 def conectar_bullex():
-
     global _bullex_ws_thread_started
 
     _auth_body()
 
     with _bullex_ws_lock:
-
         if (
             _bullex_ws is not None
             and _bullex_connected
         ):
-            return _bullex_ws
+            ws = _bullex_ws
+        else:
+            ws = None
 
         if not _bullex_ws_thread_started:
-
             _bullex_ws_thread_started = True
 
             thread = threading.Thread(
@@ -1507,17 +1282,17 @@ def conectar_bullex():
 
             thread.start()
 
+    if ws is not None:
+        return ws
+
     limite = time.time() + 20
 
     while time.time() < limite:
-
         with _bullex_ws_lock:
-
             if (
                 _bullex_ws is not None
                 and _bullex_connected
             ):
-
                 return _bullex_ws
 
         time.sleep(0.2)
@@ -1528,11 +1303,15 @@ def conectar_bullex():
 
 
 def _aguardar_autenticacao(timeout=15):
+    """
+    Aguarda confirmação REAL do servidor.
+
+    Não considera mais um socket aberto como autenticado.
+    """
 
     limite = time.time() + timeout
 
     while time.time() < limite:
-
         if _bullex_authenticated:
             return True
 
@@ -1540,61 +1319,48 @@ def _aguardar_autenticacao(timeout=15):
             not _bullex_connected
             and _bullex_last_error
         ):
-
             raise RuntimeError(
-                "Conexao fechou antes da autenticacao: "
+                "Conexao Bullex fechou antes da "
+                "confirmacao da autenticacao: "
                 f"{_bullex_last_error}"
             )
 
         if not _bullex_connected:
-
             raise RuntimeError(
-                "Conexao fechou antes da autenticacao."
+                "Conexao Bullex fechou antes da "
+                "confirmacao da autenticacao."
             )
 
-        restante = (
-            limite - time.time()
-        )
+        restante = limite - time.time()
 
         if restante <= 0:
             break
 
         _bullex_auth_event.wait(
-            timeout=min(
-                0.5,
-                restante
-            )
+            timeout=min(0.5, restante)
         )
 
     if _bullex_authenticated:
         return True
 
+    if _bullex_last_error:
+        raise RuntimeError(
+            "Autenticacao Bullex nao confirmada: "
+            f"{_bullex_last_error}"
+        )
+
     raise RuntimeError(
-        "Timeout aguardando autenticacao Bullex."
+        "Timeout aguardando confirmacao explicita "
+        "da autenticacao Bullex."
     )
 
 
-# ============================================================
-# SUBSCRIÇÃO DOS CANDLES
-# ============================================================
-
-def _montar_subscribe_candle(
-    active_id,
-    size,
-    request_id=None
-):
-
+def _montar_subscribe_candle(active_id, size, request_id=None):
+    """Monta a assinatura real observada no Traderoom."""
     return {
         "name": "subscribeMessage",
-        "request_id": str(
-            request_id
-            or
-            _next_request_id()
-        ),
-        "local_time": (
-            int(time.time() * 1000)
-            % 1_000_000
-        ),
+        "request_id": str(request_id or _next_request_id()),
+        "local_time": int(time.time() * 1000) % 1_000_000,
         "msg": {
             "name": "candle-generated",
             "params": {
@@ -1607,77 +1373,46 @@ def _montar_subscribe_candle(
     }
 
 
-def _assinar_candle(
-    active_id,
-    size
-):
-
+def _assinar_candle(active_id, size):
+    """Assina atualizações em tempo real do candle informado."""
     ws = conectar_bullex()
+    _aguardar_autenticacao(timeout=15)
 
-    _aguardar_autenticacao(
-        timeout=15
-    )
-
-    payload = _montar_subscribe_candle(
-        active_id,
-        size
-    )
+    payload = _montar_subscribe_candle(active_id, size)
+    texto = json.dumps(payload, separators=(",", ":"))
 
     try:
-
-        ws.send(
-            json.dumps(
-                payload,
-                separators=(",", ":")
-            )
-        )
-
+        ws.send(texto)
         log(
-            f"Assinatura candle enviada: "
-            f"active_id={active_id} "
-            f"size={size}"
+            f"Assinatura candle-generated enviada: "
+            f"active_id={active_id} size={size}"
         )
-
     except Exception as e:
-
         raise RuntimeError(
-            f"Falha ao assinar candle "
-            f"{active_id}/{size}: {e}"
+            f"Falha ao assinar candle-generated "
+            f"active_id={active_id} size={size}: {e}"
         )
 
 
 def _assinar_candles_otc():
+    """Assina 5M e 15M dos ativos usados pelo robô."""
+    assinaturas = set()
 
     for config in ATIVO_BULLEX.values():
-
-        active_id = int(
-            config["active_id"]
-        )
-
-        for size in (
-            300,
-            900
-        ):
-
+        active_id = int(config["active_id"])
+        for size in (300, 900):
+            chave = (active_id, size)
+            if chave in assinaturas:
+                continue
+            assinaturas.add(chave)
             try:
-
-                _assinar_candle(
-                    active_id,
-                    size
-                )
-
+                _assinar_candle(active_id, size)
             except Exception as e:
-
                 log(
-                    f"Nao foi possivel assinar "
-                    f"active_id={active_id} "
-                    f"size={size}: {e}"
+                    f"Nao foi possivel assinar candle-generated "
+                    f"active_id={active_id} size={size}: {e}"
                 )
 
-
-# ============================================================
-# ENVIO DE REQUEST E ESPERA DE RESPOSTA
-# ============================================================
 
 def _enviar_e_aguardar(
     nome,
@@ -1685,7 +1420,6 @@ def _enviar_e_aguardar(
     body=None,
     timeout=15
 ):
-
     ws = conectar_bullex()
 
     _aguardar_autenticacao(
@@ -1703,14 +1437,12 @@ def _enviar_e_aguardar(
     )
 
     with _bullex_cv:
-
         _bullex_response_store.pop(
             request_id,
             None
         )
 
     try:
-
         ws.send(
             json.dumps(
                 payload,
@@ -1719,7 +1451,6 @@ def _enviar_e_aguardar(
         )
 
     except Exception as e:
-
         raise RuntimeError(
             f"Falha ao enviar {nome}: {e}"
         )
@@ -1727,9 +1458,7 @@ def _enviar_e_aguardar(
     limite = time.time() + timeout
 
     with _bullex_cv:
-
         while time.time() < limite:
-
             resposta = (
                 _bullex_response_store.pop(
                     request_id,
@@ -1744,17 +1473,14 @@ def _enviar_e_aguardar(
                 not _bullex_connected
                 and _bullex_last_error
             ):
-
                 raise RuntimeError(
-                    f"Bullex fechou durante "
-                    f"{nome}: "
-                    f"{_bullex_last_error}"
+                    f"Bullex fechou a conexão durante "
+                    f"{nome}: {_bullex_last_error}"
                 )
 
             if not _bullex_connected:
-
                 raise RuntimeError(
-                    f"Bullex fechou durante {nome}."
+                    f"Bullex fechou a conexão durante {nome}."
                 )
 
             restante = (
@@ -1772,88 +1498,66 @@ def _enviar_e_aguardar(
             )
 
     raise RuntimeError(
-        f"Timeout aguardando resposta: "
+        f"Timeout aguardando resposta Bullex: "
         f"{nome} request_id={request_id}"
     )
 
 
 # ============================================================
-# OBTENÇÃO DO ÚLTIMO ID DE CANDLE
+# BULLEX - OBTENÇÃO DE CANDLES
 # ============================================================
 
-def _obter_ultimo_id(
-    active_id,
-    size,
-    timeout=15
-):
+def _obter_ultimo_id(active_id, size, timeout=15):
+    """Obtém o ID mais recente a partir do feed candle-generated.
 
+    IMPORTANTE: no protocolo da Bullex, get-first-candles retorna o
+    PRIMEIRO candle disponível para cada tamanho, e não o último.
+    Portanto ele não pode ser usado para montar from_id/to_id do
+    histórico recente. O último ID vem do candle-generated.
+    """
     active_id = int(active_id)
     size = int(size)
 
-    def ultimo_cache():
-
-        candles = (
-            _candidatos_candles_cache(
-                active_id,
-                size
-            )
-        )
+    def _ultimo_do_cache():
+        with _bullex_cv:
+            bucket = _bullex_candles.get((active_id, size), {})
+            candles = list(bucket.values())
 
         ids = []
-
         for candle in candles:
-
             try:
-
-                cid = int(
-                    candle.get("id")
-                )
-
-                ids.append(
-                    (cid, candle)
-                )
-
-            except Exception:
-                pass
+                cid = int(candle.get("id"))
+            except (TypeError, ValueError, AttributeError):
+                continue
+            ids.append((cid, candle))
 
         if not ids:
             return None
 
-        return max(
-            ids,
-            key=lambda x: x[0]
-        )
+        return max(ids, key=lambda x: x[0])
 
-    limite = time.time() + timeout
-
+    limite = time.time() + float(timeout)
     while time.time() < limite:
-
-        encontrado = ultimo_cache()
-
-        if encontrado:
-
-            ultimo_id, candle = encontrado
-
-            return int(
-                ultimo_id
+        resultado = _ultimo_do_cache()
+        if resultado is not None:
+            ultimo_id, candle = resultado
+            log(
+                f"[DIAG CANDLE] ultimo_id pelo feed: "
+                f"active_id={active_id} size={size} "
+                f"id={ultimo_id} from={candle.get('from')} "
+                f"to={candle.get('to')}"
             )
+            return int(ultimo_id)
 
         with _bullex_cv:
-
-            restante = (
-                limite - time.time()
-            )
-
+            restante = limite - time.time()
             if restante <= 0:
                 break
+            _bullex_cv.wait(timeout=min(0.5, restante))
 
-            _bullex_cv.wait(
-                timeout=min(
-                    0.5,
-                    restante
-                )
-            )
-
+    # Fallback: get-first-candles é útil para descobrir o PRIMEIRO ID
+    # disponível, mas não representa o candle atual. Retornamos esse ID
+    # somente como último recurso e deixamos isso explícito no log.
     resposta = _enviar_e_aguardar(
         "get-first-candles",
         "1.0",
@@ -1864,177 +1568,140 @@ def _obter_ultimo_id(
         timeout=15,
     )
 
-    msg = resposta.get(
-        "msg",
-        {}
-    )
-
-    if not isinstance(
-        msg,
-        dict
-    ):
-
+    msg = resposta.get("msg", {})
+    if not isinstance(msg, dict):
         raise RuntimeError(
             "Resposta invalida em get-first-candles."
         )
 
+    por_tamanho = msg.get("candles_by_size", {})
+    valor = None
+    if isinstance(por_tamanho, dict):
+        valor = por_tamanho.get(str(size))
+        if valor is None:
+            valor = por_tamanho.get(size)
+
+    itens = []
+    if isinstance(valor, list):
+        itens = valor
+    elif isinstance(valor, dict):
+        itens = [valor]
+
     ids = []
-
-    por_tamanho = msg.get(
-        "candles_by_size",
-        {}
-    )
-
-    if isinstance(
-        por_tamanho,
-        dict
-    ):
-
-        valores = (
-            por_tamanho.get(
-                str(size)
-            )
-        )
-
-        if valores is None:
-
-            valores = (
-                por_tamanho.get(size)
-            )
-
-        if isinstance(
-            valores,
-            dict
-        ):
-
-            valores = [valores]
-
-        if isinstance(
-            valores,
-            list
-        ):
-
-            for item in valores:
-
-                try:
-
-                    ids.append(
-                        int(item["id"])
-                    )
-
-                except Exception:
-                    pass
-
-    if not ids:
-
-        for item in (
-            _extrair_candles_da_resposta(
-                resposta
-            )
-        ):
-
-            try:
-
-                ids.append(
-                    int(item["id"])
-                )
-
-            except Exception:
-                pass
+    for item in itens:
+        if not isinstance(item, dict):
+            continue
+        try:
+            ids.append(int(item["id"]))
+        except (KeyError, TypeError, ValueError):
+            pass
 
     if ids:
+        primeiro_id = min(ids)
+        log(
+            f"[DIAG CANDLE] AVISO: sem candle-generated para "
+            f"active_id={active_id} size={size}; "
+            f"get-first-candles forneceu PRIMEIRO id={primeiro_id}."
+        )
+        return primeiro_id
 
-        return min(ids)
+    dados = _extrair_candles_da_resposta(resposta)
+    ids = []
+    for item in dados:
+        if not isinstance(item, dict):
+            continue
+        try:
+            ids.append(int(item["id"]))
+        except (KeyError, TypeError, ValueError):
+            pass
+
+    if ids:
+        primeiro_id = min(ids)
+        log(
+            f"[DIAG CANDLE] AVISO: fallback genérico para "
+            f"active_id={active_id} size={size}; primeiro_id={primeiro_id}."
+        )
+        return primeiro_id
 
     raise RuntimeError(
-        f"Nao foi possivel descobrir "
-        f"ID do candle "
-        f"{active_id}/{size}."
+        f"Nao foi possivel descobrir o ID do candle para "
+        f"active_id={active_id}, size={size}."
     )
 
+def _candidatos_candles_cache(
+    active_id,
+    size
+):
+    with _bullex_cv:
+        bucket = _bullex_candles.get(
+            (int(active_id), int(size)),
+            {}
+        )
 
-# ============================================================
-# OBTENÇÃO DOS CANDLES
-# ============================================================
+        return list(
+            bucket.values()
+        )
+
 
 def obter_candles(
     symbol,
     interval=TIMEFRAME,
     outputsize=OUTPUTSIZE
 ):
+    """Busca OHLC diretamente do WebSocket da Bullex."""
 
     codigo = None
 
     for chave, nome in ATIVOS.items():
-
         if nome == symbol:
-
             codigo = chave
             break
 
     if codigo is None:
-
         raise RuntimeError(
-            f"Ativo nao mapeado: {symbol}"
+            f"Ativo nao mapeado para Bullex: {symbol}"
         )
 
-    active_id = int(
-        ATIVO_BULLEX[codigo]["active_id"]
-    )
+    config = ATIVO_BULLEX[codigo]
+    active_id = config["active_id"]
 
-    size = BULLEX_CANDLE_SIZES.get(
+    size = _BULLEX_CANDLE_SIZES.get(
         interval
     )
 
     if size is None:
-
         raise RuntimeError(
             f"Timeframe nao suportado: {interval}"
         )
 
-    cache = ordenar_candles(
-        _candidatos_candles_cache(
-            active_id,
-            size
-        )
+    cache = _candidatos_candles_cache(
+        active_id,
+        size
     )
 
-    if len(cache) >= outputsize:
+    cache = ordenar_candles(cache)
 
-        return cache[
-            -int(outputsize):
-        ]
+    if len(cache) >= outputsize:
+        return cache[-int(outputsize):]
 
     ultimo_id = _obter_ultimo_id(
         active_id,
         size,
-        timeout=15
+        timeout=15,
     )
 
-    to_id = int(
-        ultimo_id
-    )
-
-    for candle in cache:
-
+    # candle-generated normalmente aponta para a vela corrente (phase T).
+    # Como o histórico solicitado usa only_closed=true, ela deve ficar fora
+    # do intervalo. A Traderoom confirma esse comportamento no HAR.
+    to_id = int(ultimo_id)
+    cache_atual = _candidatos_candles_cache(active_id, size)
+    for candle in cache_atual:
         try:
-
-            if int(
-                candle.get("id")
-            ) == int(ultimo_id):
-
-                if candle.get(
-                    "phase"
-                ) == "T":
-
-                    to_id = max(
-                        1,
-                        int(ultimo_id) - 1
-                    )
-
+            if int(candle.get("id")) == int(ultimo_id):
+                if candle.get("phase") == "T":
+                    to_id = max(1, int(ultimo_id) - 1)
                 break
-
-        except Exception:
+        except (TypeError, ValueError, AttributeError):
             pass
 
     from_id = max(
@@ -2042,14 +1709,21 @@ def obter_candles(
         to_id - int(outputsize) + 1
     )
 
+    log(
+        f"[DIAG CANDLE] get-candles solicitado: "
+        f"active_id={active_id} size={size} "
+        f"from_id={from_id} to_id={to_id} "
+        f"outputsize={outputsize}"
+    )
+
     resposta = _enviar_e_aguardar(
         "get-candles",
         "2.0",
         {
-            "active_id": active_id,
-            "size": size,
-            "from_id": from_id,
-            "to_id": to_id,
+            "active_id": int(active_id),
+            "size": int(size),
+            "from_id": int(from_id),
+            "to_id": int(to_id),
             "split_normalization": True,
             "only_closed": True,
         },
@@ -2063,12 +1737,11 @@ def obter_candles(
     candles = []
 
     for item in dados:
-
-        candle = _normalizar_candle_ws(
+        normalizado = _normalizar_candle_ws(
             item
         )
 
-        if candle is None:
+        if normalizado is None:
             continue
 
         _armazenar_candle_ws(
@@ -2078,7 +1751,7 @@ def obter_candles(
         )
 
         candles.append(
-            candle
+            normalizado
         )
 
     candles.extend(
@@ -2091,7 +1764,6 @@ def obter_candles(
     unicos = {}
 
     for candle in candles:
-
         chave = (
             candle.get("id"),
             candle.get("datetime")
@@ -2100,21 +1772,16 @@ def obter_candles(
         unicos[chave] = candle
 
     candles = ordenar_candles(
-        list(
-            unicos.values()
-        )
+        list(unicos.values())
     )
 
     if not candles:
-
         raise RuntimeError(
-            f"Nenhum candle recebido "
-            f"para {symbol}/{interval}."
+            f"Nenhum candle recebido da Bullex "
+            f"para {symbol} ({interval})."
         )
 
-    return candles[
-        -int(outputsize):
-    ]
+    return candles[-int(outputsize):]
 
 
 # ============================================================
@@ -2122,7 +1789,6 @@ def obter_candles(
 # ============================================================
 
 def closes(candles):
-
     return [
         float(c["close"])
         for c in candles
@@ -2130,13 +1796,10 @@ def closes(candles):
 
 
 def ema(values, period):
-
     if len(values) < period:
         return None
 
-    k = 2 / (
-        period + 1
-    )
+    k = 2 / (period + 1)
 
     valor = (
         sum(values[:period])
@@ -2144,7 +1807,6 @@ def ema(values, period):
     )
 
     for preco in values[period:]:
-
         valor = (
             preco * k
             +
@@ -2154,82 +1816,41 @@ def ema(values, period):
     return valor
 
 
-def ema_series(
-    values,
-    period
-):
-
+def ema_series(values, period):
+    """Retorna a EMA alinhada a cada candle disponível."""
     if len(values) < period:
+        return [None] * len(values)
 
-        return [
-            None
-        ] * len(values)
-
-    k = 2 / (
-        period + 1
-    )
-
-    resultado = [
-        None
-    ] * (period - 1)
-
-    valor = (
-        sum(values[:period])
-        / period
-    )
-
-    resultado.append(
-        valor
-    )
+    k = 2 / (period + 1)
+    resultado = [None] * (period - 1)
+    valor = sum(values[:period]) / period
+    resultado.append(valor)
 
     for preco in values[period:]:
-
-        valor = (
-            preco * k
-            +
-            valor * (1 - k)
-        )
-
-        resultado.append(
-            valor
-        )
+        valor = preco * k + valor * (1 - k)
+        resultado.append(valor)
 
     return resultado
 
 
-def rsi(
-    values,
-    period=14
-):
-
+def rsi(values, period=14):
     if len(values) < period + 1:
         return None
 
     ganhos = []
     perdas = []
 
-    for i in range(
-        1,
-        len(values)
-    ):
-
+    for i in range(1, len(values)):
         diferenca = (
-            values[i]
-            - values[i - 1]
+            values[i] - values[i - 1]
         )
 
         ganhos.append(
-            max(
-                diferenca,
-                0
-            )
+            max(diferenca, 0)
         )
 
         perdas.append(
-            max(
-                -diferenca,
-                0
-            )
+            max(-diferenca, 0)
         )
 
     avg_gain = (
@@ -2246,14 +1867,12 @@ def rsi(
         period,
         len(ganhos)
     ):
-
         avg_gain = (
             (
                 avg_gain
                 * (period - 1)
             )
-            +
-            ganhos[i]
+            + ganhos[i]
         ) / period
 
         avg_loss = (
@@ -2261,54 +1880,37 @@ def rsi(
                 avg_loss
                 * (period - 1)
             )
-            +
-            perdas[i]
+            + perdas[i]
         ) / period
 
     if avg_loss == 0:
         return 100.0
 
     rs = (
-        avg_gain
-        / avg_loss
+        avg_gain / avg_loss
     )
 
     return (
         100
         -
         (
-            100
-            / (1 + rs)
+            100 / (1 + rs)
         )
     )
 
 
-def atr(
-    candles,
-    period=14
-):
-
+def atr(candles, period=14):
     if len(candles) < period + 1:
         return None
 
     trs = []
 
-    for i in range(
-        1,
-        len(candles)
-    ):
-
+    for i in range(1, len(candles)):
         atual = candles[i]
         anterior = candles[i - 1]
 
-        high = float(
-            atual["high"]
-        )
-
-        low = float(
-            atual["low"]
-        )
-
+        high = float(atual["high"])
+        low = float(atual["low"])
         close_anterior = float(
             anterior["close"]
         )
@@ -2337,26 +1939,14 @@ def atr(
 
 
 # ============================================================
-# INFORMAÇÃO DA VELA
+# INFORMAÇÕES DA VELA
 # ============================================================
 
 def candle_info(candle):
-
-    abertura = float(
-        candle["open"]
-    )
-
-    fechamento = float(
-        candle["close"]
-    )
-
-    maxima = float(
-        candle["high"]
-    )
-
-    minima = float(
-        candle["low"]
-    )
+    abertura = float(candle["open"])
+    fechamento = float(candle["close"])
+    maxima = float(candle["high"])
+    minima = float(candle["low"])
 
     range_vela = max(
         maxima - minima,
@@ -2364,14 +1954,12 @@ def candle_info(candle):
     )
 
     corpo = abs(
-        fechamento
-        - abertura
+        fechamento - abertura
     )
 
     pavio_superior = (
         maxima
-        -
-        max(
+        - max(
             abertura,
             fechamento
         )
@@ -2382,8 +1970,11 @@ def candle_info(candle):
             abertura,
             fechamento
         )
-        -
-        minima
+        - minima
+    )
+
+    body_ratio = (
+        corpo / range_vela
     )
 
     return {
@@ -2401,10 +1992,7 @@ def candle_info(candle):
             pavio_inferior,
             0
         ),
-        "body_ratio": (
-            corpo
-            / range_vela
-        ),
+        "body_ratio": body_ratio,
     }
 
 
@@ -2412,14 +2000,12 @@ def percentual_distancia(
     preco,
     referencia
 ):
-
     if referencia == 0:
         return 999.0
 
     return (
         abs(
-            preco
-            - referencia
+            preco - referencia
         )
         /
         abs(referencia)
@@ -2430,58 +2016,31 @@ def percentual_distancia(
 # TENDÊNCIA
 # ============================================================
 
-def tendencia_timeframe(
-    candles
-):
-
+def tendencia_timeframe(candles):
     if len(candles) < 40:
         return "NEUTRA"
 
-    valores = closes(
-        candles
-    )
+    valores = closes(candles)
 
-    ema5 = ema(
-        valores,
-        5
-    )
-
-    ema13 = ema(
-        valores,
-        13
-    )
-
-    ema21 = ema(
-        valores,
-        21
-    )
+    ema5 = ema(valores, 5)
+    ema13 = ema(valores, 13)
+    ema21 = ema(valores, 21)
 
     if not (
         ema5
         and ema13
         and ema21
     ):
-
         return "NEUTRA"
 
     if (
-        ema5
-        >
-        ema13
-        >
-        ema21
+        ema5 > ema13 > ema21
     ):
-
         return "ALTA"
 
     if (
-        ema5
-        <
-        ema13
-        <
-        ema21
+        ema5 < ema13 < ema21
     ):
-
         return "BAIXA"
 
     return "NEUTRA"
@@ -2491,114 +2050,61 @@ def tendencia_timeframe(
 # PULLBACK
 # ============================================================
 
-def pullback_na_vela(
-    info,
-    ema13,
-    ema21,
-    direcao
-):
+def pullback_na_vela(info, ema13, ema21, direcao):
+    """Detecta pullback real perto das EMAs, alinhado à direção.
 
-    if (
-        not info
-        or ema13 is None
-        or ema21 is None
-    ):
-
+    CALL: a vela de pullback deve testar EMA13/EMA21 sem ser uma vela
+    fortemente compradora.
+    PUT: inverso.
+    """
+    if not info or ema13 is None or ema21 is None:
         return False
 
-    referencias = (
-        ema13,
-        ema21
-    )
-
-    toque = any(
-        info["low"]
-        <= ref
-        <= info["high"]
-        for ref in referencias
-    )
-
     if direcao == "CALL":
-
-        proximidade = (
-            min(
-                percentual_distancia(
-                    info["low"],
-                    ref
-                )
-                for ref in referencias
-            )
-            <= 0.0007
+        referencias = (ema13, ema21)
+        toque = any(
+            info["low"] <= ref <= info["high"]
+            for ref in referencias
         )
+        proximidade = min(
+            percentual_distancia(info["low"], ref)
+            for ref in referencias
+        ) <= 0.0007
 
+        # Evita chamar uma vela de impulso forte de "pullback".
         vela_retracao = (
-            info["close"]
-            <= info["open"]
-            or
-            info["body_ratio"]
-            <= 0.55
+            info["close"] <= info["open"]
+            or info["body_ratio"] <= 0.55
         )
-
-        return (
-            toque
-            or proximidade
-        ) and vela_retracao
+        return (toque or proximidade) and vela_retracao
 
     if direcao == "PUT":
-
-        proximidade = (
-            min(
-                percentual_distancia(
-                    info["high"],
-                    ref
-                )
-                for ref in referencias
-            )
-            <= 0.0007
+        referencias = (ema13, ema21)
+        toque = any(
+            info["low"] <= ref <= info["high"]
+            for ref in referencias
         )
+        proximidade = min(
+            percentual_distancia(info["high"], ref)
+            for ref in referencias
+        ) <= 0.0007
 
         vela_retracao = (
-            info["close"]
-            >= info["open"]
-            or
-            info["body_ratio"]
-            <= 0.55
+            info["close"] >= info["open"]
+            or info["body_ratio"] <= 0.55
         )
-
-        return (
-            toque
-            or proximidade
-        ) and vela_retracao
+        return (toque or proximidade) and vela_retracao
 
     return False
 
 
-def pullback_call_na_vela(
-    info,
-    ema13,
-    ema21
-):
-
-    return pullback_na_vela(
-        info,
-        ema13,
-        ema21,
-        "CALL"
-    )
+# Compatibilidade com chamadas antigas.
+def pullback_call_na_vela(info, ema13, ema21):
+    return pullback_na_vela(info, ema13, ema21, "CALL")
 
 
-def pullback_put_na_vela(
-    info,
-    ema13,
-    ema21
-):
-
-    return pullback_na_vela(
-        info,
-        ema13,
-        ema21,
-        "PUT"
-    )
+def pullback_put_na_vela(info, ema13, ema21):
+    return pullback_na_vela(info, ema13, ema21, "PUT")
 
 
 # ============================================================
@@ -2612,20 +2118,17 @@ def mercado_lateral(
     ema21,
     atr14
 ):
-
     if not (
         preco
         and ema5
         and ema13
         and ema21
     ):
-
         return True
 
     distancia_5_21 = (
         abs(
-            ema5
-            - ema21
+            ema5 - ema21
         )
         / preco
     )
@@ -2634,10 +2137,8 @@ def mercado_lateral(
         return True
 
     if atr14:
-
         atr_ratio = (
-            atr14
-            / preco
+            atr14 / preco
         )
 
         if atr_ratio < 0.00008:
@@ -2654,558 +2155,242 @@ def analisar_pullback(
     candles_5m,
     candles_15m
 ):
+    """Estratégia principal 5M + 15M + pullback + confirmação separada.
 
+    A lógica mantém o núcleo conservador, mas elimina filtros redundantes
+    que estavam transformando quase todos os setups válidos em AGUARDAR.
+    """
     if len(candles_5m) < 40:
-
         return {
             "sinal": "AGUARDAR",
             "score": 0,
-            "preco": (
-                float(
-                    candles_5m[-1]["close"]
-                )
-                if candles_5m
-                else 0
-            ),
-            "vela": (
-                candles_5m[-1]["_dt"]
-                if candles_5m
-                else None
-            ),
-            "mensagem":
-                "Poucas velas para análise.",
+            "preco": float(candles_5m[-1]["close"]) if candles_5m else 0,
+            "vela": candles_5m[-1]["_dt"] if candles_5m else None,
+            "mensagem": "Poucas velas para análise.",
             "score_call": 0,
             "score_put": 0,
         }
 
     if len(candles_15m) < 40:
-
         return {
             "sinal": "AGUARDAR",
             "score": 0,
-            "preco": float(
-                candles_5m[-1]["close"]
-            ),
+            "preco": float(candles_5m[-1]["close"]),
             "vela": candles_5m[-1]["_dt"],
-            "mensagem":
-                "Poucas velas de 15M.",
+            "mensagem": "Poucas velas de 15M.",
             "score_call": 0,
             "score_put": 0,
         }
 
-    c = closes(
-        candles_5m
-    )
-
+    c = closes(candles_5m)
     preco = c[-1]
 
-    ema5 = ema(
-        c,
-        5
-    )
+    ema5 = ema(c, 5)
+    ema13 = ema(c, 13)
+    ema21 = ema(c, 21)
+    ema13_series = ema_series(c, 13)
+    ema21_series = ema_series(c, 21)
 
-    ema13 = ema(
-        c,
-        13
-    )
+    rsi14 = rsi(c, 14)
+    atr14 = atr(candles_5m, 14)
 
-    ema21 = ema(
-        c,
-        21
-    )
+    tendencia_5m = tendencia_timeframe(candles_5m)
+    tendencia_15m = tendencia_timeframe(candles_15m)
 
-    ema13_series = ema_series(
-        c,
-        13
-    )
+    confirmacao = candle_info(candles_5m[-1])
+    pullback_1 = candle_info(candles_5m[-2])
+    pullback_2 = candle_info(candles_5m[-3])
 
-    ema21_series = ema_series(
-        c,
-        21
-    )
-
-    rsi14 = rsi(
-        c,
-        14
-    )
-
-    atr14 = atr(
-        candles_5m,
-        14
-    )
-
-    tendencia_5m = tendencia_timeframe(
-        candles_5m
-    )
-
-    tendencia_15m = tendencia_timeframe(
-        candles_15m
-    )
-
-    confirmacao = candle_info(
-        candles_5m[-1]
-    )
-
-    pullback_1 = candle_info(
-        candles_5m[-2]
-    )
-
+    # EMA calculada no próprio candle do pullback, e não na vela atual.
     pb1_ema13 = ema13_series[-2]
     pb1_ema21 = ema21_series[-2]
+    pb2_ema13 = ema13_series[-3]
+    pb2_ema21 = ema21_series[-3]
 
-    pullback_call = pullback_na_vela(
-        pullback_1,
-        pb1_ema13,
-        pb1_ema21,
-        "CALL"
+    pb1_call = pullback_na_vela(
+        pullback_1, pb1_ema13, pb1_ema21, "CALL"
+    )
+    pb2_call = pullback_na_vela(
+        pullback_2, pb2_ema13, pb2_ema21, "CALL"
+    )
+    pb1_put = pullback_na_vela(
+        pullback_1, pb1_ema13, pb1_ema21, "PUT"
+    )
+    pb2_put = pullback_na_vela(
+        pullback_2, pb2_ema13, pb2_ema21, "PUT"
     )
 
-    pullback_put = pullback_na_vela(
-        pullback_1,
-        pb1_ema13,
-        pb1_ema21,
-        "PUT"
-    )
+    pullback_call = pb1_call or pb2_call
+    pullback_put = pb1_put or pb2_put
 
-    # --------------------------------------------------------
-    # CONFIRMAÇÃO CALL
-    # --------------------------------------------------------
+    # A confirmação rompe a máxima/mínima da vela que realmente fez o pullback.
+    pullback_call_info = pullback_1 if pb1_call else pullback_2 if pb2_call else None
+    pullback_put_info = pullback_1 if pb1_put else pullback_2 if pb2_put else None
 
     confirmacao_call = False
-
-    if (
-        confirmacao["close"]
-        >
-        confirmacao["open"]
-        and pullback_call
-    ):
-
+    if confirmacao["close"] > confirmacao["open"] and pullback_call_info:
         rejeicao_inferior = (
-            confirmacao["lower_wick"]
-            >= confirmacao["body"] * 0.35
-            and
-            confirmacao["lower_wick"]
-            >
-            confirmacao["upper_wick"]
+            confirmacao["lower_wick"] >= confirmacao["body"] * 0.35
+            and confirmacao["lower_wick"] > confirmacao["upper_wick"]
         )
-
         fechamento_forte = (
-            confirmacao["body_ratio"]
-            >= 0.40
-            and
-            (
-                (
-                    confirmacao["high"]
-                    -
-                    confirmacao["close"]
-                )
-                /
-                confirmacao["range"]
-            )
-            <= 0.30
+            confirmacao["body_ratio"] >= 0.40
+            and (
+                (confirmacao["high"] - confirmacao["close"])
+                / confirmacao["range"]
+            ) <= 0.30
         )
-
-        rompeu_pullback = (
-            confirmacao["close"]
-            >
-            pullback_1["high"]
-        )
-
-        confirmacao_call = (
-            (
-                rejeicao_inferior
-                or fechamento_forte
-            )
-            and
-            rompeu_pullback
-        )
-
-    # --------------------------------------------------------
-    # CONFIRMAÇÃO PUT
-    # --------------------------------------------------------
+        rompeu_pullback = confirmacao["close"] > pullback_call_info["high"]
+        confirmacao_call = (rejeicao_inferior or fechamento_forte) and rompeu_pullback
 
     confirmacao_put = False
-
-    if (
-        confirmacao["close"]
-        <
-        confirmacao["open"]
-        and pullback_put
-    ):
-
+    if confirmacao["close"] < confirmacao["open"] and pullback_put_info:
         rejeicao_superior = (
-            confirmacao["upper_wick"]
-            >= confirmacao["body"] * 0.35
-            and
-            confirmacao["upper_wick"]
-            >
-            confirmacao["lower_wick"]
+            confirmacao["upper_wick"] >= confirmacao["body"] * 0.35
+            and confirmacao["upper_wick"] > confirmacao["lower_wick"]
         )
-
         fechamento_forte = (
-            confirmacao["body_ratio"]
-            >= 0.40
-            and
-            (
-                (
-                    confirmacao["close"]
-                    -
-                    confirmacao["low"]
-                )
-                /
-                confirmacao["range"]
-            )
-            <= 0.30
+            confirmacao["body_ratio"] >= 0.40
+            and (
+                (confirmacao["close"] - confirmacao["low"])
+                / confirmacao["range"]
+            ) <= 0.30
         )
+        rompeu_pullback = confirmacao["close"] < pullback_put_info["low"]
+        confirmacao_put = (rejeicao_superior or fechamento_forte) and rompeu_pullback
 
-        rompeu_pullback = (
-            confirmacao["close"]
-            <
-            pullback_1["low"]
-        )
+    movimento_4 = c[-1] - c[-4]
+    movimento_8 = c[-1] - c[-8]
+    contexto_call = movimento_4 > 0 and movimento_8 > 0
+    contexto_put = movimento_4 < 0 and movimento_8 < 0
 
-        confirmacao_put = (
-            (
-                rejeicao_superior
-                or fechamento_forte
-            )
-            and
-            rompeu_pullback
-        )
-
-    # --------------------------------------------------------
-    # CONTEXTO
-    # --------------------------------------------------------
-
-    movimento_4 = (
-        c[-1]
-        -
-        c[-4]
-    )
-
-    movimento_8 = (
-        c[-1]
-        -
-        c[-8]
-    )
-
-    contexto_call = (
-        movimento_4 > 0
-        and movimento_8 > 0
-    )
-
-    contexto_put = (
-        movimento_4 < 0
-        and movimento_8 < 0
-    )
-
-    # --------------------------------------------------------
-    # RSI
-    # --------------------------------------------------------
-
-    rsi_call_ok = (
-        rsi14 is not None
-        and
-        52 <= rsi14 <= 68
-    )
-
-    rsi_put_ok = (
-        rsi14 is not None
-        and
-        32 <= rsi14 <= 48
-    )
+    # RSI deixa de ser uma trava absoluta. Ele vira confirmação de qualidade,
+    # exceto quando está em extremo, situação que continua bloqueando a entrada.
+    rsi_call_ok = rsi14 is not None and 50 <= rsi14 <= 68
+    rsi_put_ok = rsi14 is not None and 32 <= rsi14 <= 50
 
     rsi_extremo = (
         rsi14 is not None
-        and
-        (
-            rsi14 >= 72
-            or
-            rsi14 <= 28
-        )
+        and (rsi14 >= 72 or rsi14 <= 28)
     )
-
-    # --------------------------------------------------------
-    # ATR
-    # --------------------------------------------------------
 
     atr_ok = True
-
-    if (
-        atr14 is not None
-        and preco != 0
-    ):
-
-        atr_ratio = (
-            atr14
-            /
-            preco
-        )
-
-        if (
-            atr_ratio < 0.00008
-            or
-            atr_ratio > 0.0035
-        ):
-
+    if atr14 is not None and preco != 0:
+        atr_ratio = atr14 / preco
+        if atr_ratio < 0.00008 or atr_ratio > 0.0035:
             atr_ok = False
 
-    # --------------------------------------------------------
-    # LATERAL
-    # --------------------------------------------------------
-
-    lateral = mercado_lateral(
-        preco,
-        ema5,
-        ema13,
-        ema21,
-        atr14
-    )
-
-    # --------------------------------------------------------
-    # SCORE
-    # --------------------------------------------------------
+    lateral = mercado_lateral(preco, ema5, ema13, ema21, atr14)
 
     score_call = 0
     score_put = 0
 
     if tendencia_5m == "ALTA":
         score_call += 3
-
     elif tendencia_5m == "BAIXA":
         score_put += 3
 
     if tendencia_15m == "ALTA":
         score_call += 2
-
     elif tendencia_15m == "BAIXA":
         score_put += 2
 
     if pullback_call:
         score_call += 2
-
     if pullback_put:
         score_put += 2
 
     if confirmacao_call:
         score_call += 2
-
     if confirmacao_put:
         score_put += 2
 
     if rsi_call_ok:
         score_call += 1
-
     if rsi_put_ok:
         score_put += 1
 
     if contexto_call:
         score_call += 1
-
     if contexto_put:
         score_put += 1
 
     if confirmacao["body_ratio"] >= 0.25:
-
         if confirmacao["close"] > confirmacao["open"]:
             score_call += 1
-
         elif confirmacao["close"] < confirmacao["open"]:
             score_put += 1
 
-    # --------------------------------------------------------
-    # DECISÃO
-    # --------------------------------------------------------
-
     sinal = "AGUARDAR"
-
-    score = max(
-        score_call,
-        score_put
-    )
-
+    score = max(score_call, score_put)
     bloqueio = None
 
+    # Núcleo obrigatório: tendência nos dois TFs + pullback + confirmação.
+    # O 10º ponto vem de RSI OU contexto, evitando a antiga dupla trava.
     if lateral:
-
-        bloqueio = (
-            "Mercado lateral ou tendência fraca."
-        )
-
+        bloqueio = "Mercado lateral ou tendência fraca."
     elif not atr_ok:
-
-        bloqueio = (
-            "ATR fora da faixa ideal."
-        )
-
+        bloqueio = "ATR fora da faixa ideal."
     elif rsi_extremo:
-
-        bloqueio = (
-            f"RSI extremo ({rsi14:.2f})."
-        )
-
+        bloqueio = f"RSI extremo ({rsi14:.2f})."
     elif tendencia_5m == "ALTA":
-
         if tendencia_15m != "ALTA":
-
-            bloqueio = (
-                "5M em alta, mas 15M não confirma."
-            )
-
+            bloqueio = "5M em alta, mas 15M não confirma."
         elif not pullback_call:
-
-            bloqueio = (
-                "Alta alinhada, mas sem pullback válido."
-            )
-
+            bloqueio = "Alta alinhada, mas sem pullback válido."
         elif not confirmacao_call:
-
-            bloqueio = (
-                "Pullback encontrado, "
-                "mas sem confirmação separada."
-            )
-
-        elif not rsi_call_ok:
-
-            bloqueio = (
-                f"RSI não confirma CALL ({rsi14:.2f})."
-            )
-
-        elif not contexto_call:
-
-            bloqueio = (
-                "Contexto de movimento não confirma CALL."
-            )
-
+            bloqueio = "Pullback encontrado, mas sem confirmação separada."
         elif score_call < 10:
-
-            bloqueio = (
-                "Setup de alta abaixo do score mínimo de 10."
-            )
-
+            bloqueio = "Setup de alta sem confirmação adicional de qualidade."
         else:
-
             sinal = "CALL"
-
     elif tendencia_5m == "BAIXA":
-
         if tendencia_15m != "BAIXA":
-
-            bloqueio = (
-                "5M em baixa, mas 15M não confirma."
-            )
-
+            bloqueio = "5M em baixa, mas 15M não confirma."
         elif not pullback_put:
-
-            bloqueio = (
-                "Baixa alinhada, mas sem pullback válido."
-            )
-
+            bloqueio = "Baixa alinhada, mas sem pullback válido."
         elif not confirmacao_put:
-
-            bloqueio = (
-                "Pullback encontrado, "
-                "mas sem confirmação separada."
-            )
-
-        elif not rsi_put_ok:
-
-            bloqueio = (
-                f"RSI não confirma PUT ({rsi14:.2f})."
-            )
-
-        elif not contexto_put:
-
-            bloqueio = (
-                "Contexto de movimento não confirma PUT."
-            )
-
+            bloqueio = "Pullback encontrado, mas sem confirmação separada."
         elif score_put < 10:
-
-            bloqueio = (
-                "Setup de baixa abaixo do score mínimo de 10."
-            )
-
+            bloqueio = "Setup de baixa sem confirmação adicional de qualidade."
         else:
-
             sinal = "PUT"
-
     else:
-
-        bloqueio = (
-            "5M sem tendência clara."
-        )
+        bloqueio = "5M sem tendência clara."
 
     detalhes_pullback = (
         "CONFIRMADO EM VELA ANTERIOR"
-        if (
-            (
-                pullback_call
-                and tendencia_5m == "ALTA"
-            )
-            or
-            (
-                pullback_put
-                and tendencia_5m == "BAIXA"
-            )
-        )
+        if ((pullback_call and tendencia_5m == "ALTA") or
+            (pullback_put and tendencia_5m == "BAIXA"))
         else "NÃO"
     )
 
     detalhes_confirmacao = (
         "CONFIRMADA"
-        if (
-            (
-                confirmacao_call
-                and tendencia_5m == "ALTA"
-            )
-            or
-            (
-                confirmacao_put
-                and tendencia_5m == "BAIXA"
-            )
-        )
+        if ((confirmacao_call and tendencia_5m == "ALTA") or
+            (confirmacao_put and tendencia_5m == "BAIXA"))
         else "NÃO"
     )
 
     if sinal == "CALL":
-
         mensagem = (
-            "CALL FORTE | "
-            "5M ALTA + 15M ALTA | "
-            "Pullback real | "
-            "Confirmação em vela separada | "
-            f"Score={score_call}/12 | "
-            f"RSI={rsi14:.2f}"
+            "CALL FORTE | 5M ALTA + 15M ALTA | "
+            "Pullback real | Confirmação em vela separada | "
+            f"Score={score_call}/12 | RSI={rsi14:.2f}"
         )
-
     elif sinal == "PUT":
-
         mensagem = (
-            "PUT FORTE | "
-            "5M BAIXA + 15M BAIXA | "
-            "Pullback real | "
-            "Confirmação em vela separada | "
-            f"Score={score_put}/12 | "
-            f"RSI={rsi14:.2f}"
+            "PUT FORTE | 5M BAIXA + 15M BAIXA | "
+            "Pullback real | Confirmação em vela separada | "
+            f"Score={score_put}/12 | RSI={rsi14:.2f}"
         )
-
     elif bloqueio:
-
-        mensagem = (
-            f"AGUARDAR | {bloqueio}"
-        )
-
+        mensagem = f"AGUARDAR | {bloqueio}"
     else:
-
         mensagem = (
-            f"AGUARDAR | "
-            f"5M={tendencia_5m} | "
-            f"15M={tendencia_15m} | "
-            f"Pullback={detalhes_pullback} | "
-            f"Confirmação={detalhes_confirmacao} | "
-            f"CALL={score_call} | "
-            f"PUT={score_put}"
+            f"AGUARDAR | 5M={tendencia_5m} | 15M={tendencia_15m} | "
+            f"Pullback={detalhes_pullback} | Confirmação={detalhes_confirmacao} | "
+            f"CALL={score_call} | PUT={score_put}"
         )
 
     return {
@@ -3225,22 +2410,14 @@ def analisar_pullback(
         "tendencia": tendencia_5m,
         "tendencia_5m": tendencia_5m,
         "tendencia_15m": tendencia_15m,
-        "lateral": (
-            "SIM"
-            if lateral
-            else "NÃO"
-        ),
+        "lateral": "SIM" if lateral else "NÃO",
         "rsi_call_ok": rsi_call_ok,
         "rsi_put_ok": rsi_put_ok,
         "contexto_call": contexto_call,
         "contexto_put": contexto_put,
         "confirmacao_call": confirmacao_call,
         "confirmacao_put": confirmacao_put,
-        "bloqueio": (
-            bloqueio
-            or
-            "SINAL"
-        ),
+        "bloqueio": bloqueio or "SINAL",
         "mensagem": mensagem,
     }
 
@@ -3250,7 +2427,6 @@ def analisar_pullback(
 # ============================================================
 
 def calcular_estatisticas():
-
     total = len(
         _historico_resultados
     )
@@ -3300,21 +2476,18 @@ def calcular_estatisticas():
 # ============================================================
 
 def telegram_configurado():
-
     return bool(
         TELEGRAM_BOT_TOKEN
-        and TELEGRAM_CHAT_ID
+        and
+        TELEGRAM_CHAT_ID
     )
 
 
 def enviar_telegram(texto):
-
     if not telegram_configurado():
-
         log(
             "Telegram nao configurado."
         )
-
         return False
 
     url = (
@@ -3324,7 +2497,6 @@ def enviar_telegram(texto):
     )
 
     try:
-
         resposta = requests.post(
             url,
             json={
@@ -3339,47 +2511,46 @@ def enviar_telegram(texto):
         dados = resposta.json()
 
         if not dados.get("ok"):
-
             raise RuntimeError(
                 str(dados)
             )
 
+        log(
+            "Telegram: mensagem enviada com sucesso."
+        )
+
         return True
 
     except Exception as e:
-
         log(
-            f"ERRO Telegram: {e}"
+            f"ERRO ao enviar Telegram: {e}"
         )
 
         return False
 
 
+# ============================================================
+# ENVIAR SINAL
+# ============================================================
+
 def enviar_sinal_telegram(
     symbol,
     resultado
 ):
-
-    sinal = resultado.get(
-        "sinal"
-    )
+    sinal = resultado.get("sinal")
 
     if sinal not in (
         "CALL",
         "PUT"
     ):
-
         return
 
-    vela = resultado.get(
-        "vela"
-    )
+    vela = resultado.get("vela")
 
     if not isinstance(
         vela,
         datetime
     ):
-
         return
 
     chave = (
@@ -3395,19 +2566,18 @@ def enviar_sinal_telegram(
         ==
         chave
     ):
-
+        log(
+            f"{symbol}: sinal duplicado ignorado."
+        )
         return
 
-    def fmt(
-        valor,
-        casas=5
-    ):
+    rsi_valor = resultado.get("rsi")
 
+    def fmt(valor, casas=5):
         if isinstance(
             valor,
             (float, int)
         ):
-
             return (
                 f"{valor:.{casas}f}"
             )
@@ -3417,7 +2587,8 @@ def enviar_sinal_telegram(
     emoji = (
         "🟢"
         if sinal == "CALL"
-        else "🔴"
+        else
+        "🔴"
     )
 
     texto = (
@@ -3426,954 +2597,39 @@ def enviar_sinal_telegram(
         f"Direcao: {sinal}\n"
         f"Score: {resultado.get('score', 0)}\n"
         f"Preco: {fmt(resultado.get('preco'))}\n"
-        f"Vela: "
+        f"Vela analisada: "
         f"{vela.strftime('%Y-%m-%d %H:%M:%S BRT')}\n\n"
-        f"5M: "
+        f"Tendencia 5M: "
         f"{resultado.get('tendencia_5m', '-')}\n"
-        f"15M: "
+        f"Tendencia 15M: "
         f"{resultado.get('tendencia_15m', '-')}\n"
         f"Pullback: "
         f"{resultado.get('pullback', '-')}\n"
         f"Confirmacao: "
         f"{resultado.get('rejeicao', '-')}\n"
-        f"RSI: "
-        f"{fmt(resultado.get('rsi'), 2)}\n"
-        f"EMA5: "
+        f"RSI 14: "
+        f"{fmt(rsi_valor, 2)}\n"
+        f"EMA 5: "
         f"{fmt(resultado.get('ema5'))}\n"
-        f"EMA13: "
+        f"EMA 13: "
         f"{fmt(resultado.get('ema13'))}\n"
-        f"EMA21: "
-        f"{fmt(resultado.get('ema21'))}\n\n"
-        f"➡️ ENTRADA: PRÓXIMA VELA\n"
-        f"⏱️ EXPIRAÇÃO: 5 MINUTOS\n"
-        f"💰 EXECUÇÃO DEMO: "
-        f"{'ATIVA' if BULLEX_AUTO_TRADE else 'DESATIVADA'}"
+        f"EMA 21: "
+        f"{fmt(resultado.get('ema21'))}\n"
+        f"ATR 14: "
+        f"{fmt(resultado.get('atr'), 6)}\n\n"
+        f"➡️ ENTRADA: PROXIMA VELA\n"
+        f"⏱️ EXPIRACAO: 5 MINUTOS\n\n"
+        f"⚠️ Sinal tecnico experimental."
     )
 
-    if enviar_telegram(texto):
+    sucesso = enviar_telegram(
+        texto
+    )
 
+    if sucesso:
         _ultimos_sinais_telegram[
             symbol
         ] = chave
-
-
-# ============================================================
-# EXECUÇÃO AUTOMÁTICA
-# ============================================================
-
-def _valor_entrada_atual():
-    global _nivel_progressao
-
-    if _nivel_progressao < 0:
-        _nivel_progressao = 0
-
-    if _nivel_progressao >= len(
-        VALORES_ENTRADA
-    ):
-        _nivel_progressao = (
-            len(VALORES_ENTRADA) - 1
-        )
-
-    return float(
-        VALORES_ENTRADA[
-            _nivel_progressao
-        ]
-    )
-
-
-def _atualizar_estado_execucao():
-
-    with _execucao_lock:
-
-        estado[
-            "execucao"
-        ]["automatica"] = (
-            BULLEX_AUTO_TRADE
-        )
-
-        estado[
-            "execucao"
-        ]["modo"] = "DEMO"
-
-        estado[
-            "execucao"
-        ]["valor_atual"] = (
-            _valor_entrada_atual()
-        )
-
-        estado[
-            "execucao"
-        ]["nivel_progressao"] = (
-            _nivel_progressao
-        )
-
-        estado[
-            "execucao"
-        ]["operacao_ativa"] = (
-            _operacao_global_ativa
-            is not None
-        )
-
-
-def _instrument_time():
-
-    agora = agora_brt()
-
-    minuto = (
-        agora.minute
-        // 5
-    ) * 5
-
-    return agora.replace(
-        minute=minuto,
-        second=0,
-        microsecond=0
-    )
-
-
-def _montar_instrument_id(
-    active_id,
-    dt=None
-):
-
-    if dt is None:
-        dt = _instrument_time()
-
-    return (
-        f"do{int(active_id)}"
-        f"{dt.strftime('%Y%m%d')}"
-        f"D{dt.strftime('%H%M')}"
-        f"T5MPSPT"
-    )
-
-
-def _direcao_bullex(sinal):
-
-    if sinal == "CALL":
-        return "call"
-
-    if sinal == "PUT":
-        return "put"
-
-    raise ValueError(
-        f"Direcao invalida: {sinal}"
-    )
-
-
-# ============================================================
-# DESCOBERTA DE INSTRUMENTO
-# ============================================================
-
-def _extrair_instrumentos_recursivo(
-    obj,
-    active_id,
-    encontrados=None
-):
-
-    if encontrados is None:
-        encontrados = []
-
-    if isinstance(obj, dict):
-
-        candidate_id = (
-            obj.get("instrument_id")
-            or obj.get("id")
-        )
-
-        candidate_asset = (
-            obj.get("asset_id")
-            or obj.get("active_id")
-            or obj.get("underlying_id")
-        )
-
-        candidate_index = (
-            obj.get("instrument_index")
-            if obj.get("instrument_index") is not None
-            else obj.get("index")
-        )
-
-        if (
-            candidate_id is not None
-            and candidate_index is not None
-        ):
-
-            corresponde_ativo = False
-
-            if candidate_asset is not None:
-
-                try:
-
-                    corresponde_ativo = (
-                        int(candidate_asset)
-                        ==
-                        int(active_id)
-                    )
-
-                except Exception:
-
-                    corresponde_ativo = (
-                        str(candidate_asset)
-                        ==
-                        str(active_id)
-                    )
-
-            if not corresponde_ativo:
-
-                corresponde_ativo = (
-                    str(active_id)
-                    in str(candidate_id)
-                )
-
-            if corresponde_ativo:
-
-                item = dict(obj)
-
-                item["instrument_id"] = str(
-                    candidate_id
-                )
-
-                try:
-
-                    item["instrument_index"] = int(
-                        candidate_index
-                    )
-
-                except Exception:
-                    pass
-
-                item["asset_id"] = int(
-                    active_id
-                )
-
-                encontrados.append(
-                    item
-                )
-
-        for valor in obj.values():
-
-            _extrair_instrumentos_recursivo(
-                valor,
-                active_id,
-                encontrados
-            )
-
-    elif isinstance(obj, list):
-
-        for valor in obj:
-
-            _extrair_instrumentos_recursivo(
-                valor,
-                active_id,
-                encontrados
-            )
-
-    return encontrados
-
-
-def _instrumento_eh_5m(
-    instrumento,
-    instrument_id_esperado
-):
-
-    if not isinstance(
-        instrumento,
-        dict
-    ):
-
-        return False
-
-    iid = str(
-        instrumento.get(
-            "instrument_id",
-            instrumento.get(
-                "id",
-                ""
-            )
-        )
-    )
-
-    if not iid:
-        return False
-
-    esperado = str(
-        instrument_id_esperado
-    )
-
-    if iid == esperado:
-        return True
-
-    iid_upper = iid.upper()
-
-    if "T5M" not in iid_upper:
-        return False
-
-    return True
-
-
-def _buscar_instrumento(
-    active_id,
-    dt_inicio
-):
-
-    active_id = int(
-        active_id
-    )
-
-    instrument_id_esperado = (
-        _montar_instrument_id(
-            active_id,
-            dt_inicio
-        )
-    )
-
-    cache = _bullex_instrument_cache.get(
-        instrument_id_esperado
-    )
-
-    if isinstance(
-        cache,
-        dict
-    ):
-
-        indice = cache.get(
-            "instrument_index"
-        )
-
-        if indice is not None:
-
-            try:
-
-                resultado = {
-
-                    "instrument_id":
-                        str(
-                            cache.get(
-                                "instrument_id",
-                                instrument_id_esperado
-                            )
-                        ),
-
-                    "instrument_index":
-                        int(indice),
-
-                    "asset_id":
-                        active_id,
-                }
-
-                log(
-                    "Instrumento encontrado no cache: "
-                    f"{resultado}"
-                )
-
-                return resultado
-
-            except Exception:
-                pass
-
-    consultas = [
-
-        (
-            "digital-options.get-instruments",
-            "3.0",
-            {
-                "asset_id": active_id,
-                "instrument_type": "digital",
-            }
-        ),
-
-        (
-            "digital-options.get-instruments",
-            "2.0",
-            {
-                "asset_id": active_id,
-            }
-        ),
-
-    ]
-
-    for nome, versao, body in consultas:
-
-        try:
-
-            log(
-                "Consultando instrumentos Bullex: "
-                f"{nome} v{versao} "
-                f"asset_id={active_id}"
-            )
-
-            resposta = _enviar_e_aguardar(
-                nome,
-                versao,
-                body,
-                timeout=10
-            )
-
-            candidatos = (
-                _extrair_instrumentos_recursivo(
-                    resposta,
-                    active_id
-                )
-            )
-
-            if not candidatos:
-
-                log(
-                    "Bullex não retornou "
-                    "instrumentos utilizáveis."
-                )
-
-                continue
-
-            for item in candidatos:
-
-                iid = str(
-                    item.get(
-                        "instrument_id",
-                        ""
-                    )
-                )
-
-                if iid != (
-                    instrument_id_esperado
-                ):
-                    continue
-
-                indice = item.get(
-                    "instrument_index"
-                )
-
-                if indice is None:
-                    continue
-
-                try:
-
-                    resultado = {
-
-                        "instrument_id":
-                            iid,
-
-                        "instrument_index":
-                            int(indice),
-
-                        "asset_id":
-                            active_id,
-                    }
-
-                    _bullex_instrument_cache[
-                        instrument_id_esperado
-                    ] = resultado
-
-                    log(
-                        "INSTRUMENTO EXATO ENCONTRADO: "
-                        f"{resultado}"
-                    )
-
-                    return resultado
-
-                except Exception:
-                    continue
-
-            for item in candidatos:
-
-                if not _instrumento_eh_5m(
-                    item,
-                    instrument_id_esperado
-                ):
-                    continue
-
-                iid = str(
-                    item.get(
-                        "instrument_id",
-                        item.get(
-                            "id",
-                            ""
-                        )
-                    )
-                )
-
-                indice = item.get(
-                    "instrument_index"
-                )
-
-                if indice is None:
-                    continue
-
-                try:
-
-                    indice = int(
-                        indice
-                    )
-
-                except Exception:
-
-                    continue
-
-                resultado = {
-
-                    "instrument_id":
-                        iid,
-
-                    "instrument_index":
-                        indice,
-
-                    "asset_id":
-                        active_id,
-                }
-
-                _bullex_instrument_cache[
-                    instrument_id_esperado
-                ] = resultado
-
-                log(
-                    "INSTRUMENTO 5M ENCONTRADO: "
-                    f"{resultado}"
-                )
-
-                return resultado
-
-        except Exception as e:
-
-            log(
-                "Falha ao consultar instrumentos: "
-                f"{nome} v{versao}: {e}"
-            )
-
-    log(
-        "================================"
-    )
-
-    log(
-        "INSTRUMENTO NÃO ENCONTRADO"
-    )
-
-    log(
-        f"Ativo={active_id}"
-    )
-
-    log(
-        f"Instrument esperado="
-        f"{instrument_id_esperado}"
-    )
-
-    log(
-        "A ordem será BLOQUEADA."
-    )
-
-    log(
-        "================================"
-    )
-
-    return None
-
-
-# ============================================================
-# EXECUTAR ORDEM
-# ============================================================
-
-def executar_ordem_demo(
-    symbol,
-    sinal,
-    resultado
-):
-
-    global _operacao_global_ativa
-
-    if not BULLEX_AUTO_TRADE:
-
-        return {
-            "success": False,
-            "status": "AUTO_TRADE_DESATIVADO",
-        }
-
-    with _execucao_lock:
-
-        if UMA_OPERACAO_GLOBAL:
-
-            if _operacao_global_ativa is not None:
-
-                log(
-                    "Ordem bloqueada: "
-                    "já existe operação global ativa."
-                )
-
-                return {
-                    "success": False,
-                    "status": "OPERACAO_GLOBAL_ATIVA",
-                }
-
-        balance_id = _obter_balance_id()
-
-        if not balance_id:
-
-            estado[
-                "execucao"
-            ]["ultimo_erro"] = (
-                "user_balance_id não encontrado."
-            )
-
-            log(
-                "ORDEM NAO ENVIADA: "
-                "user_balance_id nao encontrado."
-            )
-
-            return {
-                "success": False,
-                "status": "SEM_BALANCE_ID",
-            }
-
-        config = None
-
-        for chave, nome in ATIVOS.items():
-
-            if nome == symbol:
-
-                config = ATIVO_BULLEX[
-                    chave
-                ]
-
-                break
-
-        if not config:
-
-            return {
-                "success": False,
-                "status": "ATIVO_NAO_MAPEADO",
-            }
-
-        active_id = int(
-            config["active_id"]
-        )
-
-        valor = _valor_entrada_atual()
-
-        agora = agora_brt()
-
-        inicio = _instrument_time()
-
-        instrument_id = (
-            _montar_instrument_id(
-                active_id,
-                inicio
-            )
-        )
-
-        direcao = _direcao_bullex(
-            sinal
-        )
-
-        instrumento = _buscar_instrumento(
-            active_id,
-            inicio
-        )
-
-        if instrumento is None:
-
-            estado[
-                "execucao"
-            ]["ultimo_erro"] = (
-                "Instrument_index não encontrado "
-                f"para {instrument_id}."
-            )
-
-            log(
-                "ORDEM NAO ENVIADA: "
-                f"instrumento não encontrado "
-                f"{instrument_id}"
-            )
-
-            return {
-                "success": False,
-                "status": "SEM_INSTRUMENTO",
-                "instrument_id":
-                    instrument_id,
-            }
-
-        instrument_index = int(
-            instrumento[
-                "instrument_index"
-            ]
-        )
-
-        instrument_id_real = str(
-            instrumento.get(
-                "instrument_id",
-                instrument_id
-            )
-        )
-
-        body = {
-
-            "user_balance_id": str(
-                balance_id
-            ),
-
-            "instrument_id":
-                instrument_id_real,
-
-            "amount": str(
-                valor
-            ),
-
-            "instrument_index":
-                instrument_index,
-
-            "asset_id":
-                int(active_id),
-
-            "instrument_dir":
-                direcao,
-        }
-
-        log(
-            "================================"
-        )
-
-        log(
-            "ENVIANDO ORDEM DEMO"
-        )
-
-        log(
-            f"Ativo={symbol} | "
-            f"Direcao={sinal} | "
-            f"Valor=R${valor:.2f} | "
-            f"Instrument={instrument_id_real} | "
-            f"Index={instrument_index} | "
-            f"Asset={active_id}"
-        )
-                log(
-            f"Balance ID={balance_id}"
-        )
-
-        try:
-
-            resposta = _enviar_e_aguardar(
-                "digital-options.place-digital-option",
-                "3.0",
-                body,
-                timeout=15
-            )
-
-            with _bullex_diag_lock:
-
-                _bullex_diag[
-                    "orders_sent"
-                ] += 1
-
-            # ------------------------------------------------
-            # CONFIRMAÇÃO
-            # ------------------------------------------------
-
-            sucesso = False
-
-            if isinstance(
-                resposta,
-                dict
-            ):
-
-                msg = resposta.get(
-                    "msg"
-                )
-
-                if (
-                    isinstance(
-                        msg,
-                        dict
-                    )
-                    and
-                    msg.get(
-                        "success"
-                    )
-                    is True
-                ):
-
-                    sucesso = True
-
-                if (
-                    resposta.get(
-                        "success"
-                    )
-                    is True
-                ):
-
-                    sucesso = True
-
-                texto = json.dumps(
-                    resposta,
-                    ensure_ascii=False
-                ).lower()
-
-                if (
-                    "digital-option-placed"
-                    in texto
-                    or
-                    (
-                        "success"
-                        in texto
-                        and
-                        "true"
-                        in texto
-                    )
-                ):
-
-                    sucesso = True
-
-            if not sucesso:
-
-                estado[
-                    "execucao"
-                ]["ultimo_erro"] = (
-                    "Resposta sem confirmação: "
-                    f"{str(resposta)[:800]}"
-                )
-
-                with _bullex_diag_lock:
-
-                    _bullex_diag[
-                        "orders_errors"
-                    ] += 1
-
-                log(
-                    "ORDEM SEM CONFIRMACAO: "
-                    f"{resposta}"
-                )
-
-                return {
-                    "success": False,
-                    "status": "SEM_CONFIRMACAO",
-                    "response": resposta,
-                }
-
-            # ------------------------------------------------
-            # OPERAÇÃO GLOBAL ATIVA
-            # ------------------------------------------------
-
-            _operacao_global_ativa = {
-
-                "symbol":
-                    symbol,
-
-                "sinal":
-                    sinal,
-
-                "valor":
-                    valor,
-
-                "asset_id":
-                    active_id,
-
-                "instrument_id":
-                    instrument_id_real,
-
-                "instrument_index":
-                    instrument_index,
-
-                "balance_id":
-                    str(balance_id),
-
-                "enviada_em":
-                    agora,
-
-                "resultado":
-                    "PENDENTE",
-
-                "response":
-                    resposta,
-            }
-
-            # ------------------------------------------------
-            # ÚLTIMA ORDEM
-            # ------------------------------------------------
-
-            estado[
-                "execucao"
-            ]["ultima_ordem"] = {
-
-                "symbol":
-                    symbol,
-
-                "sinal":
-                    sinal,
-
-                "valor":
-                    valor,
-
-                "instrument_id":
-                    instrument_id_real,
-
-                "instrument_index":
-                    instrument_index,
-
-                "enviada_em":
-                    agora.strftime(
-                        "%Y-%m-%d %H:%M:%S BRT"
-                    ),
-            }
-
-            estado[
-                "execucao"
-            ]["ultimo_erro"] = None
-
-            _atualizar_estado_execucao()
-
-            log(
-                "ORDEM DEMO CONFIRMADA."
-            )
-
-            log(
-                f"Instrument ID real: "
-                f"{instrument_id_real}"
-            )
-
-            log(
-                f"Instrument index: "
-                f"{instrument_index}"
-            )
-
-            return {
-
-                "success":
-                    True,
-
-                "status":
-                    "CONFIRMADA",
-
-                "instrument_id":
-                    instrument_id_real,
-
-                "instrument_index":
-                    instrument_index,
-
-                "response":
-                    resposta,
-            }
-
-        except Exception as e:
-
-            with _bullex_diag_lock:
-
-                _bullex_diag[
-                    "orders_errors"
-                ] += 1
-
-            estado[
-                "execucao"
-            ]["ultimo_erro"] = str(e)
-
-            log(
-                f"ERRO AO ENVIAR ORDEM DEMO: {e}"
-            )
-
-            return {
-
-                "success":
-                    False,
-
-                "status":
-                    "ERRO",
-
-                "error":
-                    str(e),
-            }
 
 
 # ============================================================
@@ -4385,231 +2641,68 @@ def registrar_operacao(
     resultado,
     candles
 ):
+    global _operacao_global_ativa
 
-    sinal = resultado.get(
-        "sinal"
-    )
+    sinal = resultado.get("sinal")
+    if sinal not in ("CALL", "PUT"):
+        return
 
-    if sinal not in (
-        "CALL",
-        "PUT"
-    ):
+    vela_sinal = resultado.get("vela")
+    if not isinstance(vela_sinal, datetime):
+        return
 
-        return None
+    vela_entrada = vela_sinal + timedelta(minutes=5)
+    vela_expiracao = vela_entrada
+    chave = f"{symbol}|{vela_sinal.isoformat()}"
 
-    vela_sinal = resultado.get(
-        "vela"
-    )
-
-    if not isinstance(
-        vela_sinal,
-        datetime
-    ):
-
-        return None
-
-    vela_entrada = (
-        vela_sinal
-        +
-        timedelta(minutes=5)
-    )
-
-    vela_expiracao = (
-        vela_entrada
-    )
-
-    chave = (
-        f"{symbol}|"
-        f"{vela_sinal.isoformat()}"
-    )
-
-    if (
-        _ultimas_operacoes_registradas.get(
-            symbol
-        )
-        ==
-        chave
-    ):
-
-        return None
-
-    if (
-        UMA_OPERACAO_GLOBAL
-        and
-        _operacao_global_ativa is not None
-    ):
-
-        log(
-            f"{symbol}: operação local bloqueada "
-            "por operação global ativa."
-        )
-
-        return None
-
+    if _ultimas_operacoes_registradas.get(symbol) == chave:
+        log(f"{symbol}: operacao duplicada para a mesma vela ignorada.")
+        return
     if symbol in _operacoes_pendentes:
-        return None
-
-    operacao = {
-
-        "id":
-            chave,
-
-        "symbol":
-            symbol,
-
-        "sinal":
-            sinal,
-
-        "score":
-            resultado.get(
-                "score",
-                0
-            ),
-
-        "preco_sinal":
-            float(
-                resultado["preco"]
-            ),
-
-        "vela_sinal":
-            vela_sinal,
-
-        "vela_entrada":
-            vela_entrada,
-
-        "vela_expiracao":
-            vela_expiracao,
-
-        "entrada":
-            None,
-
-        "saida":
-            None,
-
-        "resultado":
-            "PENDENTE",
-
-        "ordem_automatica":
-            False,
-
-        "valor":
-            _valor_entrada_atual(),
-
-        "instrument_id":
-            None,
-
-        "instrument_index":
-            None,
-    }
-
-    _operacoes_pendentes[
-        symbol
-    ] = operacao
-
-    _ultimas_operacoes_registradas[
-        symbol
-    ] = chave
-
-    if BULLEX_AUTO_TRADE:
-
-        ordem = executar_ordem_demo(
-            symbol,
-            sinal,
-            resultado
-        )
-
-        if ordem.get("success"):
-
-            operacao[
-                "ordem_automatica"
-            ] = True
-
-            operacao[
-                "instrument_id"
-            ] = ordem.get(
-                "instrument_id"
-            )
-
-            operacao[
-                "instrument_index"
-            ] = ordem.get(
-                "instrument_index"
-            )
-
-            log(
-                f"{symbol}: "
-                f"ordem automática confirmada "
-                f"{sinal}."
-            )
-
-        else:
-
-            del _operacoes_pendentes[
-                symbol
-            ]
-
-            log(
-                f"{symbol}: "
-                "operação removida porque "
-                "a ordem não foi confirmada."
-            )
-
-            return None
-
-    else:
-
-        log(
-            f"{symbol}: operação registrada "
-            f"{sinal} | modo automático OFF."
-        )
-
-    return operacao
-
-
-# ============================================================
-# RESULTADO / PROGRESSÃO
-# ============================================================
-
-def atualizar_progressao(
-    resultado
-):
-
-    global _nivel_progressao
+        log(f"{symbol}: ja existe operacao pendente.")
+        return
 
     with _execucao_lock:
+        if UMA_OPERACAO_GLOBAL and _operacao_global_ativa is not None:
+            log(f"{symbol}: sinal ignorado porque existe operação global ativa.")
+            return
 
-        if resultado == "WIN":
+    operacao = {
+        "id": chave,
+        "symbol": symbol,
+        "sinal": sinal,
+        "score": resultado.get("score", 0),
+        "preco_sinal": float(resultado["preco"]),
+        "vela_sinal": vela_sinal,
+        "vela_entrada": vela_entrada,
+        "vela_expiracao": vela_expiracao,
+        "entrada": None,
+        "saida": None,
+        "resultado": "PENDENTE",
+        "ordem_automatica": False,
+        "valor": _valor_entrada_atual(),
+        "instrument_id": None,
+        "instrument_index": None,
+        "balance_id": None,
+    }
 
-            _nivel_progressao = 0
+    if BULLEX_AUTO_TRADE:
+        status = executar_ordem_demo(symbol, sinal, resultado)
+        if status != "CONFIRMADA":
+            return
+        with _execucao_lock:
+            info = _operacao_global_ativa or {}
+        operacao.update({
+            "ordem_automatica": True,
+            "valor": info.get("valor", operacao["valor"]),
+            "instrument_id": info.get("instrument_id"),
+            "instrument_index": info.get("instrument_index"),
+            "balance_id": info.get("balance_id"),
+        })
 
-            log(
-                "PROGRESSÃO: WIN -> "
-                "retornando para R$5,00."
-            )
-
-        elif resultado == "LOSS":
-
-            if (
-                _nivel_progressao
-                <
-                len(
-                    VALORES_ENTRADA
-                ) - 1
-            ):
-
-                _nivel_progressao += 1
-
-            else:
-
-                _nivel_progressao = 0
-
-            log(
-                "PROGRESSÃO: LOSS -> "
-                f"próxima entrada "
-                f"R${_valor_entrada_atual():.2f}."
-            )
-
-        _atualizar_estado_execucao()
+    _operacoes_pendentes[symbol] = operacao
+    _ultimas_operacoes_registradas[symbol] = chave
+    log(f"{symbol}: operacao registrada {sinal} | vela entrada={vela_entrada.strftime('%H:%M')}")
 
 
 # ============================================================
@@ -4620,9 +2713,6 @@ def avaliar_operacao(
     symbol,
     candles
 ):
-
-    global _operacao_global_ativa
-
     operacao = (
         _operacoes_pendentes.get(
             symbol
@@ -4639,7 +2729,6 @@ def avaliar_operacao(
     ]
 
     for candle in candles:
-
         dt = candle["_dt"]
 
         if dt != alvo_dt:
@@ -4652,7 +2741,6 @@ def avaliar_operacao(
             >
             agora
         ):
-
             return
 
         info = candle_info(
@@ -4662,43 +2750,26 @@ def avaliar_operacao(
         entrada = info["open"]
         saida = info["close"]
 
-        operacao[
-            "entrada"
-        ] = entrada
-
-        operacao[
-            "saida"
-        ] = saida
+        operacao["entrada"] = entrada
+        operacao["saida"] = saida
 
         if operacao["sinal"] == "CALL":
-
             if saida > entrada:
                 resultado = "WIN"
-
             elif saida < entrada:
                 resultado = "LOSS"
-
             else:
                 resultado = "DOJI"
-
         else:
-
             if saida < entrada:
                 resultado = "WIN"
-
             elif saida > entrada:
                 resultado = "LOSS"
-
             else:
                 resultado = "DOJI"
 
-        operacao[
-            "resultado"
-        ] = resultado
-
-        operacao[
-            "finalizado_em"
-        ] = agora
+        operacao["resultado"] = resultado
+        operacao["finalizado_em"] = agora
 
         _historico_resultados.append(
             operacao.copy()
@@ -4707,33 +2778,6 @@ def avaliar_operacao(
         del _operacoes_pendentes[
             symbol
         ]
-
-        with _execucao_lock:
-
-            if (
-                _operacao_global_ativa
-                is not None
-            ):
-
-                ativo_global = (
-                    _operacao_global_ativa.get(
-                        "symbol"
-                    )
-                )
-
-                if ativo_global == symbol:
-
-                    _operacao_global_ativa = None
-
-        if operacao.get(
-            "ordem_automatica"
-        ):
-
-            atualizar_progressao(
-                resultado
-            )
-
-        _atualizar_estado_execucao()
 
         estatisticas = (
             calcular_estatisticas()
@@ -4765,53 +2809,43 @@ def enviar_resultado_telegram(
     operacao,
     estatisticas
 ):
-
     resultado = operacao[
         "resultado"
     ]
 
     if resultado == "WIN":
         emoji = "✅"
-
     elif resultado == "LOSS":
         emoji = "❌"
-
     else:
         emoji = "➖"
 
     def fmt(valor):
-
         if isinstance(
             valor,
             (float, int)
         ):
-
             return f"{valor:.5f}"
 
         return "-"
 
     texto = (
-        f"{emoji} RESULTADO DA OPERAÇÃO\n\n"
+        f"{emoji} RESULTADO DA OPERACAO\n\n"
         f"Ativo: {operacao['symbol']}\n"
-        f"Direção: {operacao['sinal']}\n"
-        f"Resultado: {resultado}\n"
-        f"Valor: R${operacao.get('valor', 0):.2f}\n\n"
+        f"Direcao: {operacao['sinal']}\n"
+        f"Resultado: {resultado}\n\n"
         f"Entrada: {fmt(operacao.get('entrada'))}\n"
-        f"Saída: {fmt(operacao.get('saida'))}\n"
-        f"Fonte: Bullex\n\n"
-        f"📊 ESTATÍSTICAS\n"
-        f"Operações: {estatisticas['total']}\n"
+        f"Saida: {fmt(operacao.get('saida'))}\n"
+        f"Fonte da vela: Bullex\n\n"
+        f"📊 ESTATISTICAS\n"
+        f"Operacoes: {estatisticas['total']}\n"
         f"Wins: {estatisticas['wins']}\n"
         f"Losses: {estatisticas['losses']}\n"
         f"Dojis: {estatisticas['dojis']}\n"
-        f"Taxa: {estatisticas['taxa']:.2f}%\n\n"
-        f"💰 PRÓXIMO VALOR: "
-        f"R${_valor_entrada_atual():.2f}"
+        f"Taxa: {estatisticas['taxa']:.2f}%"
     )
 
-    enviar_telegram(
-        texto
-    )
+    enviar_telegram(texto)
 
 
 # ============================================================
@@ -4822,9 +2856,7 @@ def processar_ativo(
     chave,
     symbol
 ):
-
     try:
-
         log(
             f"Consultando 5M: {symbol}"
         )
@@ -4842,7 +2874,6 @@ def processar_ativo(
         )
 
         if ultimo_raw is None:
-
             raise RuntimeError(
                 "Ultimo candle nao encontrado."
             )
@@ -4862,35 +2893,28 @@ def processar_ativo(
         )
 
         if idade > MAX_ATRASO_MINUTOS:
-
             estado["ativo"] = symbol
             estado["sinal"] = "AGUARDAR"
             estado["score"] = 0
-
             estado["preco"] = (
                 f"{float(ultimo_raw['close']):.5f}"
             )
-
             estado["vela"] = (
                 ultimo_raw["_dt"].strftime(
                     "%Y-%m-%d %H:%M:%S BRT"
                 )
             )
-
             estado["atualidade_min"] = (
                 f"{idade:.1f} min"
             )
-
             estado["atualizado"] = (
                 agora_brt().strftime(
                     "%H:%M:%S BRT"
                 )
             )
-
             estado["mensagem"] = (
                 f"Dado atrasado ({idade:.1f} min)."
             )
-
             return
 
         fechadas_5m = (
@@ -4901,36 +2925,34 @@ def processar_ativo(
         )
 
         if len(fechadas_5m) < 40:
-
             log(
                 f"{symbol}: poucas velas 5M."
             )
-
             return
 
         log(
             f"Consultando 15M: {symbol}"
         )
 
-        candles_15m = obter_candles(
-            symbol,
-            TIMEFRAME_TREND,
-            OUTPUTSIZE_15M
+        candles_15m_raw = (
+            obter_candles(
+                symbol,
+                TIMEFRAME_TREND,
+                OUTPUTSIZE_15M
+            )
         )
 
         fechadas_15m = (
             somente_velas_fechadas(
-                candles_15m,
+                candles_15m_raw,
                 15
             )
         )
 
         if len(fechadas_15m) < 40:
-
             log(
                 f"{symbol}: poucas velas 15M."
             )
-
             return
 
         resultado = analisar_pullback(
@@ -4939,18 +2961,10 @@ def processar_ativo(
         )
 
         estado["ativo"] = symbol
+        estado["sinal"] = resultado["sinal"]
+        estado["score"] = resultado["score"]
 
-        estado["sinal"] = (
-            resultado["sinal"]
-        )
-
-        estado["score"] = (
-            resultado["score"]
-        )
-
-        preco = resultado.get(
-            "preco"
-        )
+        preco = resultado.get("preco")
 
         estado["preco"] = (
             f"{preco:.5f}"
@@ -4961,9 +2975,7 @@ def processar_ativo(
             else "-"
         )
 
-        vela = resultado.get(
-            "vela"
-        )
+        vela = resultado.get("vela")
 
         estado["vela"] = (
             vela.strftime(
@@ -4994,7 +3006,6 @@ def processar_ativo(
         )
 
         estado["detalhes"] = {
-
             "score_call":
                 resultado.get(
                     "score_call",
@@ -5082,33 +3093,41 @@ def processar_ativo(
                 else "-"
             ),
 
-            "bloqueio":
-                resultado.get(
-                    "bloqueio",
-                    "-"
-                ),
+            "bloqueio": resultado.get(
+                "bloqueio",
+                "-"
+            ),
         }
 
         log(
             f"{symbol} -> "
             f"{resultado['sinal']} | "
-            f"score={resultado['score']} | "
-            f"CALL={resultado.get('score_call', 0)} | "
-            f"PUT={resultado.get('score_put', 0)} | "
-            f"5M={resultado.get('tendencia_5m', '-')} | "
-            f"15M={resultado.get('tendencia_15m', '-')} | "
-            f"pullback={resultado.get('pullback', '-')} | "
-            f"confirmacao={resultado.get('rejeicao', '-')} | "
-            f"lateral={resultado.get('lateral', '-')} | "
-            f"preco={estado['preco']} | "
-            f"bloqueio={resultado.get('bloqueio', '-')}"
+            f"score="
+            f"{resultado['score']} | "
+            f"CALL="
+            f"{resultado.get('score_call', 0)} | "
+            f"PUT="
+            f"{resultado.get('score_put', 0)} | "
+            f"5M="
+            f"{resultado.get('tendencia_5m', '-')} | "
+            f"15M="
+            f"{resultado.get('tendencia_15m', '-')} | "
+            f"pullback="
+            f"{resultado.get('pullback', '-')} | "
+            f"confirmacao="
+            f"{resultado.get('rejeicao', '-')} | "
+            f"lateral="
+            f"{resultado.get('lateral', '-')} | "
+            f"preco="
+            f"{estado['preco']}"
+            f" | bloqueio="
+            f"{resultado.get('bloqueio', '-')}"
         )
 
         if resultado["sinal"] in (
             "CALL",
             "PUT"
         ):
-
             enviar_sinal_telegram(
                 symbol,
                 resultado
@@ -5124,10 +3143,7 @@ def processar_ativo(
             "estatisticas"
         ] = calcular_estatisticas()
 
-        _atualizar_estado_execucao()
-
     except Exception as e:
-
         log(
             f"ERRO em {symbol}: {e}"
         )
@@ -5137,15 +3153,12 @@ def processar_ativo(
         estado["score"] = 0
         estado["preco"] = "-"
         estado["vela"] = "-"
-
         estado["atualizado"] = (
             agora_brt().strftime(
                 "%H:%M:%S BRT"
             )
         )
-
         estado["atualidade_min"] = "-"
-
         estado["mensagem"] = (
             f"Erro: {e}"
         )
@@ -5156,7 +3169,6 @@ def processar_ativo(
 # ============================================================
 
 def dentro_do_horario():
-
     hora = agora_brt().hour
 
     return (
@@ -5172,36 +3184,22 @@ def dentro_do_horario():
 # ============================================================
 
 def executar_leitura():
-
-    log(
-        "================================"
-    )
-
-    log(
-        "INICIANDO LEITURA"
-    )
-
-    log(
-        "================================"
-    )
+    log("================================")
+    log("INICIANDO LEITURA")
+    log("================================")
 
     try:
-
         _auth_body()
-
     except Exception as e:
-
         log(
-            f"ERRO: Bullex nao configurada: {e}"
+            f"ERRO: autenticacao Bullex nao configurada: {e}"
         )
 
         estado["sinal"] = "AGUARDAR"
         estado["score"] = 0
-
         estado["mensagem"] = (
             "Configure BULLEX_SSID no Render."
         )
-
         estado["atualizado"] = (
             agora_brt().strftime(
                 "%H:%M:%S BRT"
@@ -5211,7 +3209,6 @@ def executar_leitura():
         return
 
     if not dentro_do_horario():
-
         agora = agora_brt()
 
         log(
@@ -5219,11 +3216,9 @@ def executar_leitura():
         )
 
         estado["sinal"] = "AGUARDAR"
-
         estado["mensagem"] = (
             "Fora do horario configurado."
         )
-
         estado["atualizado"] = (
             agora.strftime(
                 "%H:%M:%S BRT"
@@ -5233,7 +3228,6 @@ def executar_leitura():
         return
 
     for chave, symbol in ATIVOS.items():
-
         processar_ativo(
             chave,
             symbol
@@ -5243,18 +3237,20 @@ def executar_leitura():
         "estatisticas"
     ] = calcular_estatisticas()
 
-    _atualizar_estado_execucao()
-
     log(
         "Leitura concluida."
     )
 
     log(
         f"Estatisticas: "
-        f"WINS={estado['estatisticas']['wins']} | "
-        f"LOSS={estado['estatisticas']['losses']} | "
-        f"DOJI={estado['estatisticas']['dojis']} | "
-        f"TAXA={estado['estatisticas']['taxa']:.2f}%"
+        f"WINS="
+        f"{estado['estatisticas']['wins']} | "
+        f"LOSS="
+        f"{estado['estatisticas']['losses']} | "
+        f"DOJI="
+        f"{estado['estatisticas']['dojis']} | "
+        f"TAXA="
+        f"{estado['estatisticas']['taxa']:.2f}%"
     )
 
 
@@ -5263,7 +3259,6 @@ def executar_leitura():
 # ============================================================
 
 def esperar_ate_proxima_leitura():
-
     agora = agora_brt()
 
     proximo_bloco = (
@@ -5272,11 +3267,8 @@ def esperar_ate_proxima_leitura():
     ) * 5
 
     if proximo_bloco >= 60:
-
         proxima = (
-            agora
-            +
-            timedelta(hours=1)
+            agora + timedelta(hours=1)
         ).replace(
             minute=0,
             second=5,
@@ -5284,7 +3276,6 @@ def esperar_ate_proxima_leitura():
         )
 
     else:
-
         proxima = agora.replace(
             minute=proximo_bloco,
             second=5,
@@ -5303,51 +3294,40 @@ def esperar_ate_proxima_leitura():
         f"{proxima.strftime('%H:%M:%S BRT')}"
     )
 
-    time.sleep(
-        segundos
-    )
+    time.sleep(segundos)
 
 
 # ============================================================
-# LOOP PRINCIPAL
+# LOOP
 # ============================================================
 
 def loop_robo():
-
     log(
         "Loop do robo iniciado."
     )
 
     try:
-
         _auth_body()
 
         conectar_bullex()
 
         log(
-            "Thread persistente do WebSocket "
-            "Bullex iniciada."
+            "Thread persistente do WebSocket Bullex iniciada."
         )
 
     except Exception as e:
-
         log(
-            f"WebSocket sera iniciado "
-            f"sob demanda: {e}"
+            f"WebSocket sera iniciado sob demanda: {e}"
         )
 
     executar_leitura()
 
     while True:
-
         try:
-
             esperar_ate_proxima_leitura()
-
             executar_leitura()
 
         except Exception as e:
-
             log(
                 f"Erro no loop principal: {e}"
             )
@@ -5360,14 +3340,12 @@ def loop_robo():
 # ============================================================
 
 def garantir_robo_iniciado():
-
     global _robo_started
 
     if _robo_started:
         return
 
     with _robo_lock:
-
         if _robo_started:
             return
 
@@ -5388,7 +3366,6 @@ def garantir_robo_iniciado():
 
 @app.before_request
 def iniciar_robo():
-
     garantir_robo_iniciado()
 
 
@@ -5416,102 +3393,145 @@ Robo Forex Pullback PRO
 <style>
 
 body {
+
     font-family: Arial, sans-serif;
+
     background: #111;
+
     color: white;
+
     margin: 0;
+
     padding: 20px;
 }
 
 .container {
-    max-width: 800px;
+
+    max-width: 750px;
+
     margin: auto;
 }
 
 h1 {
+
     text-align: center;
+
     margin-bottom: 5px;
 }
 
 .subtitulo {
+
     text-align: center;
+
     color: #aaa;
+
     margin-bottom: 20px;
 }
 
 .card {
+
     background: #1d1d1d;
+
     border-radius: 15px;
+
     padding: 20px;
+
     margin-bottom: 15px;
+
     box-shadow:
-        0 4px 15px
-        rgba(0,0,0,.25);
+    0 4px 15px
+    rgba(0,0,0,.25);
 }
 
 .sinal {
+
     font-size: 42px;
+
     font-weight: bold;
+
     text-align: center;
+
     margin: 15px 0;
 }
 
 .linha {
+
     display: flex;
-    justify-content: space-between;
+
+    justify-content:
+    space-between;
+
     gap: 10px;
+
     padding: 8px 0;
-    border-bottom: 1px solid #333;
+
+    border-bottom:
+    1px solid #333;
 }
 
 .linha:last-child {
+
     border-bottom: none;
 }
 
 .valor {
+
     font-weight: bold;
+
     text-align: right;
 }
 
 .estatisticas {
+
     display: grid;
+
     grid-template-columns:
-        repeat(2, 1fr);
+    repeat(2, 1fr);
+
     gap: 10px;
+
     margin-top: 10px;
 }
 
 .box {
+
     background: #292929;
+
     border-radius: 10px;
+
     padding: 15px;
+
     text-align: center;
 }
 
 .numero {
+
     font-size: 25px;
+
     font-weight: bold;
+
     margin-top: 5px;
 }
 
-.status-auto {
-    text-align: center;
-    font-size: 20px;
-    font-weight: bold;
-    margin: 10px 0 20px;
-}
-
 .observacao {
+
     text-align: center;
+
     color: #bbb;
+
     font-size: 14px;
+
     line-height: 1.5;
 }
 
 .atualizacao {
+
     text-align: center;
+
     color: #888;
+
     font-size: 13px;
+
     margin-top: 15px;
 }
 
@@ -5528,78 +3548,23 @@ Robo Forex Pullback PRO
 </h1>
 
 <div class="subtitulo">
+
 5M + 15M + Pullback +
 Confirmação + RSI + ATR
+
 </div>
 
 <div class="card">
-
-<h3>
-Execução automática
-</h3>
-
-<div class="linha">
-<span>Modo</span>
-<span class="valor">
-{{ estado.execucao.modo }}
-</span>
+<h3>Execução automática DEMO</h3>
+<div class="linha"><span>Modo</span><span class="valor">{{ estado.execucao.modo }}</span></div>
+<div class="linha"><span>Automática</span><span class="valor">{{ "ATIVA" if estado.execucao.automatica else "DESATIVADA" }}</span></div>
+<div class="linha"><span>Entrada atual</span><span class="valor">R$ {{ "%.2f"|format(estado.execucao.valor_atual) }}</span></div>
+<div class="linha"><span>Progressão</span><span class="valor">{{ estado.execucao.nivel_progressao + 1 }}/3</span></div>
+<div class="linha"><span>Operação ativa</span><span class="valor">{{ "SIM" if estado.execucao.operacao_ativa else "NÃO" }}</span></div>
+<div class="linha"><span>Balance DEMO</span><span class="valor">{{ "ENCONTRADO" if estado.execucao.balance_id_disponivel else "AGUARDANDO" }}</span></div>
+<div class="linha"><span>Último erro</span><span class="valor">{{ estado.execucao.ultimo_erro or "-" }}</span></div>
 </div>
 
-<div class="linha">
-<span>Automática</span>
-<span class="valor">
-{{ "ATIVA" if estado.execucao.automatica else "DESATIVADA" }}
-</span>
-</div>
-
-<div class="linha">
-<span>Valor atual</span>
-<span class="valor">
-R$ {{ "%.2f"|format(estado.execucao.valor_atual) }}
-</span>
-</div>
-
-<div class="linha">
-<span>Nível da progressão</span>
-<span class="valor">
-{{ estado.execucao.nivel_progressao }}
-</span>
-</div>
-
-<div class="linha">
-<span>Operação ativa</span>
-<span class="valor">
-{{ "SIM" if estado.execucao.operacao_ativa else "NÃO" }}
-</span>
-</div>
-
-{% if estado.execucao.ultima_ordem %}
-
-<div class="linha">
-<span>Última ordem</span>
-<span class="valor">
-{{ estado.execucao.ultima_ordem.symbol }}
--
-{{ estado.execucao.ultima_ordem.sinal }}
--
-R$ {{ "%.2f"|format(estado.execucao.ultima_ordem.valor) }}
-</span>
-</div>
-
-{% endif %}
-
-{% if estado.execucao.ultimo_erro %}
-
-<div class="linha">
-<span>Último erro</span>
-<span class="valor">
-{{ estado.execucao.ultimo_erro }}
-</span>
-</div>
-
-{% endif %}
-
-</div>
 
 <div class="card">
 
@@ -5741,13 +3706,6 @@ Filtros da entrada
 </span>
 </div>
 
-<div class="linha">
-<span>Bloqueio</span>
-<span class="valor">
-{{ estado.detalhes.bloqueio }}
-</span>
-</div>
-
 </div>
 
 <div class="card">
@@ -5812,6 +3770,10 @@ Taxa de acerto
 
 <br><br>
 
+Quando houver sinal:
+
+<br>
+
 <strong>
 Entrada: próxima vela de 5 minutos
 </strong>
@@ -5824,25 +3786,32 @@ Expiração: 5 minutos
 
 <br><br>
 
-A execução automática, quando habilitada,
-é enviada para a conta configurada no
-{{ "DEMO" if estado.execucao.modo == "DEMO" else "modo configurado" }}.
+O resultado será calculado automaticamente
+com base na vela de expiração recebida da Bullex.
 
 <br><br>
 
-Progressão:
+<strong>
+WIN = direção acertou
+</strong>
 
 <br>
 
-R$ 5,00 → R$ 10,50 → R$ 23,00
+<strong>
+LOSS = direção errou
+</strong>
+
+<br>
+
+<strong>
+DOJI = entrada e saída iguais
+</strong>
 
 <br><br>
 
-Após WIN:
-
-<br>
-
-R$ 5,00
+Use primeiro em conta demo
+e valide a estratégia com quantidade
+suficiente de operações.
 
 </div>
 
@@ -5859,12 +3828,11 @@ a cada 10 segundos.
 
 <script>
 
-setTimeout(
-    function() {
-        location.reload();
-    },
-    10000
-);
+setTimeout(function() {
+
+    location.reload();
+
+}, 10000);
 
 </script>
 
@@ -5880,14 +3848,11 @@ setTimeout(
 
 @app.route("/")
 def index():
-
     garantir_robo_iniciado()
 
     estado[
         "estatisticas"
     ] = calcular_estatisticas()
-
-    _atualizar_estado_execucao()
 
     return render_template_string(
         HTML,
@@ -5897,14 +3862,11 @@ def index():
 
 @app.route("/dados")
 def dados():
-
     garantir_robo_iniciado()
 
     estado[
         "estatisticas"
     ] = calcular_estatisticas()
-
-    _atualizar_estado_execucao()
 
     return jsonify(
         estado
@@ -5913,115 +3875,46 @@ def dados():
 
 @app.route("/health")
 def health():
-
-    _atualizar_estado_execucao()
-
     return jsonify({
-
         "status": "ok",
-
-        "bot_iniciado":
-            _robo_started,
-
+        "bot_iniciado": _robo_started,
         "horario_brt":
             agora_brt().strftime(
                 "%Y-%m-%d %H:%M:%S"
             ),
-
         "estrategia":
             (
                 "5M + 15M + "
                 "pullback + "
                 "confirmacao "
-                "em vela separada + "
-                "RSI + ATR"
+                "em vela separada"
             ),
-
-        "fonte_candles":
-            "Bullex",
-
-        "execucao_automatica":
-            BULLEX_AUTO_TRADE,
-
-        "modo_execucao":
-            "DEMO",
-
-        "valor_entrada_atual":
-            _valor_entrada_atual(),
-
-        "nivel_progressao":
-            _nivel_progressao,
-
-        "progressao":
-            VALORES_ENTRADA,
-
-        "expiracao_minutos":
-            EXPIRACAO_MINUTOS,
-
+        "fonte_candles": "Bullex",
+        "execucao_automatica": BULLEX_AUTO_TRADE,
+        "modo_execucao": "DEMO",
+        "valor_entrada_atual": _valor_entrada_atual(),
+        "nivel_progressao": _nivel_progressao,
+        "operacao_global_ativa": _operacao_global_ativa,
+        "balance_id_disponivel": _bullex_balance_id is not None,
+        "balance_id_fonte": _bullex_balance_source,
         "websocket_conectado":
             _bullex_connected,
-
         "websocket_autenticado":
             _bullex_authenticated,
-
         "websocket_client_session_id":
             _bullex_client_session_id,
-
         "websocket_auth_request_id":
             _bullex_auth_request_id,
-
         "websocket_origin":
             BULLEX_ORIGIN,
-
         "websocket_ultimo_erro":
             _bullex_last_error,
-
-        "balance_id_disponivel":
-            bool(
-                _obter_balance_id()
-            ),
-
-        "balance_id_origem":
-            (
-                "ENV"
-                if BULLEX_USER_BALANCE_ID
-                else
-                (
-                    "WEBSOCKET"
-                    if _bullex_balance_id
-                    else "NENHUM"
-                )
-            ),
-
-        "balance_id":
-            (
-                str(
-                    _obter_balance_id()
-                )
-                if _obter_balance_id()
-                else None
-            ),
-
         "telegram_configurado":
             telegram_configurado(),
-
         "operacoes_pendentes":
-            len(
-                _operacoes_pendentes
-            ),
-
-        "operacao_global_ativa":
-            _operacao_global_ativa
-            is not None,
-
+            len(_operacoes_pendentes),
         "estatisticas":
             calcular_estatisticas(),
-
-        "diagnostico":
-            _bullex_diag,
-
-        "versao":
-            BULLEX_DIAGNOSTIC_VERSION,
     })
 
 
@@ -6029,41 +3922,18 @@ def health():
 # EXECUÇÃO
 # ============================================================
 
-log(
-    "============================================"
-)
+_atualizar_estado_execucao()
+
+log(f"AUTO TRADE DEMO={'ATIVO' if BULLEX_AUTO_TRADE else 'DESATIVADO'} | entrada inicial=R${_valor_entrada_atual():.2f}")
+log(f"BULLEX_USER_BALANCE_ID={'CONFIGURADO' if BULLEX_USER_BALANCE_ID else 'AUTO-DESCOBERTA'}")
 
 log(
-    f"VERSAO DO APP: "
-    f"{BULLEX_DIAGNOSTIC_VERSION}"
+    f"VERSAO DO APP: {BULLEX_DIAGNOSTIC_VERSION} | "
+    f"ATIVOS={list(ATIVO_BULLEX.keys())} | "
+    f"WS={BULLEX_WS_URL}"
 )
-
-log(
-    f"ATIVOS OTC: "
-    f"{list(ATIVO_BULLEX.keys())}"
-)
-
-log(
-    f"WS: {BULLEX_WS_URL}"
-)
-
-log(
-    f"AUTO TRADE DEMO: "
-    f"{BULLEX_AUTO_TRADE}"
-)
-
-log(
-    f"PROGRESSAO: "
-    f"{VALORES_ENTRADA}"
-)
-
-log(
-    "============================================"
-)
-
 
 if __name__ == "__main__":
-
     garantir_robo_iniciado()
 
     app.run(
