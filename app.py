@@ -50,8 +50,6 @@ _balance_source = None
 _test_lock = threading.Lock()
 _last_test = None
 _test_running = False
-_diagnostic_messages = []
-_DIAG_LIMIT = 100
 
 
 def log(msg):
@@ -108,42 +106,6 @@ def on_open(ws):
         log(f'Erro ao autenticar: {e}')
 
 
-def log_diagnostic_message(data):
-    """Guarda e imprime mensagens relevantes do WebSocket para diagnóstico."""
-    global _diagnostic_messages
-    try:
-        name = data.get('name')
-        req = data.get('request_id')
-        text = json.dumps(data, ensure_ascii=False)
-        relevant = (
-            name in {
-                'authenticated', 'authentication-failed', 'authentication_failed',
-                'balances', 'error', 'candle-generated',
-                'digital-option-instruments.get-underlying-list',
-                'marginal-forex-instruments.get-underlying-list',
-                'digital-options.get-instruments',
-                'digital-option-placed',
-                'digital-options.place-digital-option'
-            }
-            or (name and ('instrument' in str(name).lower() or 'underlying' in str(name).lower()))
-            or (req is not None)
-        )
-        if relevant:
-            item = {
-                'time': datetime.now(TZ).strftime('%Y-%m-%d %H:%M:%S'),
-                'name': name,
-                'request_id': req,
-                'data': data,
-            }
-            with _ws_lock:
-                _diagnostic_messages.append(item)
-                if len(_diagnostic_messages) > _DIAG_LIMIT:
-                    _diagnostic_messages = _diagnostic_messages[-_DIAG_LIMIT:]
-            log(f'[WS DIAG] name={name} request_id={req} data={text[:4000]}')
-    except Exception as e:
-        log(f'[WS DIAG] erro ao registrar mensagem: {e}')
-
-
 def on_message(ws, raw):
     global _authenticated, _connected, _client_session_id, _last_error
     try:
@@ -152,8 +114,6 @@ def on_message(ws, raw):
         return
     if not isinstance(data, dict):
         return
-
-    log_diagnostic_message(data)
 
     name = data.get('name')
     req = data.get('request_id')
@@ -343,38 +303,142 @@ def find_5m_instrument(active_id):
         except Exception as e:
             log(f'Falha get-instruments v{version}: {e}')
 
-    # Diagnóstico adicional: tenta as chamadas usadas pelo Traderoom para
-    # descobrir os underlyings/instrumentos. Não inventa instrument_id.
-    for name, version, body in [
-        ('digital-option-instruments.get-underlying-list', '1.0', None),
-        ('marginal-forex-instruments.get-underlying-list', '1.0', None),
-    ]:
-        try:
-            r = request_wait(name, version, body, 8)
-            respostas.append(r)
-            log(f'Diagnóstico {name}: resposta recebida.')
-            candidatos = extract_instruments(r, active_id)
-            log(f'Diagnóstico {name}: candidatos={len(candidatos)}')
-            for c in candidatos:
-                iid = c['instrument_id']
-                if iid == expected or 'T5M' in iid.upper():
-                    log(f'INSTRUMENTO 5M ENCONTRADO NO DIAGNÓSTICO: {iid} index={c.get("instrument_index")}')
-                    return c
-        except Exception as e:
-            log(f'Diagnóstico {name}: {e}')
+    # ========================================================
+    # DIAGNÓSTICO DO ENDPOINT REAL USADO PELO TRADEROOM
+    # ========================================================
+    # O endpoint digital-option-instruments.get-underlying-list
+    # rejeitou body vazio com "body unmarshal error / EOF".
+    # Agora testamos formatos de leitura/descoberta, sem enviar
+    # uma ordem durante esta etapa.
+    # ========================================================
+    diagnosticos = [
+        ('digital-option-instruments.get-underlying-list', '1.0',
+         {'asset_type': 'digital-option'}),
+        ('digital-option-instruments.get-underlying-list', '1.0',
+         {'instrument_type': 'digital'}),
+        ('digital-option-instruments.get-underlying-list', '1.0',
+         {'active_id': int(active_id)}),
+        ('digital-option-instruments.get-underlying-list', '1.0',
+         {'asset_id': int(active_id)}),
+        ('digital-option-instruments.get-underlying-list', '1.0',
+         {'asset_id': int(active_id), 'instrument_type': 'digital'}),
+        ('digital-option-instruments.get-underlying-list', '2.0',
+         {'asset_id': int(active_id)}),
+    ]
 
-    # Diagnóstico adicional: mostra IDs retornados, sem inventar instrumento.
+    for name, version, body in diagnosticos:
+        try:
+            log(f'DIAGNÓSTICO OTC: enviando {name} v{version} body={body}')
+            r = request_wait(name, version, body, 10)
+
+            log(
+                'DIAGNÓSTICO OTC: resposta '
+                f'{name} v{version}: {json.dumps(r, ensure_ascii=False)}'
+            )
+
+            bruto = json.dumps(r, ensure_ascii=False).upper()
+            termos = (
+                'EURUSD-OTC', 'EURUSD', str(active_id),
+                'INSTRUMENT_ID', 'INSTRUMENTINDEX', 'INSTRUMENT_INDEX'
+            )
+            encontrados = [t for t in termos if t.upper() in bruto]
+            if encontrados:
+                log(
+                    'DIAGNÓSTICO OTC: termos encontrados na resposta: '
+                    f'{encontrados}'
+                )
+
+            candidatos = extract_instruments(r, active_id)
+            log(
+                'DIAGNÓSTICO OTC: extract_instruments '
+                f'candidatos={len(candidatos)}'
+            )
+
+            for c in candidatos[:50]:
+                log(
+                    f'  CANDIDATO: id={c["instrument_id"]} '
+                    f'index={c.get("instrument_index")} '
+                    f'asset_id={c.get("asset_id")}'
+                )
+
+            for c in candidatos:
+                iid = str(c['instrument_id'])
+                if iid == expected or 'T5M' in iid.upper():
+                    log(
+                        'INSTRUMENTO 5M ENCONTRADO NO DIAGNÓSTICO: '
+                        f'{iid} index={c.get("instrument_index")}'
+                    )
+                    return c
+
+        except Exception as e:
+            log(
+                f'DIAGNÓSTICO OTC: falha {name} v{version} '
+                f'body={body}: {e}'
+            )
+
+    # Algumas versões podem identificar o ativo pelo ticker.
+    ticker = next(
+        (
+            item['ticker']
+            for item in ATIVOS.values()
+            if item['active_id'] == active_id
+        ),
+        None
+    )
+
+    if ticker:
+        for body in (
+            {'ticker': ticker},
+            {'name': ticker},
+            {'asset': ticker},
+        ):
+            try:
+                log(
+                    'DIAGNÓSTICO OTC: testando identificação por ticker '
+                    f'body={body}'
+                )
+                r = request_wait(
+                    'digital-option-instruments.get-underlying-list',
+                    '1.0',
+                    body,
+                    10
+                )
+                log(
+                    'DIAGNÓSTICO OTC: resposta por ticker: '
+                    + json.dumps(r, ensure_ascii=False)
+                )
+
+                candidatos = extract_instruments(r, active_id)
+                for c in candidatos:
+                    iid = str(c['instrument_id'])
+                    if iid == expected or 'T5M' in iid.upper():
+                        log(
+                            'INSTRUMENTO 5M ENCONTRADO POR TICKER: '
+                            f'{iid} index={c.get("instrument_index")}'
+                        )
+                        return c
+            except Exception as e:
+                log(f'DIAGNÓSTICO OTC: falha body={body}: {e}')
+
     todos = []
     for r in respostas:
         for c in extract_instruments(r, active_id):
             if c['instrument_id'] not in [x['instrument_id'] for x in todos]:
                 todos.append(c)
+
     if todos:
         log('Instrumentos retornados pela Bullex:')
         for c in todos[:50]:
-            log(f'  id={c["instrument_id"]} index={c.get("instrument_index")}')
+            log(
+                f'  id={c["instrument_id"]} '
+                f'index={c.get("instrument_index")}'
+            )
     else:
-        log('Nenhum instrument_id foi extraído das respostas.')
+        log(
+            'Nenhum instrument_id foi extraído. '
+            'Precisamos analisar as respostas do diagnóstico OTC.'
+        )
+
     return None
 
 
@@ -452,7 +516,6 @@ def status():
         'last_test': _last_test,
         'test_running': _test_running,
         'error': _last_error,
-        'diagnostic_messages': _diagnostic_messages[-30:],
     })
 
 
@@ -517,15 +580,6 @@ def teste_entrada():
         _last_error = str(e)
         log(f'ERRO AO INICIAR TESTE: {e}')
         return jsonify({'confirmada': False, 'erro': str(e), 'modo': 'DEMO_ONLY'}), 400
-
-
-@app.route('/diagnostico')
-def diagnostico():
-    return jsonify({
-        'mode': 'DEMO_ONLY',
-        'count': len(_diagnostic_messages),
-        'messages': _diagnostic_messages[-100:],
-    })
 
 
 @app.route('/health')
