@@ -1,4 +1,3 @@
-
 import os
 import time
 import threading
@@ -71,7 +70,6 @@ VALORES_ENTRADA = [5.00, 10.50, 23.00]
 
 EXPIRACAO_MINUTOS = 5
 
-# Uma operação por vez globalmente.
 UMA_OPERACAO_GLOBAL = True
 
 
@@ -185,7 +183,7 @@ _bullex_instrument_cache = {}
 # ============================================================
 
 BULLEX_DIAGNOSTIC_VERSION = (
-    "OTC-AUTO-DEMO-5M-20260906-02"
+    "OTC-AUTO-DEMO-5M-BALANCE-20260906-03"
 )
 
 _bullex_diag = {
@@ -279,7 +277,6 @@ def log(msg):
     agora = datetime.now(TZ).strftime(
         "%Y-%m-%d %H:%M:%S"
     )
-
     print(
         f"[BOT {agora}] {msg}",
         flush=True
@@ -323,7 +320,6 @@ def parse_datetime_candle(txt):
                 txt,
                 fmt
             ).replace(tzinfo=TZ)
-
         except Exception:
             pass
 
@@ -357,12 +353,8 @@ def ordenar_candles(candles):
     return resultado
 
 
-def somente_velas_fechadas(
-    candles,
-    minutos
-):
+def somente_velas_fechadas(candles, minutos):
     candles = ordenar_candles(candles)
-
     agora = agora_brt()
 
     return [
@@ -482,7 +474,6 @@ def _normalizar_candle_ws(item):
 
         if timestamp > 10_000_000_000_000:
             timestamp /= 1_000_000_000
-
         elif timestamp > 10_000_000_000:
             timestamp /= 1_000
 
@@ -531,7 +522,6 @@ def _armazenar_candle_ws(
     try:
         active_id = int(active_id)
         size = int(size)
-
     except Exception:
         return
 
@@ -544,14 +534,12 @@ def _armazenar_candle_ws(
     )
 
     with _bullex_cv:
-
         bucket = _bullex_candles.setdefault(
             (active_id, size),
             {}
         )
 
         bucket[chave] = candle
-
         _bullex_cv.notify_all()
 
 
@@ -560,7 +548,6 @@ def _candidatos_candles_cache(
     size
 ):
     with _bullex_cv:
-
         bucket = _bullex_candles.get(
             (int(active_id), int(size)),
             {}
@@ -583,8 +570,7 @@ def _extrair_candles_da_resposta(data):
 
     if isinstance(msg, list):
         return [
-            x
-            for x in msg
+            x for x in msg
             if isinstance(x, dict)
         ]
 
@@ -598,14 +584,11 @@ def _extrair_candles_da_resposta(data):
         "data",
         "values"
     ):
-
         valor = msg.get(chave)
 
         if isinstance(valor, list):
-
             encontrados.extend(
-                x
-                for x in valor
+                x for x in valor
                 if isinstance(x, dict)
             )
 
@@ -614,48 +597,29 @@ def _extrair_candles_da_resposta(data):
             and "open" in valor
             and "close" in valor
         ):
-
-            encontrados.append(
-                valor
-            )
+            encontrados.append(valor)
 
     por_tamanho = msg.get(
         "candles_by_size"
     )
 
-    if isinstance(
-        por_tamanho,
-        dict
-    ):
-
+    if isinstance(por_tamanho, dict):
         for valor in por_tamanho.values():
 
-            if isinstance(
-                valor,
-                list
-            ):
-
+            if isinstance(valor, list):
                 encontrados.extend(
-                    x
-                    for x in valor
+                    x for x in valor
                     if isinstance(x, dict)
                 )
 
-            elif isinstance(
-                valor,
-                dict
-            ):
-
-                encontrados.append(
-                    valor
-                )
+            elif isinstance(valor, dict):
+                encontrados.append(valor)
 
     if (
         not encontrados
         and "open" in msg
         and "close" in msg
     ):
-
         encontrados.append(msg)
 
     return encontrados
@@ -668,12 +632,39 @@ def _extrair_candles_da_resposta(data):
 def _extrair_balance_id(data):
     global _bullex_balance_id
 
-    if not isinstance(data, dict):
+    if not isinstance(data, (dict, list)):
         return
 
-    candidatos = []
+    candidatos_demo = []
+    candidatos_balance = []
 
-    def procurar(obj):
+    def adicionar_candidato(valor, origem):
+        if valor is None:
+            return
+
+        if isinstance(valor, bool):
+            return
+
+        texto = str(valor).strip()
+
+        if not texto:
+            return
+
+        if texto in (
+            "0",
+            "None",
+            "null"
+        ):
+            return
+
+        if texto not in [
+            x[0] for x in candidatos_balance
+        ]:
+            candidatos_balance.append(
+                (texto, origem)
+            )
+
+    def procurar(obj, contexto=None):
 
         if isinstance(obj, dict):
 
@@ -683,37 +674,189 @@ def _extrair_balance_id(data):
                 "balanceId",
                 "userBalanceId",
             ):
-
                 if obj.get(chave) is not None:
-
-                    candidatos.append(
-                        obj.get(chave)
+                    adicionar_candidato(
+                        obj.get(chave),
+                        chave
                     )
 
-            for valor in obj.values():
-                procurar(valor)
+            possui_caracteristicas_balance = any(
+                chave in obj
+                for chave in (
+                    "amount",
+                    "currency",
+                    "enrolled_amount",
+                    "is_fiat",
+                    "is_marginal",
+                    "type",
+                    "user_id",
+                )
+            )
+
+            if (
+                possui_caracteristicas_balance
+                and
+                obj.get("id") is not None
+            ):
+
+                balance_id = obj.get("id")
+                tipo = obj.get("type")
+
+                adicionar_candidato(
+                    balance_id,
+                    "balance.id"
+                )
+
+                if str(tipo) == "4":
+
+                    texto = str(
+                        balance_id
+                    ).strip()
+
+                    if texto:
+                        if not any(
+                            x[0] == texto
+                            for x in candidatos_demo
+                        ):
+                            candidatos_demo.append(
+                                (
+                                    texto,
+                                    "balance.id[type=4]"
+                                )
+                            )
+
+            for chave, valor in obj.items():
+                procurar(
+                    valor,
+                    contexto=chave
+                )
 
         elif isinstance(obj, list):
 
-            for valor in obj:
-                procurar(valor)
+            for item in obj:
+                procurar(
+                    item,
+                    contexto=contexto
+                )
 
     procurar(data)
 
-    if candidatos:
+    # --------------------------------------------------------
+    # PRIMEIRA PRIORIDADE: CONTA DEMO
+    # --------------------------------------------------------
 
-        valor = candidatos[0]
+    if candidatos_demo:
 
-        if valor is not None:
+        valor, origem = candidatos_demo[0]
 
-            _bullex_balance_id = str(
-                valor
+        if _bullex_balance_id != valor:
+
+            _bullex_balance_id = valor
+
+            log(
+                "BALANCE ID DEMO "
+                f"ENCONTRADO: {_bullex_balance_id} "
+                f"(origem={origem})"
+            )
+
+        return
+
+    # --------------------------------------------------------
+    # SEGUNDA PRIORIDADE: BALANCE ID EXPLÍCITO
+    # --------------------------------------------------------
+
+    if candidatos_balance:
+
+        valor, origem = candidatos_balance[0]
+
+        if _bullex_balance_id != valor:
+
+            _bullex_balance_id = valor
+
+            log(
+                "Balance ID encontrado: "
+                f"{_bullex_balance_id} "
+                f"(origem={origem})"
+            )
+
+
+def _solicitar_balance_id_demo():
+
+    global _bullex_balance_id
+
+    if BULLEX_USER_BALANCE_ID:
+
+        log(
+            "BULLEX_USER_BALANCE_ID "
+            "configurado no ambiente. "
+            "Consulta de saldo ignorada."
+        )
+
+        return
+
+    if _bullex_balance_id:
+
+        log(
+            "Balance ID já disponível: "
+            f"{_bullex_balance_id}"
+        )
+
+        return
+
+    if not _bullex_authenticated:
+
+        log(
+            "Não foi possível solicitar "
+            "balances: WebSocket não autenticado."
+        )
+
+        return
+
+    try:
+
+        log(
+            "Solicitando saldos da Bullex "
+            "para localizar conta DEMO..."
+        )
+
+        resposta = _enviar_e_aguardar(
+            "get-balances",
+            "1.0",
+            {},
+            timeout=10
+        )
+
+        _extrair_balance_id(
+            resposta
+        )
+
+        if _bullex_balance_id:
+
+            log(
+                "CONTA DEMO LOCALIZADA. "
+                f"user_balance_id="
+                f"{_bullex_balance_id}"
+            )
+
+        else:
+
+            log(
+                "get-balances respondeu, "
+                "mas nenhum balance DEMO "
+                "foi localizado."
             )
 
             log(
-                "Balance ID recebido da Bullex: "
-                f"{_bullex_balance_id}"
+                f"Resposta de balances: "
+                f"{str(resposta)[:2000]}"
             )
+
+    except Exception as e:
+
+        log(
+            "Erro ao solicitar get-balances: "
+            f"{e}"
+        )
 
 
 def _obter_balance_id():
@@ -805,7 +948,6 @@ def _armazenar_candles_resposta(
 
             try:
                 size = int(size_key)
-
             except Exception:
                 continue
 
@@ -827,7 +969,6 @@ def _armazenar_candles_resposta(
                     item,
                     dict
                 ):
-
                     _armazenar_candle_ws(
                         active_id,
                         size,
@@ -848,7 +989,6 @@ def _armazenar_candles_resposta(
                 item,
                 dict
             ):
-
                 _armazenar_candle_ws(
                     active_id,
                     size,
@@ -869,26 +1009,21 @@ def _on_bullex_message(
     global _bullex_authenticated
 
     try:
-
         data = json.loads(
             raw_message
         )
-
     except Exception:
-
         return
 
     if not isinstance(data, dict):
         return
 
-    # Algumas respostas podem vir encapsuladas.
     if isinstance(
         data.get("data"),
         str
     ):
 
         try:
-
             inner = json.loads(
                 data["data"]
             )
@@ -927,6 +1062,8 @@ def _on_bullex_message(
 
             return
 
+    # Sempre tenta extrair o balance antes
+    # de processar o restante da mensagem.
     _extrair_balance_id(data)
 
     nome = data.get("name")
@@ -935,7 +1072,9 @@ def _on_bullex_message(
         "request_id"
     )
 
-    msg = data.get("msg")
+    msg = data.get(
+        "msg"
+    )
 
     active_id = None
     size = None
@@ -987,6 +1126,13 @@ def _on_bullex_message(
         log(
             "Autenticacao Bullex confirmada."
         )
+
+        # Buscar conta DEMO em thread separada.
+        threading.Thread(
+            target=_solicitar_balance_id_demo,
+            daemon=True,
+            name="bullex-balance",
+        ).start()
 
         threading.Thread(
             target=_assinar_candles_otc,
@@ -1347,7 +1493,6 @@ def conectar_bullex():
             _bullex_ws is not None
             and _bullex_connected
         ):
-
             return _bullex_ws
 
         if not _bullex_ws_thread_started:
@@ -1441,21 +1586,17 @@ def _montar_subscribe_candle(
 
     return {
         "name": "subscribeMessage",
-
         "request_id": str(
             request_id
             or
             _next_request_id()
         ),
-
         "local_time": (
             int(time.time() * 1000)
             % 1_000_000
         ),
-
         "msg": {
             "name": "candle-generated",
-
             "params": {
                 "routingFilters": {
                     "active_id": int(active_id),
@@ -3251,7 +3392,8 @@ def enviar_sinal_telegram(
         _ultimos_sinais_telegram.get(
             symbol
         )
-        == chave
+        ==
+        chave
     ):
 
         return
@@ -3313,6 +3455,7 @@ def enviar_sinal_telegram(
         _ultimos_sinais_telegram[
             symbol
         ] = chave
+
 
 # ============================================================
 # EXECUÇÃO AUTOMÁTICA
@@ -3681,10 +3824,6 @@ def _buscar_instrumento(
 
                 continue
 
-            # ------------------------------------------------
-            # PRIMEIRO: procurar instrumento EXATO
-            # ------------------------------------------------
-
             for item in candidatos:
 
                 iid = str(
@@ -3734,17 +3873,12 @@ def _buscar_instrumento(
                 except Exception:
                     continue
 
-            # ------------------------------------------------
-            # SEGUNDO: procurar qualquer instrumento 5M
-            # ------------------------------------------------
-
             for item in candidatos:
 
                 if not _instrumento_eh_5m(
                     item,
                     instrument_id_esperado
                 ):
-
                     continue
 
                 iid = str(
@@ -3867,10 +4001,6 @@ def executar_ordem_demo(
                     "status": "OPERACAO_GLOBAL_ATIVA",
                 }
 
-        # ----------------------------------------------------
-        # BALANCE ID
-        # ----------------------------------------------------
-
         balance_id = _obter_balance_id()
 
         if not balance_id:
@@ -3890,10 +4020,6 @@ def executar_ordem_demo(
                 "success": False,
                 "status": "SEM_BALANCE_ID",
             }
-
-        # ----------------------------------------------------
-        # ATIVO
-        # ----------------------------------------------------
 
         config = None
 
@@ -3918,10 +4044,6 @@ def executar_ordem_demo(
             config["active_id"]
         )
 
-        # ----------------------------------------------------
-        # VALOR
-        # ----------------------------------------------------
-
         valor = _valor_entrada_atual()
 
         agora = agora_brt()
@@ -3938,10 +4060,6 @@ def executar_ordem_demo(
         direcao = _direcao_bullex(
             sinal
         )
-
-        # ----------------------------------------------------
-        # DESCOBRIR INSTRUMENTO REAL
-        # ----------------------------------------------------
 
         instrumento = _buscar_instrumento(
             active_id,
@@ -3976,21 +4094,12 @@ def executar_ordem_demo(
             ]
         )
 
-        # ----------------------------------------------------
-        # IMPORTANTE:
-        # usar o instrument_id REAL retornado pela Bullex
-        # ----------------------------------------------------
-
         instrument_id_real = str(
             instrumento.get(
                 "instrument_id",
                 instrument_id
             )
         )
-
-        # ----------------------------------------------------
-        # BODY DA ORDEM
-        # ----------------------------------------------------
 
         body = {
 
@@ -4031,8 +4140,7 @@ def executar_ordem_demo(
             f"Index={instrument_index} | "
             f"Asset={active_id}"
         )
-
-        log(
+                log(
             f"Balance ID={balance_id}"
         )
 
@@ -5883,6 +5991,15 @@ def health():
                     if _bullex_balance_id
                     else "NENHUM"
                 )
+            ),
+
+        "balance_id":
+            (
+                str(
+                    _obter_balance_id()
+                )
+                if _obter_balance_id()
+                else None
             ),
 
         "telegram_configurado":
