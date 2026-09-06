@@ -283,164 +283,217 @@ def extract_instruments(obj, active_id, out=None):
 
 def find_5m_instrument(active_id):
     expected = expected_instrument_id(active_id)
-    log(f'Procurando instrumento: active_id={active_id} expected={expected}')
-    respostas = []
-    for version, body in [
-        ('3.0', {'asset_id': int(active_id), 'instrument_type': 'digital'}),
-        ('2.0', {'asset_id': int(active_id)}),
-        ('3.0', {'asset_id': int(active_id)}),
-    ]:
-        try:
-            r = request_wait('digital-options.get-instruments', version, body, 15)
-            respostas.append(r)
-            candidatos = extract_instruments(r, active_id)
-            log(f'get-instruments v{version}: candidatos={len(candidatos)}')
-            for c in candidatos:
-                iid = c['instrument_id']
-                if iid == expected or 'T5M' in iid.upper():
-                    log(f'INSTRUMENTO 5M ENCONTRADO: {iid} index={c.get("instrument_index")}')
-                    return c
-        except Exception as e:
-            log(f'Falha get-instruments v{version}: {e}')
+    log(
+        f'Procurando instrumento OTC: active_id={active_id} '
+        f'expected={expected}'
+    )
 
     # ========================================================
-    # DIAGNÓSTICO DO ENDPOINT REAL USADO PELO TRADEROOM
+    # IMPORTANTE:
+    # Os três get-instruments já demonstraram timeout.
+    # Não vamos mais gastar 45 segundos neles.
+    #
+    # Agora vamos diretamente ao endpoint que o Traderoom
+    # já foi observado usando após a autenticação:
+    #
+    # digital-option-instruments.get-underlying-list
+    #
+    # Esta etapa é APENAS descoberta/diagnóstico. Nenhuma
+    # ordem é enviada aqui.
     # ========================================================
-    # O endpoint digital-option-instruments.get-underlying-list
-    # rejeitou body vazio com "body unmarshal error / EOF".
-    # Agora testamos formatos de leitura/descoberta, sem enviar
-    # uma ordem durante esta etapa.
-    # ========================================================
-    diagnosticos = [
-        ('digital-option-instruments.get-underlying-list', '1.0',
-         {'asset_type': 'digital-option'}),
-        ('digital-option-instruments.get-underlying-list', '1.0',
-         {'instrument_type': 'digital'}),
-        ('digital-option-instruments.get-underlying-list', '1.0',
-         {'active_id': int(active_id)}),
-        ('digital-option-instruments.get-underlying-list', '1.0',
-         {'asset_id': int(active_id)}),
-        ('digital-option-instruments.get-underlying-list', '1.0',
-         {'asset_id': int(active_id), 'instrument_type': 'digital'}),
-        ('digital-option-instruments.get-underlying-list', '2.0',
-         {'asset_id': int(active_id)}),
+
+    tentativas = [
+        # Formatos simples
+        {'asset_id': int(active_id)},
+        {'active_id': int(active_id)},
+        {'underlying_id': int(active_id)},
+
+        # Possíveis filtros de tipo
+        {
+            'asset_id': int(active_id),
+            'instrument_type': 'digital',
+        },
+        {
+            'active_id': int(active_id),
+            'instrument_type': 'digital',
+        },
+        {
+            'underlying_id': int(active_id),
+            'instrument_type': 'digital',
+        },
+
+        # Possíveis formatos usados por APIs de instrumentos
+        {
+            'asset_id': int(active_id),
+            'type': 'digital',
+        },
+        {
+            'active_id': int(active_id),
+            'type': 'digital',
+        },
+        {
+            'underlying_id': int(active_id),
+            'type': 'digital',
+        },
     ]
 
-    for name, version, body in diagnosticos:
+    respostas = []
+
+    for body in tentativas:
         try:
-            log(f'DIAGNÓSTICO OTC: enviando {name} v{version} body={body}')
-            r = request_wait(name, version, body, 10)
+            log(
+                'DIAGNÓSTICO OTC: enviando '
+                'digital-option-instruments.get-underlying-list '
+                f'v1.0 body={body}'
+            )
+
+            r = request_wait(
+                'digital-option-instruments.get-underlying-list',
+                '1.0',
+                body,
+                8,
+            )
+            respostas.append(r)
 
             log(
-                'DIAGNÓSTICO OTC: resposta '
-                f'{name} v{version}: {json.dumps(r, ensure_ascii=False)}'
+                'DIAGNÓSTICO OTC: resposta: '
+                + json.dumps(r, ensure_ascii=False)
             )
 
-            bruto = json.dumps(r, ensure_ascii=False).upper()
-            termos = (
-                'EURUSD-OTC', 'EURUSD', str(active_id),
-                'INSTRUMENT_ID', 'INSTRUMENTINDEX', 'INSTRUMENT_INDEX'
-            )
-            encontrados = [t for t in termos if t.upper() in bruto]
+            # Procura qualquer referência ao ativo na resposta.
+            bruto = json.dumps(r, ensure_ascii=False)
+            upper = bruto.upper()
+
+            termos = [
+                'EURUSD-OTC',
+                'EURUSD',
+                str(active_id),
+                'INSTRUMENT_ID',
+                'INSTRUMENTINDEX',
+                'INSTRUMENT_INDEX',
+                'T5M',
+            ]
+
+            encontrados = [
+                termo for termo in termos
+                if termo.upper() in upper
+            ]
+
             if encontrados:
                 log(
-                    'DIAGNÓSTICO OTC: termos encontrados na resposta: '
+                    'DIAGNÓSTICO OTC: termos encontrados: '
                     f'{encontrados}'
                 )
 
+            # Tentativa genérica de extrair instrument_id.
             candidatos = extract_instruments(r, active_id)
+
             log(
-                'DIAGNÓSTICO OTC: extract_instruments '
-                f'candidatos={len(candidatos)}'
+                'DIAGNÓSTICO OTC: candidatos extraídos='
+                f'{len(candidatos)}'
             )
 
             for c in candidatos[:50]:
                 log(
                     f'  CANDIDATO: id={c["instrument_id"]} '
                     f'index={c.get("instrument_index")} '
-                    f'asset_id={c.get("asset_id")}'
+                    f'asset_id={c.get("asset_id")} '
+                    f'raw={json.dumps(c.get("raw"), ensure_ascii=False)}'
                 )
 
+            # Se aparecer um instrumento 5M, podemos parar.
             for c in candidatos:
                 iid = str(c['instrument_id'])
+
                 if iid == expected or 'T5M' in iid.upper():
                     log(
-                        'INSTRUMENTO 5M ENCONTRADO NO DIAGNÓSTICO: '
+                        'INSTRUMENTO 5M ENCONTRADO: '
                         f'{iid} index={c.get("instrument_index")}'
                     )
                     return c
 
         except Exception as e:
             log(
-                f'DIAGNÓSTICO OTC: falha {name} v{version} '
-                f'body={body}: {e}'
+                'DIAGNÓSTICO OTC: falha body='
+                f'{body}: {e}'
             )
 
-    # Algumas versões podem identificar o ativo pelo ticker.
+    # ========================================================
+    # Segunda etapa: tentar por ticker.
+    # ========================================================
     ticker = next(
         (
             item['ticker']
             for item in ATIVOS.values()
             if item['active_id'] == active_id
         ),
-        None
+        None,
     )
 
     if ticker:
-        for body in (
+        ticker_tentativas = [
             {'ticker': ticker},
             {'name': ticker},
             {'asset': ticker},
-        ):
+            {'underlying': ticker},
+            {'symbol': ticker},
+        ]
+
+        for body in ticker_tentativas:
             try:
                 log(
-                    'DIAGNÓSTICO OTC: testando identificação por ticker '
+                    'DIAGNÓSTICO OTC: testando ticker '
                     f'body={body}'
                 )
+
                 r = request_wait(
                     'digital-option-instruments.get-underlying-list',
                     '1.0',
                     body,
-                    10
+                    8,
                 )
+
                 log(
-                    'DIAGNÓSTICO OTC: resposta por ticker: '
+                    'DIAGNÓSTICO OTC: resposta ticker: '
                     + json.dumps(r, ensure_ascii=False)
                 )
 
                 candidatos = extract_instruments(r, active_id)
+
                 for c in candidatos:
                     iid = str(c['instrument_id'])
+
                     if iid == expected or 'T5M' in iid.upper():
                         log(
                             'INSTRUMENTO 5M ENCONTRADO POR TICKER: '
                             f'{iid} index={c.get("instrument_index")}'
                         )
                         return c
+
             except Exception as e:
-                log(f'DIAGNÓSTICO OTC: falha body={body}: {e}')
+                log(
+                    f'DIAGNÓSTICO OTC: falha ticker body={body}: {e}'
+                )
 
-    todos = []
-    for r in respostas:
-        for c in extract_instruments(r, active_id):
-            if c['instrument_id'] not in [x['instrument_id'] for x in todos]:
-                todos.append(c)
-
-    if todos:
-        log('Instrumentos retornados pela Bullex:')
-        for c in todos[:50]:
-            log(
-                f'  id={c["instrument_id"]} '
-                f'index={c.get("instrument_index")}'
-            )
-    else:
+    # ========================================================
+    # Se a resposta tiver underlying-list mas não tiver
+    # instrument_id no formato esperado, imprime os campos
+    # relevantes encontrados. Isso é justamente o que
+    # precisamos para descobrir a próxima chamada do Traderoom.
+    # ========================================================
+    for idx, r in enumerate(respostas, 1):
         log(
-            'Nenhum instrument_id foi extraído. '
-            'Precisamos analisar as respostas do diagnóstico OTC.'
+            f'DIAGNÓSTICO OTC: resumo resposta #{idx}: '
+            + json.dumps(r, ensure_ascii=False)
         )
 
-    return None
+    log(
+        'Nenhum instrument_id 5M encontrado. '
+        'A descoberta agora depende da estrutura real retornada '
+        'pelo underlying-list.'
+    )
 
+    return None
 
 def force_order(symbol, direction, amount):
     if symbol not in ATIVOS:
