@@ -242,7 +242,7 @@ def get_demo_balance():
     if _balance_id:
         return _balance_id
     if BULLEX_USER_BALANCE_ID:
-        _balance_id, _balance_source = BULLEX_USER_BALANCE_ID, 'ENV'
+        _balance_id, _balance_source = int(BULLEX_USER_BALANCE_ID), 'ENV'
         log(f'Balance DEMO via ENV: {_balance_id}')
         return _balance_id
     r = request_wait('get-balances', '1.0', None, 15)
@@ -531,7 +531,7 @@ def force_order(symbol, direction, amount):
         # protocolo para opções de curtíssimo prazo.
         # ========================================================
         body = {
-            'user_balance_id': str(balance),
+            'user_balance_id': int(balance),
             'active_id': int(active_id),
             'option_type_id': 3,
             'direction': 'call' if direction == 'CALL' else 'put',
