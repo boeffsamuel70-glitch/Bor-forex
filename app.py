@@ -50,6 +50,8 @@ _balance_source = None
 _test_lock = threading.Lock()
 _last_test = None
 _test_running = False
+_diagnostic_messages = []
+_DIAG_LIMIT = 100
 
 
 def log(msg):
@@ -106,6 +108,42 @@ def on_open(ws):
         log(f'Erro ao autenticar: {e}')
 
 
+def log_diagnostic_message(data):
+    """Guarda e imprime mensagens relevantes do WebSocket para diagnóstico."""
+    global _diagnostic_messages
+    try:
+        name = data.get('name')
+        req = data.get('request_id')
+        text = json.dumps(data, ensure_ascii=False)
+        relevant = (
+            name in {
+                'authenticated', 'authentication-failed', 'authentication_failed',
+                'balances', 'error', 'candle-generated',
+                'digital-option-instruments.get-underlying-list',
+                'marginal-forex-instruments.get-underlying-list',
+                'digital-options.get-instruments',
+                'digital-option-placed',
+                'digital-options.place-digital-option'
+            }
+            or (name and ('instrument' in str(name).lower() or 'underlying' in str(name).lower()))
+            or (req is not None)
+        )
+        if relevant:
+            item = {
+                'time': datetime.now(TZ).strftime('%Y-%m-%d %H:%M:%S'),
+                'name': name,
+                'request_id': req,
+                'data': data,
+            }
+            with _ws_lock:
+                _diagnostic_messages.append(item)
+                if len(_diagnostic_messages) > _DIAG_LIMIT:
+                    _diagnostic_messages = _diagnostic_messages[-_DIAG_LIMIT:]
+            log(f'[WS DIAG] name={name} request_id={req} data={text[:4000]}')
+    except Exception as e:
+        log(f'[WS DIAG] erro ao registrar mensagem: {e}')
+
+
 def on_message(ws, raw):
     global _authenticated, _connected, _client_session_id, _last_error
     try:
@@ -114,6 +152,8 @@ def on_message(ws, raw):
         return
     if not isinstance(data, dict):
         return
+
+    log_diagnostic_message(data)
 
     name = data.get('name')
     req = data.get('request_id')
@@ -303,6 +343,26 @@ def find_5m_instrument(active_id):
         except Exception as e:
             log(f'Falha get-instruments v{version}: {e}')
 
+    # Diagnóstico adicional: tenta as chamadas usadas pelo Traderoom para
+    # descobrir os underlyings/instrumentos. Não inventa instrument_id.
+    for name, version, body in [
+        ('digital-option-instruments.get-underlying-list', '1.0', None),
+        ('marginal-forex-instruments.get-underlying-list', '1.0', None),
+    ]:
+        try:
+            r = request_wait(name, version, body, 8)
+            respostas.append(r)
+            log(f'Diagnóstico {name}: resposta recebida.')
+            candidatos = extract_instruments(r, active_id)
+            log(f'Diagnóstico {name}: candidatos={len(candidatos)}')
+            for c in candidatos:
+                iid = c['instrument_id']
+                if iid == expected or 'T5M' in iid.upper():
+                    log(f'INSTRUMENTO 5M ENCONTRADO NO DIAGNÓSTICO: {iid} index={c.get("instrument_index")}')
+                    return c
+        except Exception as e:
+            log(f'Diagnóstico {name}: {e}')
+
     # Diagnóstico adicional: mostra IDs retornados, sem inventar instrumento.
     todos = []
     for r in respostas:
@@ -392,6 +452,7 @@ def status():
         'last_test': _last_test,
         'test_running': _test_running,
         'error': _last_error,
+        'diagnostic_messages': _diagnostic_messages[-30:],
     })
 
 
@@ -456,6 +517,15 @@ def teste_entrada():
         _last_error = str(e)
         log(f'ERRO AO INICIAR TESTE: {e}')
         return jsonify({'confirmada': False, 'erro': str(e), 'modo': 'DEMO_ONLY'}), 400
+
+
+@app.route('/diagnostico')
+def diagnostico():
+    return jsonify({
+        'mode': 'DEMO_ONLY',
+        'count': len(_diagnostic_messages),
+        'messages': _diagnostic_messages[-100:],
+    })
 
 
 @app.route('/health')
