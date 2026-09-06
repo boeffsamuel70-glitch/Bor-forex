@@ -3313,7 +3313,7 @@ def enviar_sinal_telegram(
         _ultimos_sinais_telegram[
             symbol
         ] = chave
-```
+
 # ============================================================
 # EXECUÇÃO AUTOMÁTICA
 # ============================================================
