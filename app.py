@@ -495,19 +495,129 @@ def find_5m_instrument(active_id):
 
     return None
 
+def _extract_error_message(response):
+    """Extrai uma mensagem textual útil de uma resposta Bullex."""
+    if not isinstance(response, dict):
+        return str(response)
+
+    msg = response.get('msg')
+
+    if isinstance(msg, dict):
+        for key in ('message', 'error', 'reason', 'msg'):
+            value = msg.get(key)
+            if value not in (None, ''):
+                return str(value)
+
+    for key in ('message', 'error', 'reason'):
+        value = response.get(key)
+        if value not in (None, ''):
+            return str(value)
+
+    return ''
+
+
+def _is_success_response(response):
+    """Detecta de forma conservadora uma abertura aceita."""
+    if not isinstance(response, dict):
+        return False
+
+    msg = response.get('msg')
+
+    if isinstance(msg, dict):
+        if msg.get('success') is True:
+            return True
+        if msg.get('id') not in (None, ''):
+            return True
+
+    if response.get('success') is True:
+        return True
+
+    bruto = json.dumps(response, ensure_ascii=False).lower()
+    return (
+        '"success":true' in bruto
+        or 'digital-option-placed' in bruto
+        or 'option-placed' in bruto
+    )
+
+
+def _build_option_bodies(balance, active_id, direction, amount):
+    """
+    Gera as variações mínimas de expiração que vamos testar.
+
+    V3 NÃO muda de ativo nem de saldo. O objetivo é descobrir se o
+    4104 está ligado especificamente ao campo 'expired' / à forma
+    como a expiração é informada.
+
+    Primeira tentativa: exatamente o formato que já chegou ao servidor.
+    Segunda/terceira: variações de expiração comuns no protocolo.
+    """
+    side = 'call' if direction == 'CALL' else 'put'
+
+    return [
+        {
+            'label': 'EXPIRED_1',
+            'body': {
+                'user_balance_id': int(balance),
+                'active_id': int(active_id),
+                'option_type_id': 3,
+                'direction': side,
+                'expired': 1,
+                'price': amount,
+                'refund_value': 0,
+            },
+        },
+        {
+            'label': 'EXPIRED_60',
+            'body': {
+                'user_balance_id': int(balance),
+                'active_id': int(active_id),
+                'option_type_id': 3,
+                'direction': side,
+                'expired': 60,
+                'price': amount,
+                'refund_value': 0,
+            },
+        },
+        {
+            'label': 'EXPIRED_300',
+            'body': {
+                'user_balance_id': int(balance),
+                'active_id': int(active_id),
+                'option_type_id': 3,
+                'direction': side,
+                'expired': 300,
+                'price': amount,
+                'refund_value': 0,
+            },
+        },
+    ]
+
+
 def force_order(symbol, direction, amount):
     """
-    TESTE ISOLADO DE ORDEM DEMO.
+    TESTE ISOLADO DE ORDEM DEMO - V3.
 
-    Nesta versão não dependemos de instrument_id 5M. O endpoint
-    binary-options.open-option usa diretamente o active_id e é o
-    fluxo de abertura de opção conhecido no protocolo Traderoom.
+    A V2 já comprovou:
+      - autenticação OK;
+      - balance DEMO OK;
+      - active_id aceito;
+      - user_balance_id precisa ser número;
+      - binary-options.open-option chega ao servidor.
 
-    O objetivo é simples: descobrir se a conta DEMO consegue chegar
-    até a abertura da ordem e qual resposta a Bullex devolve.
+    Agora investigamos o status 4104:
+      "Time for purchasing options is over, please try again later."
+
+    IMPORTANTE:
+    - continua SOMENTE DEMO;
+    - não usa a estratégia;
+    - não ativa execução automática;
+    - testa uma combinação por vez;
+    - se uma tentativa for aceita, PARA imediatamente para não abrir
+      mais de uma ordem de teste.
     """
     if symbol not in ATIVOS:
         raise ValueError('Ativo inválido.')
+
     if direction not in ('CALL', 'PUT'):
         raise ValueError('Direção deve ser CALL ou PUT.')
 
@@ -522,59 +632,91 @@ def force_order(symbol, direction, amount):
         balance = get_demo_balance()
         active_id = ATIVOS[symbol]['active_id']
         ticker = ATIVOS[symbol]['ticker']
+        now = datetime.now(TZ)
 
-        # ========================================================
-        # TESTE DIRETO DE ABERTURA
-        # ========================================================
-        # option_type_id=3 = turbo-option.
-        # expired=1 = próxima expiração relativa usada pelo
-        # protocolo para opções de curtíssimo prazo.
-        # ========================================================
-        body = {
-            'user_balance_id': int(balance),
-            'active_id': int(active_id),
-            'option_type_id': 3,
-            'direction': 'call' if direction == 'CALL' else 'put',
-            'expired': 1,
-            'price': amount,
-            'refund_value': 0,
-        }
-
-        log('============================================================')
-        log(f'FORÇANDO ENTRADA DEMO: {symbol} ({ticker}) {direction} R${amount:.2f}')
-        log(f'active_id={active_id} balance_id={balance}')
-        log('TESTE: binary-options.open-option v1.0')
-        log('TESTE: body=' + json.dumps(body, ensure_ascii=False))
-        log('============================================================')
-
-        resposta = request_wait(
-            'binary-options.open-option',
-            '1.0',
-            body,
-            20,
+        tentativas = _build_option_bodies(
+            balance,
+            active_id,
+            direction,
+            amount,
         )
 
-        bruto = json.dumps(resposta, ensure_ascii=False).lower()
-        msg = resposta.get('msg')
-
-        # A resposta de abertura normalmente contém um objeto da
-        # opção quando a compra foi aceita. Mensagens de erro também
-        # são preservadas integralmente no resultado.
+        historico = []
+        resposta_final = None
+        tentativa_aceita = None
         sucesso = False
-        option = None
 
-        if isinstance(msg, dict):
-            option = msg
-            if msg.get('id') not in (None, ''):
+        log('============================================================')
+        log(f'V3 - TESTE DE ENTRADA DEMO: {symbol} ({ticker})')
+        log(f'Direção={direction} valor=R${amount:.2f}')
+        log(f'active_id={active_id} balance_id={balance}')
+        log(f'horario_local={now.strftime("%Y-%m-%d %H:%M:%S")}')
+        log('Endpoint: binary-options.open-option v1.0')
+        log('Objetivo: investigar o erro 4104.')
+        log('============================================================')
+
+        for numero, tentativa in enumerate(tentativas, 1):
+            label = tentativa['label']
+            body = tentativa['body']
+
+            inicio = time.time()
+
+            log('------------------------------------------------------------')
+            log(f'TENTATIVA V3 #{numero}: {label}')
+            log('body=' + json.dumps(body, ensure_ascii=False))
+
+            try:
+                resposta = request_wait(
+                    'binary-options.open-option',
+                    '1.0',
+                    body,
+                    20,
+                )
+            except Exception as exc:
+                resposta = {
+                    'local_error': str(exc),
+                }
+
+            duracao = round(time.time() - inicio, 3)
+            mensagem = _extract_error_message(resposta)
+            aceita = _is_success_response(resposta)
+
+            registro = {
+                'numero': numero,
+                'label': label,
+                'body': body,
+                'duracao_segundos': duracao,
+                'aceita': bool(aceita),
+                'mensagem': mensagem or None,
+                'response': resposta,
+            }
+            historico.append(registro)
+
+            log(
+                f'RESULTADO #{numero}: '
+                f'aceita={aceita} duracao={duracao}s'
+            )
+
+            if mensagem:
+                log(f'MENSAGEM #{numero}: {mensagem}')
+
+            log(
+                'RESPOSTA COMPLETA #' + str(numero) + ': '
+                + json.dumps(resposta, ensure_ascii=False)
+            )
+
+            resposta_final = resposta
+
+            if aceita:
                 sucesso = True
-            if msg.get('success') is True:
-                sucesso = True
+                tentativa_aceita = label
+                log('============================================================')
+                log(f'ORDEM DEMO ACEITA NA TENTATIVA #{numero}: {label}')
+                log('IMPORTANTE: nenhuma tentativa adicional será enviada.')
+                log('============================================================')
+                break
 
-        if resposta.get('success') is True:
-            sucesso = True
-
-        if '"success":true' in bruto or 'digital-option-placed' in bruto:
-            sucesso = True
+        global _last_test
 
         result = {
             'confirmada': bool(sucesso),
@@ -587,28 +729,28 @@ def force_order(symbol, direction, amount):
             'balance_source': _balance_source,
             'endpoint': 'binary-options.open-option',
             'version': '1.0',
-            'request_body': body,
-            'response': resposta,
-            'option': option,
+            'diagnostico': 'V3_EXPIRACAO',
+            'horario_local': now.strftime('%Y-%m-%d %H:%M:%S'),
+            'tentativa_aceita': tentativa_aceita,
+            'total_tentativas_enviadas': len(historico),
+            'tentativas': historico,
+            'response_final': resposta_final,
         }
 
-        global _last_test
         _last_test = result
 
-        if sucesso:
-            log('ORDEM DEMO ACEITA!')
-            if option:
-                log('DADOS DA OPÇÃO: ' + json.dumps(option, ensure_ascii=False))
-        else:
-            log('ORDEM DEMO NÃO CONFIRMADA.')
-            log('RESPOSTA COMPLETA: ' + json.dumps(resposta, ensure_ascii=False))
+        if not sucesso:
+            log('============================================================')
+            log('NENHUMA ORDEM DEMO FOI CONFIRMADA NA V3.')
+            log('As respostas das 3 variações foram preservadas no resultado.')
+            log('============================================================')
 
         return result
 
     finally:
         _test_lock.release()
 
-HTML = '''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Teste Bullex DEMO</title><style>body{font-family:Arial;background:#111;color:#fff;margin:0;padding:20px}.box{max-width:650px;margin:auto;background:#1d1d1d;padding:22px;border-radius:15px}select,input,button{width:100%;padding:14px;margin:7px 0;border-radius:9px;border:0;font-size:16px;box-sizing:border-box}button{cursor:pointer;font-weight:bold}.row{display:flex;gap:10px}.row button{width:50%}.call{background:#16834b;color:#fff}.put{background:#b52b35;color:#fff}.test{background:#ddd;color:#111}.status{background:#292929;padding:15px;border-radius:10px;margin:15px 0;line-height:1.7}pre{white-space:pre-wrap;word-break:break-word;background:#090909;padding:12px;border-radius:8px;font-size:12px}</style></head><body><div class="box"><h1>Teste de Entrada DEMO</h1><p>Este app ignora completamente a estratégia. Ele testa SOMENTE a abertura de uma ordem DEMO pela API.</p><div class="status" id="status">Carregando...</div><label>Ativo</label><select id="symbol"><option>EUR/USD</option><option>EUR/JPY</option><option>GBP/USD</option><option>USD/JPY</option><option>GBP/JPY</option></select><label>Valor</label><input id="amount" type="number" min="0.01" max="100" step="0.01" value="5.00"><div class="row"><button class="call" onclick="test('CALL')">FORÇAR CALL</button><button class="put" onclick="test('PUT')">FORÇAR PUT</button></div><div class="status" id="result">Aguardando teste.</div></div><script>async function status(){try{let r=await fetch('/status');let d=await r.json();document.getElementById('status').innerHTML='WebSocket: <b>'+d.websocket+'</b><br>Autenticado: <b>'+d.authenticated+'</b><br>Balance DEMO: <b>'+d.balance+'</b><br>Fonte: <b>'+d.balance_source+'</b><br>Último erro: <b>'+((d.error)||'-')+'</b>';}catch(e){document.getElementById('status').textContent=e}}async function test(direction){let symbol=document.getElementById('symbol').value;let amount=document.getElementById('amount').value;document.getElementById('result').textContent='Iniciando teste '+symbol+' '+direction+'...';try{let r=await fetch('/teste/entrada',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol,direction,amount})});let d=await r.json();document.getElementById('result').innerHTML='<pre>'+JSON.stringify(d,null,2)+'</pre>';status();if(r.status===202){poll();}}catch(e){document.getElementById('result').textContent=e}}async function poll(){for(let i=0;i<90;i++){await new Promise(x=>setTimeout(x,1000));try{let r=await fetch('/status');let d=await r.json();if(d.last_test){document.getElementById('result').innerHTML='<pre>'+JSON.stringify(d.last_test,null,2)+'</pre>';}status();if(!d.test_running)return;}catch(e){}}}status();setInterval(status,5000)</script></body></html>'''
+HTML = '''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Teste Bullex DEMO</title><style>body{font-family:Arial;background:#111;color:#fff;margin:0;padding:20px}.box{max-width:650px;margin:auto;background:#1d1d1d;padding:22px;border-radius:15px}select,input,button{width:100%;padding:14px;margin:7px 0;border-radius:9px;border:0;font-size:16px;box-sizing:border-box}button{cursor:pointer;font-weight:bold}.row{display:flex;gap:10px}.row button{width:50%}.call{background:#16834b;color:#fff}.put{background:#b52b35;color:#fff}.test{background:#ddd;color:#111}.status{background:#292929;padding:15px;border-radius:10px;margin:15px 0;line-height:1.7}pre{white-space:pre-wrap;word-break:break-word;background:#090909;padding:12px;border-radius:8px;font-size:12px}</style></head><body><div class="box"><h1>Teste de Entrada DEMO</h1><p>V3: este app ignora completamente a estratégia. Ele testa SOMENTE a abertura de uma ordem DEMO e investiga o erro 4104 variando a expiração.</p><div class="status" id="status">Carregando...</div><label>Ativo</label><select id="symbol"><option>EUR/USD</option><option>EUR/JPY</option><option>GBP/USD</option><option>USD/JPY</option><option>GBP/JPY</option></select><label>Valor</label><input id="amount" type="number" min="0.01" max="100" step="0.01" value="5.00"><div class="row"><button class="call" onclick="test('CALL')">FORÇAR CALL</button><button class="put" onclick="test('PUT')">FORÇAR PUT</button></div><div class="status" id="result">Aguardando teste.</div></div><script>async function status(){try{let r=await fetch('/status');let d=await r.json();document.getElementById('status').innerHTML='WebSocket: <b>'+d.websocket+'</b><br>Autenticado: <b>'+d.authenticated+'</b><br>Balance DEMO: <b>'+d.balance+'</b><br>Fonte: <b>'+d.balance_source+'</b><br>Último erro: <b>'+((d.error)||'-')+'</b>';}catch(e){document.getElementById('status').textContent=e}}async function test(direction){let symbol=document.getElementById('symbol').value;let amount=document.getElementById('amount').value;document.getElementById('result').textContent='Iniciando teste '+symbol+' '+direction+'...';try{let r=await fetch('/teste/entrada',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol,direction,amount})});let d=await r.json();document.getElementById('result').innerHTML='<pre>'+JSON.stringify(d,null,2)+'</pre>';status();if(r.status===202){poll();}}catch(e){document.getElementById('result').textContent=e}}async function poll(){for(let i=0;i<90;i++){await new Promise(x=>setTimeout(x,1000));try{let r=await fetch('/status');let d=await r.json();if(d.last_test){document.getElementById('result').innerHTML='<pre>'+JSON.stringify(d.last_test,null,2)+'</pre>';}status();if(!d.test_running)return;}catch(e){}}}status();setInterval(status,5000)</script></body></html>'''
 
 
 @app.route('/')
@@ -620,7 +762,8 @@ def index():
 @app.route('/status')
 def status():
     return jsonify({
-        'mode': 'DEMO_ONLY',
+        'mode': 'DEMO_ONLY_V3',
+        'diagnostico': 'EXPIRACAO_4104',
         'websocket': 'CONECTADO' if _connected else 'DESCONECTADO',
         'authenticated': _authenticated,
         'balance': 'ENCONTRADO' if _balance_id else 'AGUARDANDO',
@@ -696,7 +839,7 @@ def teste_entrada():
 
 @app.route('/health')
 def health():
-    return jsonify({'status':'ok','mode':'DEMO_ONLY','websocket':_connected,'authenticated':_authenticated,'balance':bool(_balance_id),'last_test':_last_test,'test_running':_test_running,'error':_last_error})
+    return jsonify({'status':'ok','mode':'DEMO_ONLY_V3','diagnostico':'EXPIRACAO_4104','websocket':_connected,'authenticated':_authenticated,'balance':bool(_balance_id),'last_test':_last_test,'test_running':_test_running,'error':_last_error})
 
 
 if __name__ == '__main__':
