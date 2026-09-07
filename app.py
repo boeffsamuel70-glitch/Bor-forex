@@ -4,6 +4,7 @@ import threading
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import json
+import re
 import requests
 import websocket
 
@@ -61,13 +62,23 @@ BULLEX_USER_AGENT = os.getenv(
 # ATIVOS BULLEX
 # ============================================================
 
-ATIVO_BULLEX = {
-    "EURUSD": {"symbol": "EUR/USD", "active_id": 76, "ticker": "EURUSD-OTC"},
-    "EURJPY": {"symbol": "EUR/JPY", "active_id": 79, "ticker": "EURJPY-OTC"},
-    "GBPUSD": {"symbol": "GBP/USD", "active_id": 81, "ticker": "GBPUSD-OTC"},
-    "USDJPY": {"symbol": "USD/JPY", "active_id": 85, "ticker": "USDJPY-OTC"},
-    "GBPJPY": {"symbol": "GBP/JPY", "active_id": 84, "ticker": "GBPJPY-OTC"},
+# Somente mercado aberto. Os active_id não ficam fixos no código:
+# são descobertos automaticamente na lista digital da Traderoom após autenticar.
+ATIVO_BULLEX = {}
+
+PARES_MERCADO_ABERTO = {
+    "EURUSD": "EUR/USD",
+    "EURJPY": "EUR/JPY",
+    "GBPUSD": "GBP/USD",
+    "USDJPY": "USD/JPY",
+    "GBPJPY": "GBP/JPY",
 }
+
+_bullex_assets_lock = threading.RLock()
+_bullex_assets_detected = False
+_bullex_assets_last_error = None
+_bullex_assets_updated_at = None
+_bullex_assets_source = None
 
 _BULLEX_CANDLE_SIZES = {"5min": 300, "15min": 900}
 
@@ -92,7 +103,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OTC-AUTO-DEMO-5M-LOCK-FIX-20260906"
+BULLEX_DIAGNOSTIC_VERSION = "OPEN-MARKET-AUTO-FIXED-5-BRL-20260907"
 
 _bullex_diag = {
     "messages": 0,
@@ -135,7 +146,7 @@ MAX_ATRASO_MINUTOS = 8
 
 BULLEX_AUTO_TRADE = os.getenv(
     "BULLEX_AUTO_TRADE",
-    "true"
+    "false"
 ).strip().lower() in ("1", "true", "yes", "sim", "on")
 
 BULLEX_USER_BALANCE_ID = os.getenv(
@@ -143,7 +154,7 @@ BULLEX_USER_BALANCE_ID = os.getenv(
     ""
 ).strip()
 
-VALORES_ENTRADA = [5.00, 10.50, 23.00]
+VALORES_ENTRADA = [5.00]
 EXPIRACAO_MINUTOS = 5
 MAX_ATRASO_ENTRADA_SEGUNDOS = 3
 DELAY_MINIMO_ENTRADA_SEGUNDOS = 1.0
@@ -594,43 +605,10 @@ def _atualizar_estado_execucao():
     })
 
 
-def _extrair_balance_id(obj):
-    """Procura exclusivamente uma conta DEMO (type=4), sem escolher saldo real por engano."""
-    encontrados_demo = []
-    encontrados_explicitos = []
-
-    def walk(value):
-        if isinstance(value, dict):
-            for key in ("user_balance_id", "userBalanceId", "balance_id", "balanceId"):
-                val = value.get(key)
-                if val not in (None, ""):
-                    encontrados_explicitos.append(str(val))
-
-            if value.get("id") not in (None, ""):
-                tipo = value.get("type")
-                if str(tipo) == "4":
-                    encontrados_demo.append(str(value["id"]))
-
-            for v in value.values():
-                walk(v)
-        elif isinstance(value, list):
-            for v in value:
-                walk(v)
-
-    walk(obj)
-
-    # A variável de ambiente sempre tem prioridade.
+def _extrair_balance_id(obj=None):
+    """Aceita somente BULLEX_USER_BALANCE_ID. Sem descoberta automática."""
     if BULLEX_USER_BALANCE_ID:
         return str(BULLEX_USER_BALANCE_ID), "ENV"
-
-    # Se o servidor entregar explicitamente user_balance_id, aceitamos.
-    if encontrados_explicitos:
-        return encontrados_explicitos[0], "RESPONSE_EXPLICIT"
-
-    # Fallback seguro: somente type=4 (DEMO).
-    if encontrados_demo:
-        return encontrados_demo[0], "DEMO_TYPE_4"
-
     return None, None
 
 
@@ -641,31 +619,20 @@ def _solicitar_balance_id_demo():
         _bullex_balance_id = str(BULLEX_USER_BALANCE_ID)
         _bullex_balance_source = "ENV"
         _atualizar_estado_execucao()
-        log(f"Balance DEMO definido por BULLEX_USER_BALANCE_ID: {_bullex_balance_id}")
+        log(f"Balance definido por BULLEX_USER_BALANCE_ID: {_bullex_balance_id}")
         return _bullex_balance_id
 
-    try:
-        resposta = _enviar_e_aguardar("get-balances", "1.0", None, timeout=15)
-        balance_id, source = _extrair_balance_id(resposta)
-        if balance_id is None:
-            log("[BALANCE] Nenhum user_balance_id DEMO (type=4) encontrado.")
-            return None
-
-        _bullex_balance_id = str(balance_id)
-        _bullex_balance_source = source
-        _atualizar_estado_execucao()
-        log(f"Balance DEMO encontrado: id={_bullex_balance_id} fonte={source}")
-        return _bullex_balance_id
-    except Exception as e:
-        _bullex_last_error = str(e)
-        log(f"[BALANCE] Falha ao consultar get-balances: {e}")
-        return None
+    _bullex_balance_id = None
+    _bullex_balance_source = None
+    _atualizar_estado_execucao()
+    log("[BALANCE] BULLEX_USER_BALANCE_ID vazio. Nenhum balance_id sera escolhido automaticamente.")
+    return None
 
 
 def _obter_balance_id():
-    if _bullex_balance_id:
-        return str(_bullex_balance_id)
-    return _solicitar_balance_id_demo()
+    if BULLEX_USER_BALANCE_ID:
+        return str(BULLEX_USER_BALANCE_ID)
+    return None
 
 
 def _instrument_time():
@@ -737,6 +704,17 @@ def executar_ordem_demo(symbol, sinal, resultado):
     if not BULLEX_AUTO_TRADE:
         return None
 
+    if not BULLEX_USER_BALANCE_ID:
+        estado["execucao"]["ultimo_erro"] = (
+            "SEM_BALANCE_ID: configure BULLEX_USER_BALANCE_ID."
+        )
+        _atualizar_estado_execucao()
+        log(
+            "[AUTO TRADE] BULLEX_USER_BALANCE_ID vazio. "
+            "Ordem nao enviada (SEM_BALANCE_ID)."
+        )
+        return "SEM_BALANCE_ID"
+
     if sinal not in ("CALL", "PUT"):
         return None
 
@@ -756,13 +734,13 @@ def executar_ordem_demo(symbol, sinal, resultado):
 
     if not balance_id:
         estado["execucao"]["ultimo_erro"] = (
-            "user_balance_id DEMO não encontrado."
+            "SEM_BALANCE_ID: configure BULLEX_USER_BALANCE_ID."
         )
         _atualizar_estado_execucao()
 
         log(
-            "[AUTO DEMO] user_balance_id DEMO "
-            "não encontrado."
+            "[AUTO TRADE] BULLEX_USER_BALANCE_ID vazio. "
+            "Ordem nao enviada (SEM_BALANCE_ID)."
         )
 
         return "SEM_BALANCE_ID"
@@ -1294,9 +1272,9 @@ def _on_bullex_message(ws, raw_message):
         ).start()
 
         threading.Thread(
-            target=_assinar_candles_otc,
+            target=_inicializar_ativos_mercado_aberto,
             daemon=True,
-            name="bullex-candle-subscriptions",
+            name="bullex-open-market-assets",
         ).start()
         return
 
@@ -1678,7 +1656,221 @@ def _assinar_candle(active_id, size):
         )
 
 
-def _assinar_candles_otc():
+def _iter_dicts_recursivo(obj):
+    if isinstance(obj, dict):
+        yield obj
+        for valor in obj.values():
+            yield from _iter_dicts_recursivo(valor)
+    elif isinstance(obj, list):
+        for valor in obj:
+            yield from _iter_dicts_recursivo(valor)
+
+
+def _primeiro_valor(item, chaves):
+    for chave in chaves:
+        if chave in item and item[chave] not in (None, ""):
+            return item[chave]
+    return None
+
+
+def _normalizar_par_mercado_aberto(item):
+    """Normaliza um underlying de Forex e rejeita explicitamente qualquer OTC."""
+    if not isinstance(item, dict):
+        return None
+
+    # Rejeição forte por flag e por texto: esta versão não negocia OTC.
+    if item.get("is_otc") is True or item.get("isOtc") is True:
+        return None
+
+    campos_texto = [
+        item.get(chave)
+        for chave in (
+            "ticker", "ticker_name", "tickerName", "display_name", "displayName",
+            "instrument_name", "instrumentName", "name", "symbol", "underlying",
+            "underlying_name", "underlyingName", "description", "type",
+            "instrument_type",
+        )
+    ]
+    texto = " ".join(str(x) for x in campos_texto if x not in (None, "")).upper()
+    if "OTC" in texto:
+        return None
+
+    active_id = _primeiro_valor(
+        item,
+        ("active_id", "activeId", "activeID", "asset_id", "assetId", "underlying_id"),
+    )
+    try:
+        active_id = int(active_id)
+    except (TypeError, ValueError):
+        return None
+
+    ticker = _primeiro_valor(
+        item,
+        ("ticker", "ticker_name", "tickerName", "symbol", "name", "underlying", "display_name"),
+    )
+    symbol = _primeiro_valor(
+        item,
+        ("symbol", "asset_name", "assetName", "underlying", "underlying_name", "name", "ticker"),
+    )
+
+    base = re.sub(r"[^A-Z]", "", str(ticker or symbol or "").upper())
+    if len(base) < 6:
+        return None
+    par = base[:6]
+    if par not in PARES_MERCADO_ABERTO:
+        return None
+
+    return {
+        "codigo": par,
+        "symbol": PARES_MERCADO_ABERTO[par],
+        "active_id": active_id,
+        "ticker": str(ticker or par).strip(),
+        "raw": item,
+    }
+
+
+def _extrair_mercado_aberto_da_resposta(resposta):
+    encontrados = {}
+    for item in _iter_dicts_recursivo(resposta):
+        normalizado = _normalizar_par_mercado_aberto(item)
+        if not normalizado:
+            continue
+        codigo = normalizado["codigo"]
+        atual = encontrados.get(codigo)
+        if atual is None:
+            encontrados[codigo] = normalizado
+            continue
+        # Prefere registro explicitamente visível/ativo quando houver duplicidade.
+        raw_novo = normalizado.get("raw") or {}
+        raw_atual = atual.get("raw") or {}
+        score_novo = int(raw_novo.get("is_visible") is True) + int(raw_novo.get("is_active") is True)
+        score_atual = int(raw_atual.get("is_visible") is True) + int(raw_atual.get("is_active") is True)
+        if score_novo > score_atual:
+            encontrados[codigo] = normalizado
+    return [encontrados[c] for c in PARES_MERCADO_ABERTO if c in encontrados]
+
+
+def _corpo_lista_instrumentos(nome):
+    if nome == "digital-option-instruments.get-underlying-list":
+        return {"type": "digital-option"}
+    return None
+
+
+def _consultar_lista_mercado_aberto(nome, versoes=("2.0", "1.0")):
+    ultimo_erro = None
+    body = _corpo_lista_instrumentos(nome)
+    for versao in versoes:
+        try:
+            resposta = _enviar_e_aguardar(nome, versao, body, timeout=12)
+            ativos = _extrair_mercado_aberto_da_resposta(resposta)
+            log(
+                f"[OPEN MARKET] {nome} v{versao}: "
+                f"{len(ativos)} par(es) normal(is) reconhecido(s)."
+            )
+            if ativos:
+                return resposta, ativos
+        except Exception as e:
+            ultimo_erro = e
+            log(f"[OPEN MARKET] Falha em {nome} v{versao}: {e}")
+    if ultimo_erro:
+        raise ultimo_erro
+    return None, []
+
+
+def _atualizar_ativos_mercado_aberto(ativos, origem):
+    global ATIVO_BULLEX
+    global ATIVOS
+    global _bullex_assets_detected
+    global _bullex_assets_last_error
+    global _bullex_assets_updated_at
+    global _bullex_assets_source
+
+    if not ativos:
+        raise RuntimeError("Nenhum par de mercado aberto foi encontrado na Traderoom.")
+
+    novos_bullex = {}
+    novos_ativos = {}
+    for item in ativos:
+        codigo = item["codigo"]
+        novos_bullex[codigo] = {
+            "symbol": item["symbol"],
+            "active_id": int(item["active_id"]),
+            "ticker": item["ticker"],
+        }
+        novos_ativos[codigo] = item["symbol"]
+
+    with _bullex_assets_lock:
+        ATIVO_BULLEX = novos_bullex
+        ATIVOS = novos_ativos
+        _bullex_assets_detected = True
+        _bullex_assets_last_error = None
+        _bullex_assets_updated_at = agora_brt().isoformat()
+        _bullex_assets_source = origem
+
+    estado["ativos_info"] = {
+        "tipo": "MERCADO_ABERTO",
+        "quantidade": len(novos_bullex),
+        "status": "AUTOMÁTICO",
+        "lista": ", ".join(
+            f"{cfg['ticker']} (id {cfg['active_id']})"
+            for cfg in novos_bullex.values()
+        ) or "-",
+    }
+    log(
+        "[OPEN MARKET] Ativos carregados: "
+        + ", ".join(
+            f"{cfg['ticker']}={cfg['active_id']}"
+            for cfg in novos_bullex.values()
+        )
+    )
+
+
+def _inicializar_ativos_mercado_aberto():
+    """Descobre somente Forex normal; se falhar, não usa fallback OTC."""
+    global _bullex_assets_last_error
+
+    fonte_digital = "digital-option-instruments.get-underlying-list"
+    try:
+        _, ativos = _consultar_lista_mercado_aberto(fonte_digital)
+        if not ativos:
+            raise RuntimeError("Lista digital não retornou os pares normais configurados.")
+        _atualizar_ativos_mercado_aberto(ativos, fonte_digital)
+        _assinar_candles_mercado_aberto()
+        log(f"[OPEN MARKET] Inicialização concluída com {len(ativos)} ativo(s).")
+        return
+    except Exception as e:
+        _bullex_assets_last_error = str(e)
+        log(f"[OPEN MARKET] Descoberta digital falhou: {e}")
+
+    # Diagnóstico adicional. Não transforma automaticamente IDs marginais em
+    # ativos de opção, para evitar enviar ordem com um identificador inadequado.
+    try:
+        nome_marginal = "marginal-forex-instruments.get-underlying-list"
+        _, diagnostico = _consultar_lista_mercado_aberto(nome_marginal)
+        if diagnostico:
+            log(
+                "[OPEN MARKET] A lista marginal reconheceu: "
+                + ", ".join(f"{x['ticker']}={x['active_id']}" for x in diagnostico)
+                + ". Mantidos apenas como diagnóstico; nenhuma ordem usa esses IDs."
+            )
+    except Exception as diag_e:
+        log(f"[OPEN MARKET] Diagnóstico marginal indisponível: {diag_e}")
+
+    # Sem fallback OTC por decisão explícita desta versão.
+    with _bullex_assets_lock:
+        ATIVO_BULLEX.clear()
+        ATIVOS.clear()
+    estado["ativos_info"] = {
+        "tipo": "MERCADO_ABERTO",
+        "quantidade": 0,
+        "status": "ERRO",
+        "lista": "-",
+        "erro": _bullex_assets_last_error,
+    }
+    log("[OPEN MARKET] Nenhum OTC será usado como fallback.")
+
+
+def _assinar_candles_mercado_aberto():
     """Assina 5M e 15M dos ativos usados pelo robô."""
     assinaturas = set()
 
@@ -3881,7 +4073,7 @@ Confirmação + RSI + ATR
 <div class="linha"><span>Modo</span><span class="valor">{{ estado.execucao.modo }}</span></div>
 <div class="linha"><span>Automática</span><span class="valor">{{ "ATIVA" if estado.execucao.automatica else "DESATIVADA" }}</span></div>
 <div class="linha"><span>Entrada atual</span><span class="valor">R$ {{ "%.2f"|format(estado.execucao.valor_atual) }}</span></div>
-<div class="linha"><span>Progressão</span><span class="valor">{{ estado.execucao.nivel_progressao + 1 }}/3</span></div>
+<div class="linha"><span>Progressão</span><span class="valor">DESATIVADA (R$ 5,00 FIXO)</span></div>
 <div class="linha"><span>Operação ativa</span><span class="valor">{{ "SIM" if estado.execucao.operacao_ativa else "NÃO" }}</span></div>
 <div class="linha"><span>Balance DEMO</span><span class="valor">{{ "ENCONTRADO" if estado.execucao.balance_id_disponivel else "AGUARDANDO" }}</span></div>
 <div class="linha"><span>Último erro</span><span class="valor">{{ estado.execucao.ultimo_erro or "-" }}</span></div>
@@ -4235,6 +4427,25 @@ def health():
             telegram_configurado(),
         "operacoes_pendentes":
             len(_operacoes_pendentes),
+        "entrada_fixa": 5.00,
+        "progressao_ativa": False,
+        "mercado": "ABERTO",
+        "ativos_mercado_aberto": {
+            "detectado": _bullex_assets_detected,
+            "quantidade": len(ATIVO_BULLEX),
+            "atualizado_em": _bullex_assets_updated_at,
+            "fonte": _bullex_assets_source,
+            "erro": _bullex_assets_last_error,
+            "ativos": [
+                {
+                    "codigo": codigo,
+                    "symbol": config["symbol"],
+                    "ticker": config["ticker"],
+                    "active_id": config["active_id"],
+                }
+                for codigo, config in ATIVO_BULLEX.items()
+            ],
+        },
         "estatisticas":
             calcular_estatisticas(),
     })
@@ -4246,8 +4457,8 @@ def health():
 
 _atualizar_estado_execucao()
 
-log(f"AUTO TRADE DEMO={'ATIVO' if BULLEX_AUTO_TRADE else 'DESATIVADO'} | entrada inicial=R${_valor_entrada_atual():.2f}")
-log(f"BULLEX_USER_BALANCE_ID={'CONFIGURADO' if BULLEX_USER_BALANCE_ID else 'AUTO-DESCOBERTA'}")
+log(f"AUTO TRADE DEMO={'ATIVO' if BULLEX_AUTO_TRADE else 'DESATIVADO'} | entrada fixa=R${_valor_entrada_atual():.2f} | progressao=DESATIVADA")
+log(f"BULLEX_USER_BALANCE_ID={'CONFIGURADO' if BULLEX_USER_BALANCE_ID else 'AUSENTE'}")
 
 log(
     f"VERSAO DO APP: {BULLEX_DIAGNOSTIC_VERSION} | "
