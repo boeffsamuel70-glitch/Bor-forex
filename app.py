@@ -110,7 +110,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OPEN-MARKET-DUAL-BINARY-DIGITAL-5-BRL-20260908-R8-7PARES"
+BULLEX_DIAGNOSTIC_VERSION = "OPEN-MARKET-DUAL-BINARY-DIGITAL-5-BRL-20260908-R9-LATE-GUARD"
 
 _bullex_diag = {
     "messages": 0,
@@ -691,7 +691,7 @@ def _buscar_instrumento(active_id, dt=None):
     for version, body in (("3.0", {"asset_id": int(active_id), "instrument_type": "digital"}),
                           ("2.0", {"asset_id": int(active_id)})):
         try:
-            resposta = _enviar_e_aguardar("digital-options.get-instruments", version, body, timeout=15)
+            resposta = _enviar_e_aguardar("digital-options.get-instruments", version, body, timeout=0.9)
             candidatos = [x for x in _extrair_instrumentos_recursivo(resposta, active_id)
                           if _instrumento_eh_5m(x, expected)]
             if not candidatos:
@@ -758,6 +758,26 @@ def _registrar_ordem_confirmada(symbol, ticker, sinal, valor, active_id, balance
         f"{symbol} {sinal} R${valor:.2f} id={option_id}"
     )
     return "CONFIRMADA"
+
+
+def _revalidar_janela_entrada(symbol, sinal, etapa):
+    """Revalida a janela de 5M imediatamente antes de qualquer envio de ordem."""
+    janela = _janela_execucao_5m()
+    atraso = float(janela["atraso_segundos"])
+
+    if not janela["permitida"]:
+        estado["execucao"]["ultimo_erro"] = (
+            f"Entrada bloqueada por atraso em {etapa}: "
+            f"{atraso:.3f}s > {MAX_ATRASO_ENTRADA_SEGUNDOS}s."
+        )
+        _atualizar_estado_execucao()
+        log(
+            f"[AUTO DUAL] ATRASADA antes de {etapa} - "
+            f"{symbol} {sinal} atraso={atraso:.3f}s; ordem NÃO enviada."
+        )
+        return None
+
+    return janela
 
 
 def executar_ordem_demo(symbol, sinal, resultado):
@@ -833,9 +853,17 @@ def executar_ordem_demo(symbol, sinal, resultado):
             "asset_id": active_id,
             "instrument_dir": _direcao_instrumento(sinal),
         }
+        janela_digital = _revalidar_janela_entrada(
+            symbol, sinal, "DIGITAL"
+        )
+        if janela_digital is None:
+            return "ATRASADA"
+        janela = janela_digital
+
         log(
             f"[AUTO DUAL] DIGITAL disponível: {symbol} instrument_id={instrument_id} "
-            f"index={instrument_index}. Enviando R${valor:.2f}."
+            f"index={instrument_index}. Enviando R${valor:.2f} | "
+            f"atraso={janela['atraso_segundos']:.3f}s."
         )
         try:
             with _bullex_diag_lock:
@@ -866,7 +894,14 @@ def executar_ordem_demo(symbol, sinal, resultado):
     else:
         log(f"[AUTO DUAL] DIGITAL 5M não disponível para {symbol}; verificando BINÁRIA.")
 
-    # 2) BINÁRIA: a própria resposta de open-option confirma disponibilidade/aceitação.
+    # 2) BINÁRIA: revalida a janela imediatamente antes do envio.
+    janela_binaria = _revalidar_janela_entrada(
+        symbol, sinal, "BINARIA"
+    )
+    if janela_binaria is None:
+        return "ATRASADA"
+    janela = janela_binaria
+
     body_binary = {
         "user_balance_id": int(balance_id),
         "active_id": active_id,
@@ -876,7 +911,11 @@ def executar_ordem_demo(symbol, sinal, resultado):
         "price": float(valor),
         "refund_value": 0,
     }
-    log(f"[AUTO DUAL] Tentando BINÁRIA: {symbol} {sinal} R${valor:.2f} active_id={active_id}.")
+    log(
+        f"[AUTO DUAL] Tentando BINÁRIA: {symbol} {sinal} "
+        f"R${valor:.2f} active_id={active_id} | "
+        f"atraso={janela['atraso_segundos']:.3f}s."
+    )
     try:
         with _bullex_diag_lock:
             _bullex_diag["orders_sent"] += 1
