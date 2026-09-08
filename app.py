@@ -1,6 +1,7 @@
 import os
 import time
 import threading
+import secrets
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import json
@@ -42,14 +43,16 @@ BULLEX_PROTOCOL = int(
     os.getenv("BULLEX_PROTOCOL", "3").strip() or "3"
 )
 
-# O HAR fornecido mostrou local_time=9087.
-# Deixamos configurável para não prender o valor ao código.
-try:
-    BULLEX_LOCAL_TIME = int(
-        os.getenv("BULLEX_LOCAL_TIME", "9087").strip()
-    )
-except ValueError:
-    BULLEX_LOCAL_TIME = 9087
+# R6: o navegador mostrou local_time variável entre autenticações
+# (ex.: 8869 e 7985). Nesta versão o valor é gerado dinamicamente
+# para cada authenticate. A variável antiga BULLEX_LOCAL_TIME pode
+# permanecer no Render, mas não é usada na autenticação R6.
+BULLEX_LOCAL_TIME_LEGACY = os.getenv("BULLEX_LOCAL_TIME", "").strip()
+
+
+def _gerar_local_time_auth():
+    # Faixa de 4 dígitos observada nas capturas do navegador.
+    return 1000 + secrets.randbelow(9000)
 
 BULLEX_USER_AGENT = os.getenv(
     "BULLEX_USER_AGENT",
@@ -105,7 +108,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OPEN-MARKET-DUAL-BINARY-DIGITAL-5-BRL-20260908-R5-DIAG"
+BULLEX_DIAGNOSTIC_VERSION = "OPEN-MARKET-DUAL-BINARY-DIGITAL-5-BRL-20260908-R6-AUTH-DYNAMIC"
 
 _bullex_diag = {
     "messages": 0,
@@ -512,17 +515,20 @@ def _auth_body():
 
 def _next_request_id():
     """
-    Gera request_id no formato observado no HAR:
-    <unix_seconds>_<numero>.
+    Gera request_id no padrão observado na Traderoom:
+    <unix_seconds>_<numero_grande_variavel>.
+
+    Exemplos capturados no navegador tinham sufixos de 9-10 dígitos.
     """
 
+    # Mantém um contador interno apenas para compatibilidade/diagnóstico,
+    # mas o sufixo enviado segue o formato grande e variável do navegador.
     global _bullex_request_counter
-
     with _bullex_request_lock:
         _bullex_request_counter += 1
-        contador = _bullex_request_counter
 
-    return f"{int(time.time())}_{contador}"
+    sufixo = 100_000_000 + secrets.randbelow(1_900_000_000)
+    return f"{int(time.time())}_{sufixo}"
 
 
 def _montar_auth_message():
@@ -532,7 +538,7 @@ def _montar_auth_message():
     {
       "name": "authenticate",
       "request_id": "...",
-      "local_time": 9087,
+      "local_time": <dinamico>,
       "msg": {
         "ssid": "...",
         "protocol": 3,
@@ -551,7 +557,7 @@ def _montar_auth_message():
     return {
         "name": "authenticate",
         "request_id": _next_request_id(),
-        "local_time": BULLEX_LOCAL_TIME,
+        "local_time": _gerar_local_time_auth(),
         "msg": {
             "ssid": BULLEX_SSID,
             "protocol": BULLEX_PROTOCOL,
@@ -1514,7 +1520,7 @@ def _on_bullex_open(ws):
             "Autenticacao WebSocket enviada "
             f"(request_id={_bullex_auth_request_id}, "
             f"protocol={BULLEX_PROTOCOL}, "
-            f"local_time={BULLEX_LOCAL_TIME})."
+            f"local_time={auth['local_time']})."
         )
 
     except Exception as e:
