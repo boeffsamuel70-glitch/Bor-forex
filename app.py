@@ -108,7 +108,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OPEN-MARKET-DUAL-BINARY-DIGITAL-5-BRL-20260908-R6-AUTH-DYNAMIC"
+BULLEX_DIAGNOSTIC_VERSION = "OPEN-MARKET-DUAL-BINARY-DIGITAL-5-BRL-20260908-R7-22H-15H-AUTO"
 
 _bullex_diag = {
     "messages": 0,
@@ -140,8 +140,8 @@ TZ = ZoneInfo(TIMEZONE)
 OUTPUTSIZE = 150
 OUTPUTSIZE_15M = 100
 
-HORA_INICIO = 4
-HORA_FIM = 22
+HORA_INICIO = 22
+HORA_FIM = 15
 
 MAX_ATRASO_MINUTOS = 8
 
@@ -151,7 +151,7 @@ MAX_ATRASO_MINUTOS = 8
 
 BULLEX_AUTO_TRADE = os.getenv(
     "BULLEX_AUTO_TRADE",
-    "false"
+    "true"
 ).strip().lower() in ("1", "true", "yes", "sim", "on")
 
 BULLEX_USER_BALANCE_ID = os.getenv(
@@ -3838,12 +3838,13 @@ def processar_ativo(
 def dentro_do_horario():
     hora = agora_brt().hour
 
-    return (
-        HORA_INICIO
-        <= hora
-        <
-        HORA_FIM
-    )
+    if HORA_INICIO < HORA_FIM:
+        return HORA_INICIO <= hora < HORA_FIM
+
+    if HORA_INICIO > HORA_FIM:
+        return hora >= HORA_INICIO or hora < HORA_FIM
+
+    return True
 
 
 # ============================================================
