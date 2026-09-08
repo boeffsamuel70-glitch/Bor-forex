@@ -105,7 +105,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OPEN-MARKET-AUTO-FIXED-5-BRL-20260908-R2"
+BULLEX_DIAGNOSTIC_VERSION = "OPEN-MARKET-DUAL-BINARY-DIGITAL-5-BRL-20260908-R3"
 
 _bullex_diag = {
     "messages": 0,
@@ -137,8 +137,8 @@ TZ = ZoneInfo(TIMEZONE)
 OUTPUTSIZE = 150
 OUTPUTSIZE_15M = 100
 
-HORA_INICIO = 20
-HORA_FIM = 15
+HORA_INICIO = 4
+HORA_FIM = 22
 
 MAX_ATRASO_MINUTOS = 8
 
@@ -699,64 +699,90 @@ def _direcao_instrumento(sinal):
     return "call" if sinal == "CALL" else "put"
 
 
+def _resposta_indica_indisponibilidade_produto(resposta):
+    texto = json.dumps(resposta, ensure_ascii=False).lower() if isinstance(resposta, dict) else str(resposta).lower()
+    termos = (
+        "not available", "unavailable", "closed", "market is closed",
+        "purchasing options is over", "time for purchasing", "4104",
+        "instrument not found", "instrument unavailable", "asset is closed",
+        "option is closed", "not tradable", "temporarily unavailable",
+    )
+    return any(t in texto for t in termos)
+
+
+def _registrar_ordem_confirmada(symbol, ticker, sinal, valor, active_id, balance_id,
+                                produto, resposta, janela, instrument_id=None,
+                                instrument_index=None):
+    global _operacao_global_ativa
+
+    candle_open_dt = datetime.fromtimestamp(janela["candle_open"], TZ)
+    candle_close_dt = datetime.fromtimestamp(janela["candle_close"], TZ)
+    msg = resposta.get("msg") if isinstance(resposta, dict) else None
+    option_id = msg.get("id") if isinstance(msg, dict) else None
+
+    _operacao_global_ativa = {
+        "symbol": symbol,
+        "ticker": ticker,
+        "sinal": sinal,
+        "valor": valor,
+        "asset_id": active_id,
+        "balance_id": str(balance_id),
+        "produto": produto,
+        "option_id": option_id,
+        "instrument_id": instrument_id,
+        "instrument_index": instrument_index,
+        "expired": int(janela["candle_close"]),
+        "expiracao": candle_close_dt.isoformat(),
+        "candle_open": candle_open_dt.isoformat(),
+        "atraso_segundos": round(float(janela["atraso_segundos"]), 3),
+        "fonte_horario": janela["source"],
+        "enviada_em": agora_brt().isoformat(),
+        "resultado": "PENDENTE",
+        "response": resposta,
+    }
+    estado["execucao"]["ultima_ordem"] = _operacao_global_ativa.copy()
+    estado["execucao"]["ultimo_erro"] = None
+    _atualizar_estado_execucao()
+    log(
+        f"[AUTO DUAL] ORDEM CONFIRMADA via {produto}: "
+        f"{symbol} {sinal} R${valor:.2f} id={option_id}"
+    )
+    return "CONFIRMADA"
+
+
 def executar_ordem_demo(symbol, sinal, resultado):
+    """Executa em Digital quando houver instrumento 5M; senão tenta Binária.
+
+    Nunca envia a segunda rota após uma confirmação da primeira. Se Digital
+    existir mas for rejeitada por indisponibilidade de produto, Binária é
+    tentada. Erros de saldo/autenticação não provocam uma segunda tentativa.
+    """
     global _operacao_global_ativa
     global _bullex_last_error
 
     if not BULLEX_AUTO_TRADE:
         return None
-
     if not BULLEX_USER_BALANCE_ID:
-        estado["execucao"]["ultimo_erro"] = (
-            "SEM_BALANCE_ID: configure BULLEX_USER_BALANCE_ID."
-        )
+        estado["execucao"]["ultimo_erro"] = "SEM_BALANCE_ID: configure BULLEX_USER_BALANCE_ID."
         _atualizar_estado_execucao()
-        log(
-            "[AUTO TRADE] BULLEX_USER_BALANCE_ID vazio. "
-            "Ordem nao enviada (SEM_BALANCE_ID)."
-        )
+        log("[AUTO DUAL] BULLEX_USER_BALANCE_ID vazio. Ordem não enviada.")
         return "SEM_BALANCE_ID"
-
     if sinal not in ("CALL", "PUT"):
         return None
 
     with _execucao_lock:
-        if (
-            UMA_OPERACAO_GLOBAL
-            and _operacao_global_ativa is not None
-        ):
-            log(
-                "[AUTO DEMO] Ordem bloqueada: "
-                "já existe operação global ativa em "
-                f"{_operacao_global_ativa.get('symbol')}."
-            )
+        if UMA_OPERACAO_GLOBAL and _operacao_global_ativa is not None:
+            log(f"[AUTO DUAL] Bloqueada: operação global ativa em {_operacao_global_ativa.get('symbol')}.")
             return "BLOQUEADA_GLOBAL"
 
     balance_id = _obter_balance_id()
-
     if not balance_id:
-        estado["execucao"]["ultimo_erro"] = (
-            "SEM_BALANCE_ID: configure BULLEX_USER_BALANCE_ID."
-        )
-        _atualizar_estado_execucao()
-
-        log(
-            "[AUTO TRADE] BULLEX_USER_BALANCE_ID vazio. "
-            "Ordem nao enviada (SEM_BALANCE_ID)."
-        )
-
         return "SEM_BALANCE_ID"
 
-    config = next(
-        (
-            cfg
-            for cfg in ATIVO_BULLEX.values()
-            if cfg["symbol"] == symbol
-        ),
-        None,
-    )
-
+    config = next((cfg for cfg in ATIVO_BULLEX.values() if cfg["symbol"] == symbol), None)
     if not config:
+        estado["execucao"]["ultimo_erro"] = f"SEM_ATIVO: active_id não carregado para {symbol}."
+        _atualizar_estado_execucao()
         return "SEM_ATIVO"
 
     active_id = int(config["active_id"])
@@ -765,50 +791,73 @@ def executar_ordem_demo(symbol, sinal, resultado):
 
     janela = _janela_execucao_5m()
     atraso = float(janela["atraso_segundos"])
-
-    # Evita enviar exatamente no instante 00.000 da nova vela.
-    # A Bullex pode ainda estar liberando a nova janela de compra.
     if atraso < DELAY_MINIMO_ENTRADA_SEGUNDOS:
-        espera = DELAY_MINIMO_ENTRADA_SEGUNDOS - atraso
-        log(
-            f"[AUTO DEMO V4] Aguardando {espera:.3f}s "
-            "para liberação técnica da nova vela."
-        )
-        time.sleep(espera)
-
-        # Recalcula após a espera para garantir que continuamos
-        # dentro da janela máxima de 3 segundos.
+        time.sleep(DELAY_MINIMO_ENTRADA_SEGUNDOS - atraso)
         janela = _janela_execucao_5m()
         atraso = float(janela["atraso_segundos"])
 
-    candle_open_dt = datetime.fromtimestamp(
-        janela["candle_open"],
-        TZ,
-    )
-    candle_close_dt = datetime.fromtimestamp(
-        janela["candle_close"],
-        TZ,
-    )
-
     if not janela["permitida"]:
         estado["execucao"]["ultimo_erro"] = (
-            "Entrada bloqueada por atraso: "
-            f"{atraso:.3f}s > "
-            f"{MAX_ATRASO_ENTRADA_SEGUNDOS}s."
+            f"Entrada bloqueada por atraso: {atraso:.3f}s > {MAX_ATRASO_ENTRADA_SEGUNDOS}s."
         )
-
         _atualizar_estado_execucao()
-
-        log(
-            "[AUTO DEMO] ATRASADA - ordem NÃO enviada | "
-            f"{symbol} {sinal} | atraso={atraso:.3f}s | "
-            f"vela={candle_open_dt.strftime('%H:%M:%S')} -> "
-            f"{candle_close_dt.strftime('%H:%M:%S')}"
-        )
-
+        log(f"[AUTO DUAL] ATRASADA - {symbol} {sinal} atraso={atraso:.3f}s")
         return "ATRASADA"
 
-    body = {
+    # 1) DIGITAL: disponibilidade é comprovada pela existência de instrumento 5M.
+    instrumento = None
+    try:
+        log(f"[AUTO DUAL] Verificando DIGITAL 5M para {symbol} active_id={active_id}.")
+        instrumento = _buscar_instrumento(active_id, _instrument_time())
+    except Exception as e:
+        log(f"[AUTO DUAL] Falha ao verificar DIGITAL para {symbol}: {e}")
+
+    if instrumento:
+        instrument_id = instrumento["instrument_id"]
+        instrument_index = instrumento.get("instrument_index")
+        body_digital = {
+            "user_balance_id": str(balance_id),
+            "instrument_id": instrument_id,
+            "amount": str(valor),
+            "instrument_index": instrument_index,
+            "asset_id": active_id,
+            "instrument_dir": _direcao_instrumento(sinal),
+        }
+        log(
+            f"[AUTO DUAL] DIGITAL disponível: {symbol} instrument_id={instrument_id} "
+            f"index={instrument_index}. Enviando R${valor:.2f}."
+        )
+        try:
+            with _bullex_diag_lock:
+                _bullex_diag["orders_sent"] += 1
+            resposta = _enviar_e_aguardar(
+                "digital-options.place-digital-option", "3.0", body_digital, timeout=15
+            )
+            if _ordem_option_confirmada(resposta):
+                with _bullex_diag_lock:
+                    _bullex_diag["orders_confirmed"] += 1
+                return _registrar_ordem_confirmada(
+                    symbol, ticker, sinal, valor, active_id, balance_id,
+                    "DIGITAL", resposta, janela, instrument_id, instrument_index
+                )
+
+            if not _resposta_indica_indisponibilidade_produto(resposta):
+                with _bullex_diag_lock:
+                    _bullex_diag["orders_errors"] += 1
+                estado["execucao"]["ultimo_erro"] = _mensagem_erro_ordem(resposta) or str(resposta)
+                _atualizar_estado_execucao()
+                log("[AUTO DUAL] DIGITAL rejeitada por erro que não é disponibilidade; Binária não será tentada.")
+                return "SEM_CONFIRMACAO"
+
+            log("[AUTO DUAL] DIGITAL indisponível para este par/janela; tentando BINÁRIA.")
+        except Exception as e:
+            _bullex_last_error = str(e)
+            log(f"[AUTO DUAL] DIGITAL falhou: {e}. Tentando BINÁRIA como fallback de disponibilidade.")
+    else:
+        log(f"[AUTO DUAL] DIGITAL 5M não disponível para {symbol}; verificando BINÁRIA.")
+
+    # 2) BINÁRIA: a própria resposta de open-option confirma disponibilidade/aceitação.
+    body_binary = {
         "user_balance_id": int(balance_id),
         "active_id": active_id,
         "option_type_id": 3,
@@ -817,126 +866,37 @@ def executar_ordem_demo(symbol, sinal, resultado):
         "price": float(valor),
         "refund_value": 0,
     }
-
-    log(
-        "[AUTO DEMO V4] Enviando ordem: "
-        f"{symbol} ({ticker}) {sinal} "
-        f"valor={valor:.2f} "
-        f"atraso={atraso:.3f}s "
-        f"expira={candle_close_dt.strftime('%H:%M:%S')} "
-        f"fonte_horario={janela['source']}"
-    )
-
-    log(
-        "[AUTO DEMO V4] body="
-        + json.dumps(
-            body,
-            ensure_ascii=False,
-        )
-    )
-
+    log(f"[AUTO DUAL] Tentando BINÁRIA: {symbol} {sinal} R${valor:.2f} active_id={active_id}.")
     try:
         with _bullex_diag_lock:
             _bullex_diag["orders_sent"] += 1
-
-        resposta = _enviar_e_aguardar(
-            "binary-options.open-option",
-            "1.0",
-            body,
-            timeout=20,
-        )
-
-        sucesso = _ordem_option_confirmada(
-            resposta
-        )
-
-        if not sucesso:
+        resposta = _enviar_e_aguardar("binary-options.open-option", "1.0", body_binary, timeout=20)
+        if _ordem_option_confirmada(resposta):
             with _bullex_diag_lock:
-                _bullex_diag["orders_errors"] += 1
-
-            mensagem = _mensagem_erro_ordem(
-                resposta
+                _bullex_diag["orders_confirmed"] += 1
+            return _registrar_ordem_confirmada(
+                symbol, ticker, sinal, valor, active_id, balance_id,
+                "BINARIA", resposta, janela
             )
-
-            estado["execucao"]["ultimo_erro"] = (
-                mensagem
-                or f"Ordem não confirmada: {resposta}"
-            )
-
-            _atualizar_estado_execucao()
-
-            log(
-                "[AUTO DEMO V4] Ordem não confirmada: "
-                + json.dumps(
-                    resposta,
-                    ensure_ascii=False,
-                )
-            )
-
-            return "SEM_CONFIRMACAO"
 
         with _bullex_diag_lock:
-            _bullex_diag["orders_confirmed"] += 1
-
-        msg = resposta.get("msg")
-        option_id = None
-
-        if isinstance(msg, dict):
-            option_id = msg.get("id")
-
-        _operacao_global_ativa = {
-            "symbol": symbol,
-            "ticker": ticker,
-            "sinal": sinal,
-            "valor": valor,
-            "asset_id": active_id,
-            "balance_id": str(balance_id),
-            "option_id": option_id,
-            "option_type_id": 3,
-            "expired": int(janela["candle_close"]),
-            "expiracao": candle_close_dt.isoformat(),
-            "candle_open": candle_open_dt.isoformat(),
-            "atraso_segundos": round(atraso, 3),
-            "fonte_horario": janela["source"],
-            "enviada_em": agora_brt().isoformat(),
-            "resultado": "PENDENTE",
-            "response": resposta,
-        }
-
-        estado["execucao"]["ultima_ordem"] = (
-            _operacao_global_ativa.copy()
-        )
-
-        estado["execucao"]["ultimo_erro"] = None
-
+            _bullex_diag["orders_errors"] += 1
+        mensagem = _mensagem_erro_ordem(resposta)
+        estado["execucao"]["ultimo_erro"] = mensagem or f"Binária não confirmada: {resposta}"
         _atualizar_estado_execucao()
-
-        log(
-            "[AUTO DEMO V4] ORDEM CONFIRMADA: "
-            f"{symbol} {sinal} "
-            f"R${valor:.2f} "
-            f"id={option_id} "
-            f"expira={candle_close_dt.strftime('%H:%M:%S')}"
-        )
-
-        return "CONFIRMADA"
-
+        if _resposta_indica_indisponibilidade_produto(resposta):
+            log(f"[AUTO DUAL] BINÁRIA também indisponível para {symbol}; nenhuma ordem aberta.")
+            return "PRODUTOS_INDISPONIVEIS"
+        log(f"[AUTO DUAL] BINÁRIA não confirmada: {resposta}")
+        return "SEM_CONFIRMACAO"
     except Exception as e:
         with _bullex_diag_lock:
             _bullex_diag["orders_errors"] += 1
-
         _bullex_last_error = str(e)
         estado["execucao"]["ultimo_erro"] = str(e)
-
         _atualizar_estado_execucao()
-
-        log(
-            "[AUTO DEMO V4] ERRO ao enviar ordem: "
-            f"{e}"
-        )
-
+        log(f"[AUTO DUAL] ERRO BINÁRIA: {e}")
         return "ERRO"
-
 
 def _atualizar_progressao(resultado):
     global _nivel_progressao
@@ -1190,6 +1150,31 @@ def _armazenar_candles_resposta(active_id, msg):
                 _armazenar_candle_ws(active_id, size, item)
 
 
+def _pos_auth_inicializacao():
+    """Inicializa balance/ativos após uma pequena janela de estabilização.
+
+    O atraso também serve como diagnóstico: se o servidor fechar o socket
+    antes deste ponto, sabemos que nenhum comando pós-auth provocou o close.
+    """
+    time.sleep(1.25)
+
+    if not _bullex_connected or not _bullex_authenticated:
+        log(
+            "[POS-AUTH] Socket fechou antes do primeiro comando pós-login; "
+            "nenhuma consulta de ativos foi enviada nesta conexão."
+        )
+        return
+
+    log("[POS-AUTH] Sessão estável por 1.25s; iniciando balance e descoberta de ativos.")
+    _solicitar_balance_id_demo()
+
+    if not _bullex_connected or not _bullex_authenticated:
+        log("[POS-AUTH] Socket fechou antes da descoberta de ativos.")
+        return
+
+    _inicializar_ativos_mercado_aberto()
+
+
 def _on_bullex_message(ws, raw_message):
     global _bullex_last_error
     global _bullex_authenticated
@@ -1268,15 +1253,9 @@ def _on_bullex_message(ws, raw_message):
             log("Autenticacao Bullex confirmada.")
 
         threading.Thread(
-            target=_solicitar_balance_id_demo,
+            target=_pos_auth_inicializacao,
             daemon=True,
-            name="bullex-balance",
-        ).start()
-
-        threading.Thread(
-            target=_inicializar_ativos_mercado_aberto,
-            daemon=True,
-            name="bullex-open-market-assets",
+            name="bullex-pos-auth",
         ).start()
         return
 
@@ -1981,6 +1960,10 @@ def _enviar_e_aguardar(
         )
 
     try:
+        log(
+            f"[WS SEND] primeiro/seguinte comando pós-auth: {nome} "
+            f"v{version} request_id={request_id}"
+        )
         ws.send(
             json.dumps(
                 payload,
@@ -3243,6 +3226,7 @@ def registrar_operacao(
             "instrument_id": info.get("instrument_id"),
             "instrument_index": info.get("instrument_index"),
             "balance_id": info.get("balance_id"),
+            "produto": info.get("produto"),
         })
 
     _operacoes_pendentes[symbol] = operacao
