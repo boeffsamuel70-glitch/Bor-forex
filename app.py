@@ -110,7 +110,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OPEN-MARKET-BINARY-ONLY-5-BRL-20260908-R11-BEST-SIGNAL-8W5L"
+BULLEX_DIAGNOSTIC_VERSION = "OPEN-MARKET-BINARY-ONLY-5-BRL-20260908-R12-MULTI-STRATEGY-10W10L"
 
 _bullex_diag = {
     "messages": 0,
@@ -209,6 +209,9 @@ estado = {
         "lateral": "-",
         "atr": "-",
         "bloqueio": "-",
+        "regime": "-",
+        "estrategia": "-",
+        "zona_fibonacci": "-",
     },
 
     "estatisticas": {
@@ -238,12 +241,13 @@ _robo_started = False
 _ultimos_sinais_telegram = {}
 _operacoes_pendentes = {}
 _ultimas_operacoes_registradas = {}
-# Base histórica consolidada até antes da R11:
-# 13 operações decididas = 8 WIN / 5 LOSS = 61,54%.
-# Novos resultados serão acrescentados a esta lista.
+# Base histórica consolidada antes da versão multi-estratégia:
+# 20 operações decididas = 10 WIN / 10 LOSS = 50,00%.
+# A base antiga não tinha identificação de estratégia.
+# Novos resultados serão acrescentados com estratégia e regime.
 _historico_resultados = (
-    [{"resultado": "WIN", "origem": "BASE_ANTES_R11"} for _ in range(8)]
-    + [{"resultado": "LOSS", "origem": "BASE_ANTES_R11"} for _ in range(5)]
+    [{"resultado": "WIN", "origem": "BASE_ANTES_R12", "estrategia": "BASE"} for _ in range(10)]
+    + [{"resultado": "LOSS", "origem": "BASE_ANTES_R12", "estrategia": "BASE"} for _ in range(10)]
 )
 _execucao_lock = threading.RLock()
 _operacao_global_ativa = None
@@ -3062,6 +3066,391 @@ def analisar_pullback(
 
 
 # ============================================================
+# MULTI-ESTRATÉGIA / REGIME DE MERCADO
+# ============================================================
+
+def _resultado_base_multi(candles_5m, candles_15m, estrategia, regime):
+    c = closes(candles_5m)
+    preco = c[-1] if c else 0.0
+    return {
+        "sinal": "AGUARDAR",
+        "score": 0,
+        "preco": preco,
+        "vela": candles_5m[-1]["_dt"] if candles_5m else None,
+        "rsi": rsi(c, 14) if len(c) >= 15 else None,
+        "ema5": ema(c, 5) if len(c) >= 5 else None,
+        "ema13": ema(c, 13) if len(c) >= 13 else None,
+        "ema21": ema(c, 21) if len(c) >= 21 else None,
+        "atr": atr(candles_5m, 14) if len(candles_5m) >= 15 else None,
+        "score_call": 0,
+        "score_put": 0,
+        "pullback": "NÃO",
+        "rejeicao": "NÃO",
+        "tendencia": tendencia_timeframe(candles_5m) if len(candles_5m) >= 20 else "NEUTRA",
+        "tendencia_5m": tendencia_timeframe(candles_5m) if len(candles_5m) >= 20 else "NEUTRA",
+        "tendencia_15m": tendencia_timeframe(candles_15m) if len(candles_15m) >= 20 else "NEUTRA",
+        "lateral": "-",
+        "bloqueio": "Sem setup.",
+        "mensagem": "AGUARDAR",
+        "estrategia": estrategia,
+        "regime": regime,
+        "zona_fibonacci": "-",
+    }
+
+
+def _detectar_regime(candles_5m, candles_15m):
+    c = closes(candles_5m)
+    preco = c[-1]
+    ema5_v = ema(c, 5)
+    ema13_v = ema(c, 13)
+    ema21_v = ema(c, 21)
+    atr14 = atr(candles_5m, 14)
+
+    t5 = tendencia_timeframe(candles_5m)
+    t15 = tendencia_timeframe(candles_15m)
+    lateral = mercado_lateral(preco, ema5_v, ema13_v, ema21_v, atr14)
+
+    # Mercado lateral tem prioridade: estratégia de tendência fica desligada.
+    if lateral or (t5 == "NEUTRA" and t15 == "NEUTRA"):
+        return "LATERAL"
+
+    # Tendência alinhada: o seletor decide entre Fibonacci e pullback por EMA.
+    if t5 == t15 and t5 in ("ALTA", "BAIXA"):
+        return "TENDENCIA"
+
+    # Sem alinhamento suficiente para operar.
+    return "TRANSICAO"
+
+
+def _fib_setup_info(candles_5m, direcao):
+    """Detecta impulso recente e zona 50%-61,8% no 5M.
+
+    Usa somente velas já fechadas. A vela atual é confirmação; as duas
+    anteriores podem ser a retração.
+    """
+    if len(candles_5m) < 30:
+        return None
+
+    janela = candles_5m[-18:-1]
+    atr14 = atr(candles_5m, 14)
+    if not atr14 or atr14 <= 0:
+        return None
+
+    infos = [candle_info(x) for x in janela]
+    lows = [x["low"] for x in infos]
+    highs = [x["high"] for x in infos]
+
+    if direcao == "CALL":
+        idx_low = min(range(len(lows)), key=lows.__getitem__)
+        # O topo do impulso precisa vir depois do fundo.
+        candidatos_high = list(range(idx_low + 1, len(highs)))
+        if not candidatos_high:
+            return None
+        idx_high = max(candidatos_high, key=lambda i: highs[i])
+        fundo = lows[idx_low]
+        topo = highs[idx_high]
+        impulso = topo - fundo
+        if impulso < atr14 * 1.6:
+            return None
+
+        fib50 = topo - impulso * 0.50
+        fib618 = topo - impulso * 0.618
+        zona_low, zona_high = min(fib50, fib618), max(fib50, fib618)
+
+        pb1 = candle_info(candles_5m[-2])
+        pb2 = candle_info(candles_5m[-3])
+        toque1 = pb1["low"] <= zona_high and pb1["high"] >= zona_low
+        toque2 = pb2["low"] <= zona_high and pb2["high"] >= zona_low
+        pb = pb1 if toque1 else pb2 if toque2 else None
+        if pb is None:
+            return None
+
+        conf = candle_info(candles_5m[-1])
+        confirmada = (
+            conf["close"] > conf["open"]
+            and conf["close"] > pb["high"]
+            and conf["body_ratio"] >= 0.35
+        )
+        return {
+            "direcao": "CALL",
+            "impulso": impulso,
+            "fib50": fib50,
+            "fib618": fib618,
+            "zona_low": zona_low,
+            "zona_high": zona_high,
+            "pullback": True,
+            "confirmada": confirmada,
+        }
+
+    idx_high = max(range(len(highs)), key=highs.__getitem__)
+    candidatos_low = list(range(idx_high + 1, len(lows)))
+    if not candidatos_low:
+        return None
+    idx_low = min(candidatos_low, key=lambda i: lows[i])
+    topo = highs[idx_high]
+    fundo = lows[idx_low]
+    impulso = topo - fundo
+    if impulso < atr14 * 1.6:
+        return None
+
+    fib50 = fundo + impulso * 0.50
+    fib618 = fundo + impulso * 0.618
+    zona_low, zona_high = min(fib50, fib618), max(fib50, fib618)
+
+    pb1 = candle_info(candles_5m[-2])
+    pb2 = candle_info(candles_5m[-3])
+    toque1 = pb1["low"] <= zona_high and pb1["high"] >= zona_low
+    toque2 = pb2["low"] <= zona_high and pb2["high"] >= zona_low
+    pb = pb1 if toque1 else pb2 if toque2 else None
+    if pb is None:
+        return None
+
+    conf = candle_info(candles_5m[-1])
+    confirmada = (
+        conf["close"] < conf["open"]
+        and conf["close"] < pb["low"]
+        and conf["body_ratio"] >= 0.35
+    )
+    return {
+        "direcao": "PUT",
+        "impulso": impulso,
+        "fib50": fib50,
+        "fib618": fib618,
+        "zona_low": zona_low,
+        "zona_high": zona_high,
+        "pullback": True,
+        "confirmada": confirmada,
+    }
+
+
+def analisar_fibonacci_pullback(candles_5m, candles_15m):
+    resultado = _resultado_base_multi(
+        candles_5m, candles_15m, "FIBONACCI_PULLBACK", "TENDENCIA"
+    )
+
+    t5 = resultado["tendencia_5m"]
+    t15 = resultado["tendencia_15m"]
+    if t5 != t15 or t5 not in ("ALTA", "BAIXA"):
+        resultado["bloqueio"] = "Fibonacci exige tendência 5M e 15M alinhadas."
+        resultado["mensagem"] = "AGUARDAR | tendência não alinhada para Fibonacci."
+        return resultado
+
+    direcao = "CALL" if t5 == "ALTA" else "PUT"
+    fib = _fib_setup_info(candles_5m, direcao)
+    if fib is None:
+        resultado["bloqueio"] = "Sem retração válida na zona Fibonacci 50%-61,8%."
+        resultado["mensagem"] = "AGUARDAR | sem setup Fibonacci."
+        return resultado
+
+    conf = candle_info(candles_5m[-1])
+    atr14 = resultado["atr"]
+    preco = resultado["preco"]
+
+    score = 0
+    score += 3  # 5M alinhado
+    score += 2  # 15M alinhado
+    score += 3  # toque 50%-61,8%
+    if fib["confirmada"]:
+        score += 3
+    if conf["body_ratio"] >= 0.50:
+        score += 1
+
+    resultado["pullback"] = "FIB 50%-61,8%"
+    resultado["rejeicao"] = "CONFIRMADA" if fib["confirmada"] else "NÃO"
+    resultado["zona_fibonacci"] = (
+        f"{fib['zona_low']:.5f} - {fib['zona_high']:.5f}"
+    )
+    resultado["lateral"] = "NÃO"
+
+    # Evita impulso pequeno demais ou volatilidade anormal.
+    atr_ok = bool(atr14 and preco and 0.00008 <= atr14 / preco <= 0.0040)
+
+    if direcao == "CALL":
+        resultado["score_call"] = score
+        resultado["score_put"] = 1
+    else:
+        resultado["score_put"] = score
+        resultado["score_call"] = 1
+
+    resultado["score"] = score
+
+    if not atr_ok:
+        resultado["bloqueio"] = "ATR fora da faixa ideal para Fibonacci."
+    elif not fib["confirmada"]:
+        resultado["bloqueio"] = "Tocou Fibonacci, mas faltou confirmação."
+    elif score < 10:
+        resultado["bloqueio"] = "Setup Fibonacci abaixo da qualidade mínima."
+    else:
+        resultado["sinal"] = direcao
+        resultado["bloqueio"] = "SINAL"
+        resultado["mensagem"] = (
+            f"{direcao} | Fibonacci 50%-61,8% + confirmação | score={score}/12"
+        )
+
+    return resultado
+
+
+def analisar_lateral_rejeicao(candles_5m, candles_15m):
+    resultado = _resultado_base_multi(
+        candles_5m, candles_15m, "LATERAL_REJEICAO", "LATERAL"
+    )
+
+    if len(candles_5m) < 30:
+        resultado["bloqueio"] = "Poucas velas para faixa lateral."
+        return resultado
+
+    c = closes(candles_5m)
+    preco = c[-1]
+    atr14 = resultado["atr"]
+    ema5_v = resultado["ema5"]
+    ema13_v = resultado["ema13"]
+    ema21_v = resultado["ema21"]
+
+    lateral = mercado_lateral(preco, ema5_v, ema13_v, ema21_v, atr14)
+    resultado["lateral"] = "SIM" if lateral else "NÃO"
+
+    if not lateral:
+        resultado["bloqueio"] = "Mercado não está lateral."
+        resultado["mensagem"] = "AGUARDAR | estratégia lateral desativada."
+        return resultado
+
+    # Faixa recente sem usar a vela de confirmação.
+    faixa = [candle_info(x) for x in candles_5m[-21:-1]]
+    suporte = min(x["low"] for x in faixa)
+    resistencia = max(x["high"] for x in faixa)
+    largura = resistencia - suporte
+
+    if not atr14 or largura < atr14 * 2.2 or largura > atr14 * 7.0:
+        resultado["bloqueio"] = "Faixa lateral sem largura adequada."
+        return resultado
+
+    conf = candle_info(candles_5m[-1])
+    tolerancia = atr14 * 0.30
+
+    perto_suporte = conf["low"] <= suporte + tolerancia
+    perto_resistencia = conf["high"] >= resistencia - tolerancia
+
+    rejeicao_call = (
+        perto_suporte
+        and conf["close"] > conf["open"]
+        and conf["lower_wick"] >= conf["body"] * 0.7
+        and conf["close"] > suporte + largura * 0.12
+    )
+    rejeicao_put = (
+        perto_resistencia
+        and conf["close"] < conf["open"]
+        and conf["upper_wick"] >= conf["body"] * 0.7
+        and conf["close"] < resistencia - largura * 0.12
+    )
+
+    score_call = 0
+    score_put = 0
+
+    if perto_suporte:
+        score_call += 4
+    if rejeicao_call:
+        score_call += 5
+    if resultado["tendencia_15m"] in ("NEUTRA", "ALTA"):
+        score_call += 1
+    if conf["body_ratio"] >= 0.25:
+        score_call += 1
+
+    if perto_resistencia:
+        score_put += 4
+    if rejeicao_put:
+        score_put += 5
+    if resultado["tendencia_15m"] in ("NEUTRA", "BAIXA"):
+        score_put += 1
+    if conf["body_ratio"] >= 0.25:
+        score_put += 1
+
+    resultado["score_call"] = score_call
+    resultado["score_put"] = score_put
+    resultado["score"] = max(score_call, score_put)
+    resultado["pullback"] = "FAIXA LATERAL"
+    resultado["rejeicao"] = (
+        "CONFIRMADA" if (rejeicao_call or rejeicao_put) else "NÃO"
+    )
+
+    # Conservador: só opera a borda da faixa, nunca o meio.
+    if rejeicao_call and score_call >= 10:
+        resultado["sinal"] = "CALL"
+        resultado["bloqueio"] = "SINAL"
+        resultado["mensagem"] = (
+            f"CALL | rejeição no suporte lateral | score={score_call}/11"
+        )
+    elif rejeicao_put and score_put >= 10:
+        resultado["sinal"] = "PUT"
+        resultado["bloqueio"] = "SINAL"
+        resultado["mensagem"] = (
+            f"PUT | rejeição na resistência lateral | score={score_put}/11"
+        )
+    else:
+        resultado["bloqueio"] = "Lateral, mas sem rejeição forte na borda."
+        resultado["mensagem"] = "AGUARDAR | sem rejeição lateral válida."
+
+    return resultado
+
+
+def analisar_multi_estrategia(candles_5m, candles_15m):
+    """Seleciona UMA estratégia conforme o regime atual do mercado."""
+    regime = _detectar_regime(candles_5m, candles_15m)
+
+    if regime == "LATERAL":
+        return analisar_lateral_rejeicao(candles_5m, candles_15m)
+
+    if regime == "TENDENCIA":
+        # Fibonacci recebe prioridade quando existe impulso + retração na zona.
+        t5 = tendencia_timeframe(candles_5m)
+        direcao = "CALL" if t5 == "ALTA" else "PUT"
+        fib = _fib_setup_info(candles_5m, direcao)
+
+        if fib is not None:
+            return analisar_fibonacci_pullback(candles_5m, candles_15m)
+
+        resultado = analisar_pullback(candles_5m, candles_15m)
+        resultado["estrategia"] = "TENDENCIA_PULLBACK"
+        resultado["regime"] = "TENDENCIA"
+        resultado["zona_fibonacci"] = "-"
+        return resultado
+
+    # Transição/desalinhamento: não força estratégia.
+    resultado = _resultado_base_multi(
+        candles_5m, candles_15m, "SEM_ESTRATEGIA", "TRANSICAO"
+    )
+    resultado["bloqueio"] = "Mercado em transição; nenhuma estratégia habilitada."
+    resultado["mensagem"] = "AGUARDAR | regime de transição."
+    return resultado
+
+
+def calcular_estatisticas_por_estrategia():
+    saida = {}
+    for item in _historico_resultados:
+        estrategia = item.get("estrategia", "BASE")
+        if estrategia == "BASE":
+            continue
+        bloco = saida.setdefault(
+            estrategia,
+            {"total": 0, "wins": 0, "losses": 0, "dojis": 0, "taxa": 0.0}
+        )
+        bloco["total"] += 1
+        if item.get("resultado") == "WIN":
+            bloco["wins"] += 1
+        elif item.get("resultado") == "LOSS":
+            bloco["losses"] += 1
+        elif item.get("resultado") == "DOJI":
+            bloco["dojis"] += 1
+
+    for bloco in saida.values():
+        decididos = bloco["wins"] + bloco["losses"]
+        bloco["taxa"] = round(
+            bloco["wins"] / decididos * 100 if decididos else 0.0,
+            2
+        )
+    return saida
+
+
+# ============================================================
 # ESTATÍSTICAS
 # ============================================================
 
@@ -3235,6 +3624,8 @@ def enviar_sinal_telegram(
         f"Ativo: {symbol}\n"
         f"Direcao: {sinal}\n"
         f"Score: {resultado.get('score', 0)}\n"
+        f"Estrategia: {resultado.get('estrategia', '-')}\n"
+        f"Regime: {resultado.get('regime', '-')}\n"
         f"Preco: {fmt(resultado.get('preco'))}\n"
         f"Vela analisada: "
         f"{vela.strftime('%Y-%m-%d %H:%M:%S BRT')}\n\n"
@@ -3311,6 +3702,8 @@ def registrar_operacao(
         "symbol": symbol,
         "sinal": sinal,
         "score": resultado.get("score", 0),
+        "estrategia": resultado.get("estrategia", "TENDENCIA_PULLBACK"),
+        "regime": resultado.get("regime", "-"),
         "preco_sinal": float(resultado["preco"]),
         "vela_sinal": vela_sinal,
         "vela_entrada": vela_entrada,
@@ -3497,6 +3890,8 @@ def enviar_resultado_telegram(
         f"{emoji} RESULTADO DA OPERACAO\n\n"
         f"Ativo: {operacao['symbol']}\n"
         f"Direcao: {operacao['sinal']}\n"
+        f"Estrategia: {operacao.get('estrategia', '-')}\n"
+        f"Regime: {operacao.get('regime', '-')}\n"
         f"Resultado: {resultado}\n\n"
         f"Entrada: {fmt(operacao.get('entrada'))}\n"
         f"Saida: {fmt(operacao.get('saida'))}\n"
@@ -3664,7 +4059,7 @@ def processar_ativo(
             )
             return
 
-        resultado = analisar_pullback(
+        resultado = analisar_multi_estrategia(
             fechadas_5m,
             fechadas_15m
         )
@@ -3806,11 +4201,28 @@ def processar_ativo(
                 "bloqueio",
                 "-"
             ),
+
+            "regime": resultado.get(
+                "regime",
+                "-"
+            ),
+
+            "estrategia": resultado.get(
+                "estrategia",
+                "-"
+            ),
+
+            "zona_fibonacci": resultado.get(
+                "zona_fibonacci",
+                "-"
+            ),
         }
 
         log(
             f"{symbol} -> "
             f"{resultado['sinal']} | "
+            f"estrategia={resultado.get('estrategia', '-')} | "
+            f"regime={resultado.get('regime', '-')} | "
             f"score="
             f"{resultado['score']} | "
             f"CALL="
@@ -4376,8 +4788,7 @@ Robo Forex Pullback PRO
 
 <div class="subtitulo">
 
-5M + 15M + Pullback +
-Confirmação + RSI + ATR
+Multi-estratégia: Tendência + Fibonacci + Lateral
 
 </div>
 
@@ -4448,6 +4859,21 @@ Confirmação + RSI + ATR
 <h3>
 Filtros da entrada
 </h3>
+
+<div class="linha">
+<span>Regime</span>
+<span class="valor">{{ estado.detalhes.regime }}</span>
+</div>
+
+<div class="linha">
+<span>Estratégia escolhida</span>
+<span class="valor">{{ estado.detalhes.estrategia }}</span>
+</div>
+
+<div class="linha">
+<span>Zona Fibonacci</span>
+<span class="valor">{{ estado.detalhes.zona_fibonacci }}</span>
+</div>
 
 <div class="linha">
 <span>Tendência 5M</span>
@@ -4761,6 +5187,8 @@ def health():
         },
         "estatisticas":
             calcular_estatisticas(),
+        "estatisticas_por_estrategia":
+            calcular_estatisticas_por_estrategia(),
     })
 
 
