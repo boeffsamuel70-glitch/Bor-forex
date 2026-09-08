@@ -71,10 +71,12 @@ ATIVO_BULLEX = {}
 
 PARES_MERCADO_ABERTO = {
     "EURUSD": "EUR/USD",
-    "EURJPY": "EUR/JPY",
     "GBPUSD": "GBP/USD",
     "USDJPY": "USD/JPY",
     "GBPJPY": "GBP/JPY",
+    "AUDUSD": "AUD/USD",
+    "USDCAD": "USD/CAD",
+    "AUDJPY": "AUD/JPY",
 }
 
 _bullex_assets_lock = threading.RLock()
@@ -108,7 +110,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OPEN-MARKET-DUAL-BINARY-DIGITAL-5-BRL-20260908-R7-22H-15H-AUTO"
+BULLEX_DIAGNOSTIC_VERSION = "OPEN-MARKET-DUAL-BINARY-DIGITAL-5-BRL-20260908-R8-7PARES"
 
 _bullex_diag = {
     "messages": 0,
@@ -171,10 +173,12 @@ UMA_OPERACAO_GLOBAL = True
 
 ATIVOS = {
     "EURUSD": "EUR/USD",
-    "EURJPY": "EUR/JPY",
     "GBPUSD": "GBP/USD",
     "USDJPY": "USD/JPY",
     "GBPJPY": "GBP/JPY",
+    "AUDUSD": "AUD/USD",
+    "USDCAD": "USD/CAD",
+    "AUDJPY": "AUD/JPY",
 }
 
 # ============================================================
