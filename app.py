@@ -105,7 +105,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OPEN-MARKET-DUAL-BINARY-DIGITAL-5-BRL-20260908-R3"
+BULLEX_DIAGNOSTIC_VERSION = "OPEN-MARKET-DUAL-BINARY-DIGITAL-5-BRL-20260908-R4"
 
 _bullex_diag = {
     "messages": 0,
@@ -1150,29 +1150,94 @@ def _armazenar_candles_resposta(active_id, msg):
                 _armazenar_candle_ws(active_id, size, item)
 
 
-def _pos_auth_inicializacao():
-    """Inicializa balance/ativos após uma pequena janela de estabilização.
+def _aguardar_probe_pos_auth(request_id, nome, version, timeout=8):
+    """Espera a resposta do primeiro comando enviado dentro do callback auth.
 
-    O atraso também serve como diagnóstico: se o servidor fechar o socket
-    antes deste ponto, sabemos que nenhum comando pós-auth provocou o close.
+    O envio ocorre de forma síncrona dentro de ``authenticated`` para testar
+    se a Traderoom exige uma inicialização imediata. A espera precisa ficar
+    fora do callback para não bloquear o recebimento das respostas do socket.
     """
-    time.sleep(1.25)
+    limite = time.time() + timeout
+    resposta = None
 
-    if not _bullex_connected or not _bullex_authenticated:
-        log(
-            "[POS-AUTH] Socket fechou antes do primeiro comando pós-login; "
-            "nenhuma consulta de ativos foi enviada nesta conexão."
-        )
+    with _bullex_cv:
+        while time.time() < limite:
+            resposta = _bullex_response_store.pop(str(request_id), None)
+            if resposta is not None:
+                break
+
+            if not _bullex_connected:
+                break
+
+            restante = limite - time.time()
+            if restante <= 0:
+                break
+            _bullex_cv.wait(timeout=min(0.25, restante))
+
+    if resposta is None:
+        if not _bullex_connected:
+            log(
+                f"[POS-AUTH IMEDIATO] Socket fechou após envio de {nome} "
+                f"v{version} request_id={request_id}, antes da resposta."
+            )
+        else:
+            log(
+                f"[POS-AUTH IMEDIATO] Timeout aguardando {nome} "
+                f"v{version} request_id={request_id}."
+            )
         return
 
-    log("[POS-AUTH] Sessão estável por 1.25s; iniciando balance e descoberta de ativos.")
-    _solicitar_balance_id_demo()
+    ativos = _extrair_mercado_aberto_da_resposta(resposta)
+    log(
+        f"[POS-AUTH IMEDIATO] Resposta recebida de {nome} v{version}: "
+        f"{len(ativos)} par(es) normal(is) reconhecido(s)."
+    )
 
-    if not _bullex_connected or not _bullex_authenticated:
-        log("[POS-AUTH] Socket fechou antes da descoberta de ativos.")
-        return
+    if ativos:
+        try:
+            _atualizar_ativos_mercado_aberto(ativos, f"{nome} v{version} IMEDIATO")
+            _assinar_candles_mercado_aberto()
+            log(
+                f"[OPEN MARKET] Inicialização imediata concluída com "
+                f"{len(ativos)} ativo(s)."
+            )
+            return
+        except Exception as e:
+            log(f"[POS-AUTH IMEDIATO] Falha ao aplicar ativos: {e}")
 
-    _inicializar_ativos_mercado_aberto()
+    # Se a primeira resposta vier sem os pares esperados, a rotina normal
+    # tenta as versões/filtros alternativos, desde que o socket continue vivo.
+    if _bullex_connected and _bullex_authenticated:
+        _inicializar_ativos_mercado_aberto()
+
+
+def _enviar_primeiro_comando_no_authenticated(ws):
+    """Envia a primeira consulta ainda dentro do callback authenticated."""
+    nome = "digital-option-instruments.get-underlying-list"
+    version = "2.0"
+    body = {"type": "digital-option"}
+    payload = _montar_send_message(nome, version, body)
+    request_id = str(payload["request_id"])
+
+    with _bullex_cv:
+        _bullex_response_store.pop(request_id, None)
+
+    log(
+        f"[POS-AUTH IMEDIATO] ENVIANDO dentro de authenticated: "
+        f"{nome} v{version} request_id={request_id}"
+    )
+    ws.send(json.dumps(payload, separators=(",", ":")))
+    log(
+        f"[POS-AUTH IMEDIATO] ENVIO CONCLUÍDO: {nome} "
+        f"request_id={request_id}"
+    )
+
+    threading.Thread(
+        target=_aguardar_probe_pos_auth,
+        args=(request_id, nome, version),
+        daemon=True,
+        name="bullex-pos-auth-probe",
+    ).start()
 
 
 def _on_bullex_message(ws, raw_message):
@@ -1252,11 +1317,20 @@ def _on_bullex_message(ws, raw_message):
         else:
             log("Autenticacao Bullex confirmada.")
 
+        # Balance por variável de ambiente não envia comando ao servidor.
         threading.Thread(
-            target=_pos_auth_inicializacao,
+            target=_solicitar_balance_id_demo,
             daemon=True,
-            name="bullex-pos-auth",
+            name="bullex-balance",
         ).start()
+
+        # R4: o primeiro comando pós-login é enviado IMEDIATAMENTE, ainda
+        # dentro deste callback. Isso testa se a Bullex exige inicialização
+        # antes de encerrar a sessão autenticada.
+        try:
+            _enviar_primeiro_comando_no_authenticated(ws)
+        except Exception as e:
+            log(f"[POS-AUTH IMEDIATO] Falha ao enviar primeiro comando: {e}")
         return
 
     if _mensagem_indica_auth_erro(data):
