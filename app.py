@@ -110,7 +110,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OPEN-MARKET-DUAL-BINARY-DIGITAL-5-BRL-20260908-R9-LATE-GUARD"
+BULLEX_DIAGNOSTIC_VERSION = "OPEN-MARKET-BINARY-ONLY-5-BRL-20260908-R10-BASE-5W3L"
 
 _bullex_diag = {
     "messages": 0,
@@ -238,7 +238,13 @@ _robo_started = False
 _ultimos_sinais_telegram = {}
 _operacoes_pendentes = {}
 _ultimas_operacoes_registradas = {}
-_historico_resultados = []
+# Base histórica preservada antes da versão somente Binária:
+# 8 operações decididas = 5 WIN / 3 LOSS = 62,50%.
+# Novos resultados serão acrescentados a esta lista.
+_historico_resultados = (
+    [{"resultado": "WIN", "origem": "BASE_ANTES_BINARY_ONLY"} for _ in range(5)]
+    + [{"resultado": "LOSS", "origem": "BASE_ANTES_BINARY_ONLY"} for _ in range(3)]
+)
 _execucao_lock = threading.RLock()
 _operacao_global_ativa = None
 _nivel_progressao = 0
@@ -781,37 +787,49 @@ def _revalidar_janela_entrada(symbol, sinal, etapa):
 
 
 def executar_ordem_demo(symbol, sinal, resultado):
-    """Executa em Digital quando houver instrumento 5M; senão tenta Binária.
+    """Executa somente em Opção Binária.
 
-    Nunca envia a segunda rota após uma confirmação da primeira. Se Digital
-    existir mas for rejeitada por indisponibilidade de produto, Binária é
-    tentada. Erros de saldo/autenticação não provocam uma segunda tentativa.
+    A modalidade Digital foi removida para reduzir latência no caminho crítico.
+    A ordem só é enviada se ainda estiver dentro dos primeiros
+    MAX_ATRASO_ENTRADA_SEGUNDOS da nova vela de 5 minutos.
     """
     global _operacao_global_ativa
     global _bullex_last_error
 
     if not BULLEX_AUTO_TRADE:
         return None
+
     if not BULLEX_USER_BALANCE_ID:
-        estado["execucao"]["ultimo_erro"] = "SEM_BALANCE_ID: configure BULLEX_USER_BALANCE_ID."
+        estado["execucao"]["ultimo_erro"] = (
+            "SEM_BALANCE_ID: configure BULLEX_USER_BALANCE_ID."
+        )
         _atualizar_estado_execucao()
-        log("[AUTO DUAL] BULLEX_USER_BALANCE_ID vazio. Ordem não enviada.")
+        log("[AUTO BINARIA] BULLEX_USER_BALANCE_ID vazio. Ordem não enviada.")
         return "SEM_BALANCE_ID"
+
     if sinal not in ("CALL", "PUT"):
         return None
 
     with _execucao_lock:
         if UMA_OPERACAO_GLOBAL and _operacao_global_ativa is not None:
-            log(f"[AUTO DUAL] Bloqueada: operação global ativa em {_operacao_global_ativa.get('symbol')}.")
+            log(
+                "[AUTO BINARIA] Bloqueada: operação global ativa em "
+                f"{_operacao_global_ativa.get('symbol')}."
+            )
             return "BLOQUEADA_GLOBAL"
 
     balance_id = _obter_balance_id()
     if not balance_id:
         return "SEM_BALANCE_ID"
 
-    config = next((cfg for cfg in ATIVO_BULLEX.values() if cfg["symbol"] == symbol), None)
+    config = next(
+        (cfg for cfg in ATIVO_BULLEX.values() if cfg["symbol"] == symbol),
+        None,
+    )
     if not config:
-        estado["execucao"]["ultimo_erro"] = f"SEM_ATIVO: active_id não carregado para {symbol}."
+        estado["execucao"]["ultimo_erro"] = (
+            f"SEM_ATIVO: active_id não carregado para {symbol}."
+        )
         _atualizar_estado_execucao()
         return "SEM_ATIVO"
 
@@ -819,88 +837,21 @@ def executar_ordem_demo(symbol, sinal, resultado):
     ticker = config.get("ticker")
     valor = _valor_entrada_atual()
 
+    # Primeira checagem da janela.
     janela = _janela_execucao_5m()
     atraso = float(janela["atraso_segundos"])
+
+    # Evita envio exatamente em 00.000, quando a nova janela pode
+    # ainda estar sendo liberada pela Bullex.
     if atraso < DELAY_MINIMO_ENTRADA_SEGUNDOS:
         time.sleep(DELAY_MINIMO_ENTRADA_SEGUNDOS - atraso)
-        janela = _janela_execucao_5m()
-        atraso = float(janela["atraso_segundos"])
 
-    if not janela["permitida"]:
-        estado["execucao"]["ultimo_erro"] = (
-            f"Entrada bloqueada por atraso: {atraso:.3f}s > {MAX_ATRASO_ENTRADA_SEGUNDOS}s."
-        )
-        _atualizar_estado_execucao()
-        log(f"[AUTO DUAL] ATRASADA - {symbol} {sinal} atraso={atraso:.3f}s")
+    # Revalidação obrigatória imediatamente antes da Binária.
+    janela = _revalidar_janela_entrada(symbol, sinal, "BINARIA")
+    if janela is None:
         return "ATRASADA"
 
-    # 1) DIGITAL: disponibilidade é comprovada pela existência de instrumento 5M.
-    instrumento = None
-    try:
-        log(f"[AUTO DUAL] Verificando DIGITAL 5M para {symbol} active_id={active_id}.")
-        instrumento = _buscar_instrumento(active_id, _instrument_time())
-    except Exception as e:
-        log(f"[AUTO DUAL] Falha ao verificar DIGITAL para {symbol}: {e}")
-
-    if instrumento:
-        instrument_id = instrumento["instrument_id"]
-        instrument_index = instrumento.get("instrument_index")
-        body_digital = {
-            "user_balance_id": str(balance_id),
-            "instrument_id": instrument_id,
-            "amount": str(valor),
-            "instrument_index": instrument_index,
-            "asset_id": active_id,
-            "instrument_dir": _direcao_instrumento(sinal),
-        }
-        janela_digital = _revalidar_janela_entrada(
-            symbol, sinal, "DIGITAL"
-        )
-        if janela_digital is None:
-            return "ATRASADA"
-        janela = janela_digital
-
-        log(
-            f"[AUTO DUAL] DIGITAL disponível: {symbol} instrument_id={instrument_id} "
-            f"index={instrument_index}. Enviando R${valor:.2f} | "
-            f"atraso={janela['atraso_segundos']:.3f}s."
-        )
-        try:
-            with _bullex_diag_lock:
-                _bullex_diag["orders_sent"] += 1
-            resposta = _enviar_e_aguardar(
-                "digital-options.place-digital-option", "3.0", body_digital, timeout=15
-            )
-            if _ordem_option_confirmada(resposta):
-                with _bullex_diag_lock:
-                    _bullex_diag["orders_confirmed"] += 1
-                return _registrar_ordem_confirmada(
-                    symbol, ticker, sinal, valor, active_id, balance_id,
-                    "DIGITAL", resposta, janela, instrument_id, instrument_index
-                )
-
-            if not _resposta_indica_indisponibilidade_produto(resposta):
-                with _bullex_diag_lock:
-                    _bullex_diag["orders_errors"] += 1
-                estado["execucao"]["ultimo_erro"] = _mensagem_erro_ordem(resposta) or str(resposta)
-                _atualizar_estado_execucao()
-                log("[AUTO DUAL] DIGITAL rejeitada por erro que não é disponibilidade; Binária não será tentada.")
-                return "SEM_CONFIRMACAO"
-
-            log("[AUTO DUAL] DIGITAL indisponível para este par/janela; tentando BINÁRIA.")
-        except Exception as e:
-            _bullex_last_error = str(e)
-            log(f"[AUTO DUAL] DIGITAL falhou: {e}. Tentando BINÁRIA como fallback de disponibilidade.")
-    else:
-        log(f"[AUTO DUAL] DIGITAL 5M não disponível para {symbol}; verificando BINÁRIA.")
-
-    # 2) BINÁRIA: revalida a janela imediatamente antes do envio.
-    janela_binaria = _revalidar_janela_entrada(
-        symbol, sinal, "BINARIA"
-    )
-    if janela_binaria is None:
-        return "ATRASADA"
-    janela = janela_binaria
+    atraso = float(janela["atraso_segundos"])
 
     body_binary = {
         "user_balance_id": int(balance_id),
@@ -911,40 +862,67 @@ def executar_ordem_demo(symbol, sinal, resultado):
         "price": float(valor),
         "refund_value": 0,
     }
+
     log(
-        f"[AUTO DUAL] Tentando BINÁRIA: {symbol} {sinal} "
+        f"[AUTO BINARIA] Enviando: {symbol} {sinal} "
         f"R${valor:.2f} active_id={active_id} | "
-        f"atraso={janela['atraso_segundos']:.3f}s."
+        f"atraso={atraso:.3f}s."
     )
+
     try:
         with _bullex_diag_lock:
             _bullex_diag["orders_sent"] += 1
-        resposta = _enviar_e_aguardar("binary-options.open-option", "1.0", body_binary, timeout=20)
+
+        resposta = _enviar_e_aguardar(
+            "binary-options.open-option",
+            "1.0",
+            body_binary,
+            timeout=20,
+        )
+
         if _ordem_option_confirmada(resposta):
             with _bullex_diag_lock:
                 _bullex_diag["orders_confirmed"] += 1
+
             return _registrar_ordem_confirmada(
-                symbol, ticker, sinal, valor, active_id, balance_id,
-                "BINARIA", resposta, janela
+                symbol,
+                ticker,
+                sinal,
+                valor,
+                active_id,
+                balance_id,
+                "BINARIA",
+                resposta,
+                janela,
             )
 
         with _bullex_diag_lock:
             _bullex_diag["orders_errors"] += 1
+
         mensagem = _mensagem_erro_ordem(resposta)
-        estado["execucao"]["ultimo_erro"] = mensagem or f"Binária não confirmada: {resposta}"
+        estado["execucao"]["ultimo_erro"] = (
+            mensagem or f"Binária não confirmada: {resposta}"
+        )
         _atualizar_estado_execucao()
+
         if _resposta_indica_indisponibilidade_produto(resposta):
-            log(f"[AUTO DUAL] BINÁRIA também indisponível para {symbol}; nenhuma ordem aberta.")
-            return "PRODUTOS_INDISPONIVEIS"
-        log(f"[AUTO DUAL] BINÁRIA não confirmada: {resposta}")
+            log(
+                f"[AUTO BINARIA] BINÁRIA indisponível para {symbol}; "
+                "nenhuma ordem aberta."
+            )
+            return "PRODUTO_INDISPONIVEL"
+
+        log(f"[AUTO BINARIA] Ordem não confirmada: {resposta}")
         return "SEM_CONFIRMACAO"
+
     except Exception as e:
         with _bullex_diag_lock:
             _bullex_diag["orders_errors"] += 1
+
         _bullex_last_error = str(e)
         estado["execucao"]["ultimo_erro"] = str(e)
         _atualizar_estado_execucao()
-        log(f"[AUTO DUAL] ERRO BINÁRIA: {e}")
+        log(f"[AUTO BINARIA] ERRO ao enviar ordem: {e}")
         return "ERRO"
 
 def _atualizar_progressao(resultado):
