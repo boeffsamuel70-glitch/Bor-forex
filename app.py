@@ -105,7 +105,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OPEN-MARKET-DUAL-BINARY-DIGITAL-5-BRL-20260908-R4"
+BULLEX_DIAGNOSTIC_VERSION = "OPEN-MARKET-DUAL-BINARY-DIGITAL-5-BRL-20260908-R5-DIAG"
 
 _bullex_diag = {
     "messages": 0,
@@ -1297,12 +1297,22 @@ def _on_bullex_message(ws, raw_message):
         log(
             f"[DIAG WS] name={nome} request_id={request_id} "
             f"active_id={active_id} size={size} "
-            f"msg_type={type(msg).__name__} keys={list(data.keys())[:12]}"
+            f"msg_type={type(msg).__name__} msg_value={msg!r} "
+            f"client_session_id_present={bool(data.get('client_session_id'))} "
+            f"keys={list(data.keys())[:12]}"
         )
 
     # ========================================================
     # AUTENTICAÇÃO
     # ========================================================
+
+    if nome == "authenticated":
+        log(
+            "[AUTH DIAG] "
+            f"msg={msg!r} | "
+            f"request_id={request_id!r} | "
+            f"client_session_id_present={bool(data.get('client_session_id'))}"
+        )
 
     if _mensagem_indica_auth_sucesso(data):
         _bullex_authenticated = True
