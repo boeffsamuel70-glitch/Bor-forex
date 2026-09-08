@@ -110,7 +110,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OPEN-MARKET-BINARY-ONLY-5-BRL-20260908-R10-BASE-5W3L"
+BULLEX_DIAGNOSTIC_VERSION = "OPEN-MARKET-BINARY-ONLY-5-BRL-20260908-R11-BEST-SIGNAL-8W5L"
 
 _bullex_diag = {
     "messages": 0,
@@ -238,12 +238,12 @@ _robo_started = False
 _ultimos_sinais_telegram = {}
 _operacoes_pendentes = {}
 _ultimas_operacoes_registradas = {}
-# Base histórica preservada antes da versão somente Binária:
-# 8 operações decididas = 5 WIN / 3 LOSS = 62,50%.
+# Base histórica consolidada até antes da R11:
+# 13 operações decididas = 8 WIN / 5 LOSS = 61,54%.
 # Novos resultados serão acrescentados a esta lista.
 _historico_resultados = (
-    [{"resultado": "WIN", "origem": "BASE_ANTES_BINARY_ONLY"} for _ in range(5)]
-    + [{"resultado": "LOSS", "origem": "BASE_ANTES_BINARY_ONLY"} for _ in range(3)]
+    [{"resultado": "WIN", "origem": "BASE_ANTES_R11"} for _ in range(8)]
+    + [{"resultado": "LOSS", "origem": "BASE_ANTES_R11"} for _ in range(5)]
 )
 _execucao_lock = threading.RLock()
 _operacao_global_ativa = None
@@ -3513,12 +3513,46 @@ def enviar_resultado_telegram(
 
 
 # ============================================================
+# FINALIZAR OPERAÇÕES VENCIDAS ANTES DE PROCURAR NOVOS SINAIS
+# ============================================================
+
+def finalizar_operacoes_vencidas_antes_da_leitura():
+    """Libera a trava global antes de analisar a nova vela.
+
+    Isso evita perder um sinal de outro par só porque a operação anterior
+    ainda seria finalizada mais tarde na ordem do loop dos ativos.
+    """
+    if not _operacoes_pendentes:
+        return
+
+    pendentes = list(_operacoes_pendentes.keys())
+
+    for symbol in pendentes:
+        try:
+            candles_5m = obter_candles(
+                symbol,
+                TIMEFRAME,
+                OUTPUTSIZE
+            )
+            avaliar_operacao(
+                symbol,
+                candles_5m
+            )
+        except Exception as e:
+            log(
+                f"[TRAVA] Não foi possível avaliar operação pendente de "
+                f"{symbol} antes da nova leitura: {e}"
+            )
+
+
+# ============================================================
 # PROCESSAR ATIVO
 # ============================================================
 
 def processar_ativo(
     chave,
-    symbol
+    symbol,
+    executar_sinal=True
 ):
     inicio_processamento = time.time()
 
@@ -3799,6 +3833,8 @@ def processar_ativo(
             f"{resultado.get('bloqueio', '-')}"
         )
 
+        candidato = None
+
         if resultado["sinal"] in (
             "CALL",
             "PUT"
@@ -3810,26 +3846,38 @@ def processar_ativo(
                 f"atraso_na_vela={janela_diag['atraso_segundos']:.3f}s"
             )
 
-            # CAMINHO CRÍTICO:
-            # primeiro tenta registrar/enviar a ordem automática.
-            # Telegram fica fora do caminho crítico para não consumir
-            # a janela máxima de 3 segundos.
-            registrar_operacao(
-                symbol,
-                resultado,
-                fechadas_5m
-            )
+            candidato = {
+                "chave": chave,
+                "symbol": symbol,
+                "resultado": resultado,
+                "candles": fechadas_5m,
+                "score": int(resultado.get("score", 0) or 0),
+                "margem_score": abs(
+                    int(resultado.get("score_call", 0) or 0)
+                    - int(resultado.get("score_put", 0) or 0)
+                ),
+                "atraso": float(janela_diag["atraso_segundos"]),
+            }
 
-            threading.Thread(
-                target=enviar_sinal_telegram,
-                args=(symbol, resultado),
-                daemon=True,
-                name=f"telegram-sinal-{chave}",
-            ).start()
+            if executar_sinal:
+                registrar_operacao(
+                    symbol,
+                    resultado,
+                    fechadas_5m
+                )
+
+                threading.Thread(
+                    target=enviar_sinal_telegram,
+                    args=(symbol, resultado),
+                    daemon=True,
+                    name=f"telegram-sinal-{chave}",
+                ).start()
 
         estado[
             "estatisticas"
         ] = calcular_estatisticas()
+
+        return candidato
 
     except Exception as e:
         log(
@@ -3930,11 +3978,76 @@ def executar_leitura():
 
         return
 
+    # 1) Primeiro apura a operação anterior e libera a trava, se já venceu.
+    finalizar_operacoes_vencidas_antes_da_leitura()
+
+    # 2) Analisa TODOS os pares antes de decidir qual ordem enviar.
+    candidatos = []
+
     for chave, symbol in ATIVOS.items():
-        processar_ativo(
+        candidato = processar_ativo(
             chave,
-            symbol
+            symbol,
+            executar_sinal=False
         )
+        if candidato is not None:
+            candidatos.append(candidato)
+
+    # 3) Se houver vários sinais na mesma vela, executa apenas o melhor.
+    if candidatos:
+        # Prioridade:
+        #   1. maior score total;
+        #   2. maior diferença entre score CALL e PUT;
+        #   3. menor atraso;
+        #   4. nome do ativo apenas para desempate determinístico.
+        candidatos.sort(
+            key=lambda c: (
+                -c["score"],
+                -c["margem_score"],
+                c["atraso"],
+                c["symbol"],
+            )
+        )
+
+        melhor = candidatos[0]
+
+        if len(candidatos) > 1:
+            log(
+                "[SELECAO] Sinais válidos desta vela: "
+                + ", ".join(
+                    f"{c['symbol']}={c['resultado']['sinal']}"
+                    f"(score={c['score']})"
+                    for c in candidatos
+                )
+            )
+
+        log(
+            f"[SELECAO] Melhor sinal: {melhor['symbol']} "
+            f"{melhor['resultado']['sinal']} | "
+            f"score={melhor['score']} | "
+            f"margem={melhor['margem_score']} | "
+            f"atraso={melhor['atraso']:.3f}s"
+        )
+
+        registrar_operacao(
+            melhor["symbol"],
+            melhor["resultado"],
+            melhor["candles"]
+        )
+
+        threading.Thread(
+            target=enviar_sinal_telegram,
+            args=(melhor["symbol"], melhor["resultado"]),
+            daemon=True,
+            name=f"telegram-sinal-{melhor['chave']}",
+        ).start()
+
+        for descartado in candidatos[1:]:
+            log(
+                f"[SELECAO] {descartado['symbol']} "
+                f"{descartado['resultado']['sinal']} não executado: "
+                "houve sinal melhor na mesma vela."
+            )
 
     estado[
         "estatisticas"
