@@ -79,6 +79,8 @@ _bullex_assets_detected = False
 _bullex_assets_last_error = None
 _bullex_assets_updated_at = None
 _bullex_assets_source = None
+_bullex_assets_ready_event = threading.Event()
+_bullex_assets_init_lock = threading.Lock()
 
 _BULLEX_CANDLE_SIZES = {"5min": 300, "15min": 900}
 
@@ -103,7 +105,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OPEN-MARKET-AUTO-FIXED-5-BRL-20260907"
+BULLEX_DIAGNOSTIC_VERSION = "OPEN-MARKET-AUTO-FIXED-5-BRL-20260908-R2"
 
 _bullex_diag = {
     "messages": 0,
@@ -1382,8 +1384,13 @@ def _on_bullex_message(ws, raw_message):
 def _on_bullex_error(ws, error):
     global _bullex_last_error
 
-    _bullex_last_error = str(error)
-    log(f"Bullex WebSocket erro: {error}")
+    texto_erro = str(error)
+    if "closed normally" in texto_erro.lower() or "code 1000" in texto_erro.lower():
+        _bullex_last_error = None
+        log(f"Bullex WebSocket encerrou normalmente; reconexão automática será feita: {error}")
+    else:
+        _bullex_last_error = texto_erro
+        log(f"Bullex WebSocket erro: {error}")
 
     with _bullex_cv:
         _bullex_cv.notify_all()
@@ -1806,6 +1813,7 @@ def _atualizar_ativos_mercado_aberto(ativos, origem):
         _bullex_assets_last_error = None
         _bullex_assets_updated_at = agora_brt().isoformat()
         _bullex_assets_source = origem
+        _bullex_assets_ready_event.set()
 
     estado["ativos_info"] = {
         "tipo": "MERCADO_ABERTO",
@@ -1826,49 +1834,103 @@ def _atualizar_ativos_mercado_aberto(ativos, origem):
 
 
 def _inicializar_ativos_mercado_aberto():
-    """Descobre somente Forex normal; se falhar, não usa fallback OTC."""
+    """Descobre somente Forex normal; se falhar, não usa fallback OTC.
+
+    A inicialização é serializada para impedir duas descobertas concorrentes
+    após reconexões rápidas do WebSocket.
+    """
     global _bullex_assets_last_error
 
-    fonte_digital = "digital-option-instruments.get-underlying-list"
-    try:
-        _, ativos = _consultar_lista_mercado_aberto(fonte_digital)
-        if not ativos:
-            raise RuntimeError("Lista digital não retornou os pares normais configurados.")
-        _atualizar_ativos_mercado_aberto(ativos, fonte_digital)
-        _assinar_candles_mercado_aberto()
-        log(f"[OPEN MARKET] Inicialização concluída com {len(ativos)} ativo(s).")
+    if not _bullex_assets_init_lock.acquire(blocking=False):
+        log("[OPEN MARKET] Descoberta de ativos já está em andamento.")
         return
-    except Exception as e:
-        _bullex_assets_last_error = str(e)
-        log(f"[OPEN MARKET] Descoberta digital falhou: {e}")
 
-    # Diagnóstico adicional. Não transforma automaticamente IDs marginais em
-    # ativos de opção, para evitar enviar ordem com um identificador inadequado.
     try:
-        nome_marginal = "marginal-forex-instruments.get-underlying-list"
-        _, diagnostico = _consultar_lista_mercado_aberto(nome_marginal)
-        if diagnostico:
+        _bullex_assets_ready_event.clear()
+        fonte_digital = "digital-option-instruments.get-underlying-list"
+
+        try:
+            _, ativos = _consultar_lista_mercado_aberto(fonte_digital)
+            if not ativos:
+                raise RuntimeError(
+                    "Lista digital não retornou os pares normais configurados."
+                )
+
+            _atualizar_ativos_mercado_aberto(ativos, fonte_digital)
+            _assinar_candles_mercado_aberto()
             log(
-                "[OPEN MARKET] A lista marginal reconheceu: "
-                + ", ".join(f"{x['ticker']}={x['active_id']}" for x in diagnostico)
-                + ". Mantidos apenas como diagnóstico; nenhuma ordem usa esses IDs."
+                f"[OPEN MARKET] Inicialização concluída com {len(ativos)} ativo(s)."
             )
-    except Exception as diag_e:
-        log(f"[OPEN MARKET] Diagnóstico marginal indisponível: {diag_e}")
+            return
 
-    # Sem fallback OTC por decisão explícita desta versão.
-    with _bullex_assets_lock:
-        ATIVO_BULLEX.clear()
-        ATIVOS.clear()
-    estado["ativos_info"] = {
-        "tipo": "MERCADO_ABERTO",
-        "quantidade": 0,
-        "status": "ERRO",
-        "lista": "-",
-        "erro": _bullex_assets_last_error,
-    }
-    log("[OPEN MARKET] Nenhum OTC será usado como fallback.")
+        except Exception as e:
+            _bullex_assets_last_error = str(e)
+            log(f"[OPEN MARKET] Descoberta digital falhou: {e}")
 
+        # Diagnóstico adicional. IDs marginais nunca são usados para ordens.
+        try:
+            nome_marginal = "marginal-forex-instruments.get-underlying-list"
+            _, diagnostico = _consultar_lista_mercado_aberto(nome_marginal)
+            if diagnostico:
+                log(
+                    "[OPEN MARKET] A lista marginal reconheceu: "
+                    + ", ".join(
+                        f"{x['ticker']}={x['active_id']}" for x in diagnostico
+                    )
+                    + ". Mantidos apenas como diagnóstico; nenhuma ordem usa esses IDs."
+                )
+        except Exception as diag_e:
+            log(f"[OPEN MARKET] Diagnóstico marginal indisponível: {diag_e}")
+
+        # Mantém ATIVOS (a lista lógica dos pares) intacta. Somente o mapa
+        # de active_id fica vazio enquanto a Traderoom não retornar IDs válidos.
+        with _bullex_assets_lock:
+            ATIVO_BULLEX.clear()
+            _bullex_assets_ready_event.clear()
+
+        estado["ativos_info"] = {
+            "tipo": "MERCADO_ABERTO",
+            "quantidade": 0,
+            "status": "AGUARDANDO",
+            "lista": "-",
+            "erro": _bullex_assets_last_error,
+        }
+        log(
+            "[OPEN MARKET] Ativos ainda não disponíveis. "
+            "A leitura ficará bloqueada até nova autenticação/descoberta; OTC não será usado."
+        )
+    finally:
+        _bullex_assets_init_lock.release()
+
+
+def _aguardar_ativos_mercado_aberto(timeout=30):
+    """Aguarda o mapa de active_id sem deixar a estratégia rodar com mapa vazio."""
+    limite = time.time() + timeout
+
+    while time.time() < limite:
+        with _bullex_assets_lock:
+            prontos = bool(ATIVO_BULLEX) and _bullex_assets_detected
+
+        if prontos:
+            _bullex_assets_ready_event.set()
+            return True
+
+        if not _bullex_connected:
+            # A thread persistente reconecta automaticamente.
+            time.sleep(0.25)
+            continue
+
+        if not _bullex_authenticated:
+            time.sleep(0.1)
+            continue
+
+        restante = limite - time.time()
+        if restante <= 0:
+            break
+
+        _bullex_assets_ready_event.wait(timeout=min(0.5, restante))
+
+    return False
 
 def _assinar_candles_mercado_aberto():
     """Assina 5M e 15M dos ativos usados pelo robô."""
@@ -2138,7 +2200,14 @@ def obter_candles(
             f"Ativo nao mapeado para Bullex: {symbol}"
         )
 
-    config = ATIVO_BULLEX[codigo]
+    with _bullex_assets_lock:
+        config = ATIVO_BULLEX.get(codigo)
+
+    if not config:
+        raise RuntimeError(
+            f"ACTIVE_ID_AGUARDANDO: {codigo} ainda não foi carregado pela Traderoom."
+        )
+
     active_id = config["active_id"]
 
     size = _BULLEX_CANDLE_SIZES.get(
@@ -3357,6 +3426,16 @@ def processar_ativo(
     symbol
 ):
     inicio_processamento = time.time()
+
+    with _bullex_assets_lock:
+        config_disponivel = ATIVO_BULLEX.get(chave)
+
+    if not config_disponivel:
+        log(
+            f"[OPEN MARKET] {symbol}: aguardando active_id; leitura ignorada nesta rodada."
+        )
+        return
+
     try:
         log(
             f"Consultando 5M: {symbol}"
@@ -3722,6 +3801,20 @@ def executar_leitura():
 
         return
 
+    if not _aguardar_ativos_mercado_aberto(timeout=8):
+        erro_ativos = _bullex_assets_last_error or "aguardando resposta da Traderoom"
+        log(
+            "[OPEN MARKET] Leitura adiada: active_id dos pares ainda não está pronto. "
+            f"Detalhe: {erro_ativos}"
+        )
+        estado["sinal"] = "AGUARDAR"
+        estado["score"] = 0
+        estado["mensagem"] = (
+            "Aguardando carregamento dos pares de mercado aberto na Bullex."
+        )
+        estado["atualizado"] = agora_brt().strftime("%H:%M:%S BRT")
+        return
+
     if not dentro_do_horario():
         agora = agora_brt()
 
@@ -3824,10 +3917,21 @@ def loop_robo():
         _auth_body()
 
         conectar_bullex()
+        _aguardar_autenticacao(timeout=20)
 
         log(
-            "Thread persistente do WebSocket Bullex iniciada."
+            "Thread persistente do WebSocket Bullex iniciada e autenticada."
         )
+
+        if _aguardar_ativos_mercado_aberto(timeout=30):
+            with _bullex_assets_lock:
+                ativos_prontos = ", ".join(ATIVO_BULLEX.keys())
+            log(f"[OPEN MARKET] Pronto para leitura: {ativos_prontos}")
+        else:
+            log(
+                "[OPEN MARKET] Inicialização ainda incompleta; "
+                "a primeira leitura ficará em AGUARDAR, sem gerar KeyError."
+            )
 
     except Exception as e:
         log(
