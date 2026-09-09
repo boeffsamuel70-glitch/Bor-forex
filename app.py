@@ -73,6 +73,8 @@ ATIVO_BULLEX = {
     "GBPUSD_OTC": {"symbol": "GBP/USD OTC", "active_id": 81, "ticker": "GBPUSD-OTC", "is_otc": True, "mercado": "OTC"},
     "USDJPY_OTC": {"symbol": "USD/JPY OTC", "active_id": 85, "ticker": "USDJPY-OTC", "is_otc": True, "mercado": "OTC"},
     "GBPJPY_OTC": {"symbol": "GBP/JPY OTC", "active_id": 84, "ticker": "GBPJPY-OTC", "is_otc": True, "mercado": "OTC"},
+    "EURGBP_OTC": {"symbol": "EUR/GBP OTC", "active_id": 77, "ticker": "EURGBP-OTC", "is_otc": True, "mercado": "OTC"},
+    "USDCHF_OTC": {"symbol": "USD/CHF OTC", "active_id": 78, "ticker": "USDCHF-OTC", "is_otc": True, "mercado": "OTC"},
 }
 
 PARES_MERCADO_ABERTO = {}
@@ -85,13 +87,15 @@ PARES_OTC_ALVO = {
     "GBPUSD": "GBP/USD OTC",
     "USDJPY": "USD/JPY OTC",
     "GBPJPY": "GBP/JPY OTC",
+    "EURGBP": "EUR/GBP OTC",
+    "USDCHF": "USD/CHF OTC",
 }
 
 _bullex_assets_lock = threading.RLock()
 _bullex_assets_detected = True
 _bullex_assets_last_error = None
 _bullex_assets_updated_at = None
-_bullex_assets_source = "OTC_STATIC_FALLBACK_76_79_81_85_84"
+_bullex_assets_source = "OTC_STATIC_FALLBACK_76_79_81_85_84_77_78"
 _bullex_assets_ready_event = threading.Event()
 _bullex_assets_init_lock = threading.Lock()
 
@@ -118,7 +122,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OTC-ONLY-BINARY-5-BRL-20260909-R18-SR-M5-INTRABAR"
+BULLEX_DIAGNOSTIC_VERSION = "OTC-ONLY-BINARY-5-BRL-20260909-R19-SR-M5-7PAIRS-22H20H-DASHFIX"
 
 _bullex_diag = {
     "messages": 0,
@@ -209,6 +213,8 @@ ATIVOS = {
     "GBPUSD_OTC": "GBP/USD OTC",
     "USDJPY_OTC": "USD/JPY OTC",
     "GBPJPY_OTC": "GBP/JPY OTC",
+    "EURGBP_OTC": "EUR/GBP OTC",
+    "USDCHF_OTC": "USD/CHF OTC",
 }
 
 # ============================================================
@@ -3598,6 +3604,50 @@ def _resultado_retracao_intravela(msg, active_id):
     return None
 
 
+
+def _limpar_sinal_dashboard_se_expirado():
+    """O card principal mostra somente sinal ainda válido na vela M5 atual."""
+    candle_to = estado.get("_sinal_candle_to")
+    if not candle_to:
+        return
+
+    try:
+        server_ts, _ = _horario_servidor_atual()
+        if float(server_ts) < float(candle_to):
+            return
+    except Exception:
+        return
+
+    estado["ativo"] = "-"
+    estado["sinal"] = "AGUARDAR"
+    estado["score"] = 0
+    estado["preco"] = "-"
+    estado["vela"] = "-"
+    estado["atualidade_min"] = "-"
+    estado["mensagem"] = "Aguardando novo sinal válido na vela M5 atual."
+    estado["atualizado"] = agora_brt().strftime("%H:%M:%S BRT")
+    estado["detalhes"] = {
+        "score_call": "-",
+        "score_put": "-",
+        "rsi": "-",
+        "ema5": "-",
+        "ema13": "-",
+        "ema21": "-",
+        "tendencia_5m": "S/R M5",
+        "tendencia_15m": "NÃO UTILIZADO",
+        "pullback": "-",
+        "confirmacao": "-",
+        "lateral": "N/A",
+        "atr": "-",
+        "bloqueio": "SEM SINAL ATUAL",
+        "regime": "INTRAVELA",
+        "estrategia": "SR_M5_RETRACAO_MESMA_VELA",
+        "zona_fibonacci": "-",
+    }
+    estado["_sinal_candle_to"] = None
+    log("[DASHBOARD] Sinal antigo removido após o fim da vela M5.")
+
+
 def _atualizar_dashboard_intravela(symbol, resultado):
     estado["ativo"] = symbol
     estado["sinal"] = resultado.get("sinal", "AGUARDAR")
@@ -3609,6 +3659,7 @@ def _atualizar_dashboard_intravela(symbol, resultado):
         if isinstance(vela, datetime) else "-"
     )
     estado["atualizado"] = agora_brt().strftime("%H:%M:%S BRT")
+    estado["_sinal_candle_to"] = resultado.get("candle_to")
     estado["atualidade_min"] = "TEMPO REAL"
     estado["mensagem"] = resultado.get("mensagem", "")
     estado["detalhes"] = {
@@ -4279,6 +4330,7 @@ def executar_leitura():
     # A R17 gera sinais EXCLUSIVAMENTE em tempo real no candle-generated.
     # Este ciclo de 5 minutos apenas finaliza/atualiza operações e saúde dos ativos.
     finalizar_operacoes_vencidas_antes_da_leitura()
+    _limpar_sinal_dashboard_se_expirado()
 
     with _bullex_assets_lock:
         ativos_ciclo = list(ATIVOS.items())
@@ -4940,6 +4992,7 @@ setTimeout(function() {
 
 @app.route("/")
 def index():
+    _limpar_sinal_dashboard_se_expirado()
     garantir_robo_iniciado()
 
     estado[
@@ -4976,7 +5029,7 @@ def health():
             ),
         "estrategia":
             (
-                "S/R M5 + retracao intravela na mesma vela M5 | SOMENTE OTC"
+                "S/R M5 + retracao intravela na mesma vela M5 | SOMENTE OTC | 7 PARES"
             ),
         "fonte_candles": "Bullex",
         "execucao_automatica": BULLEX_AUTO_TRADE,
