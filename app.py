@@ -110,7 +110,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OPEN-MARKET-BINARY-ONLY-5-BRL-20260908-R12-MULTI-STRATEGY-10W10L"
+BULLEX_DIAGNOSTIC_VERSION = "OPEN-MARKET-BINARY-ONLY-5-BRL-20260909-R13-INTRABAR-RETRACE"
 
 _bullex_diag = {
     "messages": 0,
@@ -163,9 +163,20 @@ BULLEX_USER_BALANCE_ID = os.getenv(
 
 VALORES_ENTRADA = [5.00]
 EXPIRACAO_MINUTOS = 5
-MAX_ATRASO_ENTRADA_SEGUNDOS = 3
-DELAY_MINIMO_ENTRADA_SEGUNDOS = 1.0
+# A antiga janela de 3 segundos foi removida.
+# Esta estratégia entra DURANTE a vela atual e expira no fechamento da MESMA vela.
+INTRAVELA_MIN_SEGUNDOS_DECORRIDOS = 20
+INTRAVELA_MIN_SEGUNDOS_RESTANTES = 35
+INTRAVELA_IMPULSO_ATR_MIN = 0.60
+INTRAVELA_RETRACAO_MIN = 0.28
+INTRAVELA_RETRACAO_MAX = 0.68
+INTRAVELA_PAVIO_MIN_FRACAO_IMPULSO = 0.12
+INTRAVELA_MOVIMENTO_MIN_PCT = 0.00020
 UMA_OPERACAO_GLOBAL = True
+
+_intravela_lock = threading.RLock()
+_intravela_estado = {}
+_intravela_velas_tentadas = set()
 
 # ============================================================
 # ATIVOS
@@ -241,13 +252,11 @@ _robo_started = False
 _ultimos_sinais_telegram = {}
 _operacoes_pendentes = {}
 _ultimas_operacoes_registradas = {}
-# Base histórica consolidada antes da versão multi-estratégia:
-# 20 operações decididas = 10 WIN / 10 LOSS = 50,00%.
-# A base antiga não tinha identificação de estratégia.
-# Novos resultados serão acrescentados com estratégia e regime.
+# Base histórica consolidada antes da estratégia de retração intravela:
+# 44 operações decididas = 22 WIN / 22 LOSS = 50,00%.
 _historico_resultados = (
-    [{"resultado": "WIN", "origem": "BASE_ANTES_R12", "estrategia": "BASE"} for _ in range(10)]
-    + [{"resultado": "LOSS", "origem": "BASE_ANTES_R12", "estrategia": "BASE"} for _ in range(10)]
+    [{"resultado": "WIN", "origem": "BASE_ANTES_R13", "estrategia": "BASE"} for _ in range(22)]
+    + [{"resultado": "LOSS", "origem": "BASE_ANTES_R13", "estrategia": "BASE"} for _ in range(22)]
 )
 _execucao_lock = threading.RLock()
 _operacao_global_ativa = None
@@ -351,13 +360,16 @@ def _janela_execucao_5m():
     candle_close = candle_open + 300
     atraso = max(0.0, server_ts - candle_open)
 
+    restante = max(0.0, candle_close - server_ts)
+
     return {
         "server_ts": server_ts,
         "source": source,
         "candle_open": int(candle_open),
         "candle_close": int(candle_close),
         "atraso_segundos": float(atraso),
-        "permitida": atraso <= MAX_ATRASO_ENTRADA_SEGUNDOS,
+        "segundos_restantes": float(restante),
+        "permitida": restante > 0,
     }
 
 
@@ -764,61 +776,32 @@ def _registrar_ordem_confirmada(symbol, ticker, sinal, valor, active_id, balance
     estado["execucao"]["ultimo_erro"] = None
     _atualizar_estado_execucao()
     log(
-        f"[AUTO DUAL] ORDEM CONFIRMADA via {produto}: "
+        f"[AUTO] ORDEM CONFIRMADA via {produto}: "
         f"{symbol} {sinal} R${valor:.2f} id={option_id}"
     )
     return "CONFIRMADA"
 
 
-def _revalidar_janela_entrada(symbol, sinal, etapa):
-    """Revalida a janela de 5M imediatamente antes de qualquer envio de ordem."""
-    janela = _janela_execucao_5m()
-    atraso = float(janela["atraso_segundos"])
-
-    if not janela["permitida"]:
-        estado["execucao"]["ultimo_erro"] = (
-            f"Entrada bloqueada por atraso em {etapa}: "
-            f"{atraso:.3f}s > {MAX_ATRASO_ENTRADA_SEGUNDOS}s."
-        )
-        _atualizar_estado_execucao()
-        log(
-            f"[AUTO DUAL] ATRASADA antes de {etapa} - "
-            f"{symbol} {sinal} atraso={atraso:.3f}s; ordem NÃO enviada."
-        )
-        return None
-
-    return janela
-
-
-def executar_ordem_demo(symbol, sinal, resultado):
-    """Executa somente em Opção Binária.
-
-    A modalidade Digital foi removida para reduzir latência no caminho crítico.
-    A ordem só é enviada se ainda estiver dentro dos primeiros
-    MAX_ATRASO_ENTRADA_SEGUNDOS da nova vela de 5 minutos.
-    """
+def executar_ordem_intravela(symbol, sinal, resultado):
     global _operacao_global_ativa
     global _bullex_last_error
 
     if not BULLEX_AUTO_TRADE:
         return None
 
-    if not BULLEX_USER_BALANCE_ID:
-        estado["execucao"]["ultimo_erro"] = (
-            "SEM_BALANCE_ID: configure BULLEX_USER_BALANCE_ID."
-        )
-        _atualizar_estado_execucao()
-        log("[AUTO BINARIA] BULLEX_USER_BALANCE_ID vazio. Ordem não enviada.")
-        return "SEM_BALANCE_ID"
-
     if sinal not in ("CALL", "PUT"):
         return None
+
+    if not BULLEX_USER_BALANCE_ID:
+        estado["execucao"]["ultimo_erro"] = "SEM_BALANCE_ID"
+        _atualizar_estado_execucao()
+        return "SEM_BALANCE_ID"
 
     with _execucao_lock:
         if UMA_OPERACAO_GLOBAL and _operacao_global_ativa is not None:
             log(
-                "[AUTO BINARIA] Bloqueada: operação global ativa em "
-                f"{_operacao_global_ativa.get('symbol')}."
+                f"[INTRAVELA] {symbol}: sinal ignorado; "
+                "já existe operação global ativa."
             )
             return "BLOQUEADA_GLOBAL"
 
@@ -831,46 +814,58 @@ def executar_ordem_demo(symbol, sinal, resultado):
         None,
     )
     if not config:
-        estado["execucao"]["ultimo_erro"] = (
-            f"SEM_ATIVO: active_id não carregado para {symbol}."
-        )
-        _atualizar_estado_execucao()
         return "SEM_ATIVO"
 
     active_id = int(config["active_id"])
     ticker = config.get("ticker")
     valor = _valor_entrada_atual()
 
-    # Primeira checagem da janela.
-    janela = _janela_execucao_5m()
-    atraso = float(janela["atraso_segundos"])
+    server_ts, source = _horario_servidor_atual()
+    candle_from = int(resultado["candle_from"])
+    candle_to = int(resultado["candle_to"])
+    restantes = candle_to - server_ts
 
-    # Evita envio exatamente em 00.000, quando a nova janela pode
-    # ainda estar sendo liberada pela Bullex.
-    if atraso < DELAY_MINIMO_ENTRADA_SEGUNDOS:
-        time.sleep(DELAY_MINIMO_ENTRADA_SEGUNDOS - atraso)
+    # Proteção específica desta estratégia:
+    # não muda a expiração para a vela seguinte.
+    if server_ts < candle_from or server_ts >= candle_to:
+        log(
+            f"[INTRAVELA] {symbol}: vela do sinal já encerrou; "
+            "ordem NÃO enviada."
+        )
+        return "VELA_ENCERRADA"
 
-    # Revalidação obrigatória imediatamente antes da Binária.
-    janela = _revalidar_janela_entrada(symbol, sinal, "BINARIA")
-    if janela is None:
-        return "ATRASADA"
+    if restantes < INTRAVELA_MIN_SEGUNDOS_RESTANTES:
+        log(
+            f"[INTRAVELA] {symbol}: restam apenas {restantes:.1f}s; "
+            "ordem NÃO enviada para evitar cair na próxima vela."
+        )
+        return "POUCO_TEMPO"
 
-    atraso = float(janela["atraso_segundos"])
+    janela = {
+        "server_ts": server_ts,
+        "source": source,
+        "candle_open": candle_from,
+        "candle_close": candle_to,
+        "atraso_segundos": server_ts - candle_from,
+        "segundos_restantes": restantes,
+        "permitida": True,
+    }
 
-    body_binary = {
+    body = {
         "user_balance_id": int(balance_id),
         "active_id": active_id,
         "option_type_id": 3,
         "direction": _direcao_instrumento(sinal),
-        "expired": int(janela["candle_close"]),
+        "expired": candle_to,
         "price": float(valor),
         "refund_value": 0,
     }
 
     log(
-        f"[AUTO BINARIA] Enviando: {symbol} {sinal} "
-        f"R${valor:.2f} active_id={active_id} | "
-        f"atraso={atraso:.3f}s."
+        f"[AUTO INTRAVELA] Enviando {symbol} {sinal} R${valor:.2f} | "
+        f"entrada_estimada={resultado['preco']:.5f} | "
+        f"expira_na_mesma_vela={datetime.fromtimestamp(candle_to, TZ).strftime('%H:%M:%S')} | "
+        f"restam={restantes:.1f}s"
     )
 
     try:
@@ -880,54 +875,57 @@ def executar_ordem_demo(symbol, sinal, resultado):
         resposta = _enviar_e_aguardar(
             "binary-options.open-option",
             "1.0",
-            body_binary,
+            body,
             timeout=20,
         )
 
-        if _ordem_option_confirmada(resposta):
+        if not _ordem_option_confirmada(resposta):
             with _bullex_diag_lock:
-                _bullex_diag["orders_confirmed"] += 1
-
-            return _registrar_ordem_confirmada(
-                symbol,
-                ticker,
-                sinal,
-                valor,
-                active_id,
-                balance_id,
-                "BINARIA",
-                resposta,
-                janela,
+                _bullex_diag["orders_errors"] += 1
+            estado["execucao"]["ultimo_erro"] = (
+                _mensagem_erro_ordem(resposta)
+                or f"Ordem intravela não confirmada: {resposta}"
             )
+            _atualizar_estado_execucao()
+            log(
+                "[AUTO INTRAVELA] Ordem não confirmada: "
+                + json.dumps(resposta, ensure_ascii=False)
+            )
+            return "SEM_CONFIRMACAO"
 
         with _bullex_diag_lock:
-            _bullex_diag["orders_errors"] += 1
+            _bullex_diag["orders_confirmed"] += 1
 
-        mensagem = _mensagem_erro_ordem(resposta)
-        estado["execucao"]["ultimo_erro"] = (
-            mensagem or f"Binária não confirmada: {resposta}"
+        status = _registrar_ordem_confirmada(
+            symbol,
+            ticker,
+            sinal,
+            valor,
+            active_id,
+            balance_id,
+            "BINARIA_INTRAVELA",
+            resposta,
+            janela,
         )
-        _atualizar_estado_execucao()
 
-        if _resposta_indica_indisponibilidade_produto(resposta):
-            log(
-                f"[AUTO BINARIA] BINÁRIA indisponível para {symbol}; "
-                "nenhuma ordem aberta."
-            )
-            return "PRODUTO_INDISPONIVEL"
+        with _execucao_lock:
+            if _operacao_global_ativa is not None:
+                _operacao_global_ativa["preco_entrada_estimado"] = float(resultado["preco"])
+                _operacao_global_ativa["estrategia"] = "RETRACAO_MESMA_VELA"
+                _operacao_global_ativa["regime"] = "INTRAVELA"
 
-        log(f"[AUTO BINARIA] Ordem não confirmada: {resposta}")
-        return "SEM_CONFIRMACAO"
+        return status
 
     except Exception as e:
         with _bullex_diag_lock:
             _bullex_diag["orders_errors"] += 1
-
         _bullex_last_error = str(e)
         estado["execucao"]["ultimo_erro"] = str(e)
         _atualizar_estado_execucao()
-        log(f"[AUTO BINARIA] ERRO ao enviar ordem: {e}")
+        log(f"[AUTO INTRAVELA] ERRO ao enviar ordem: {e}")
         return "ERRO"
+
+
 
 def _atualizar_progressao(resultado):
     global _nivel_progressao
@@ -1396,6 +1394,15 @@ def _on_bullex_message(ws, raw_message):
                 _armazenar_candle_ws(active_id, size, msg)
                 with _bullex_diag_lock:
                     _bullex_diag["stored"] += 1
+
+                # Estratégia única R13: observa a vela de 5M ainda aberta.
+                if int(size) == 300:
+                    threading.Thread(
+                        target=_processar_sinal_intravela,
+                        args=(active_id, dict(msg)),
+                        daemon=True,
+                        name=f"intravela-scan-{active_id}",
+                    ).start()
         return
 
     # ========================================================
@@ -3066,388 +3073,307 @@ def analisar_pullback(
 
 
 # ============================================================
-# MULTI-ESTRATÉGIA / REGIME DE MERCADO
+# ESTRATÉGIA ÚNICA - RETRAÇÃO NA MESMA VELA (INTRAVELA)
 # ============================================================
 
-def _resultado_base_multi(candles_5m, candles_15m, estrategia, regime):
-    c = closes(candles_5m)
-    preco = c[-1] if c else 0.0
-    return {
-        "sinal": "AGUARDAR",
-        "score": 0,
-        "preco": preco,
-        "vela": candles_5m[-1]["_dt"] if candles_5m else None,
-        "rsi": rsi(c, 14) if len(c) >= 15 else None,
-        "ema5": ema(c, 5) if len(c) >= 5 else None,
-        "ema13": ema(c, 13) if len(c) >= 13 else None,
-        "ema21": ema(c, 21) if len(c) >= 21 else None,
-        "atr": atr(candles_5m, 14) if len(candles_5m) >= 15 else None,
-        "score_call": 0,
-        "score_put": 0,
-        "pullback": "NÃO",
-        "rejeicao": "NÃO",
-        "tendencia": tendencia_timeframe(candles_5m) if len(candles_5m) >= 20 else "NEUTRA",
-        "tendencia_5m": tendencia_timeframe(candles_5m) if len(candles_5m) >= 20 else "NEUTRA",
-        "tendencia_15m": tendencia_timeframe(candles_15m) if len(candles_15m) >= 20 else "NEUTRA",
-        "lateral": "-",
-        "bloqueio": "Sem setup.",
-        "mensagem": "AGUARDAR",
-        "estrategia": estrategia,
-        "regime": regime,
+def _symbol_por_active_id(active_id):
+    try:
+        aid = int(active_id)
+    except Exception:
+        return None, None
+
+    with _bullex_assets_lock:
+        for codigo, cfg in ATIVO_BULLEX.items():
+            if int(cfg.get("active_id")) == aid:
+                return codigo, cfg.get("symbol")
+    return None, None
+
+
+def _candles_5m_cache(active_id):
+    with _bullex_cv:
+        bucket = _bullex_candles.get((int(active_id), 300), {})
+        candles = [dict(x) for x in bucket.values()]
+    return ordenar_candles(candles)
+
+
+def _atr_cache_5m(active_id):
+    candles = _candles_5m_cache(active_id)
+    fechadas = somente_velas_fechadas(candles, 5)
+    if len(fechadas) < 15:
+        return None
+    return atr(fechadas, 14)
+
+
+def _resultado_retracao_intravela(msg, active_id):
+    """Analisa somente a vela corrente.
+
+    Se a vela impulsiona para cima e começa a retrair do topo, procura PUT.
+    Se impulsiona para baixo e começa a retrair do fundo, procura CALL.
+    A expiração é sempre o fechamento da própria vela corrente.
+    """
+    if not isinstance(msg, dict):
+        return None
+
+    try:
+        abertura = float(msg["open"])
+        fechamento = float(msg["close"])
+        maxima = float(msg.get("max", msg.get("high")))
+        minima = float(msg.get("min", msg.get("low")))
+        candle_from = int(float(msg["from"]))
+        candle_to = int(float(msg.get("to") or (candle_from + 300)))
+    except Exception:
+        return None
+
+    server_ts, _ = _horario_servidor_atual()
+    decorridos = max(0.0, server_ts - candle_from)
+    restantes = max(0.0, candle_to - server_ts)
+
+    # Não é a trava antiga: estas duas regras só garantem que exista
+    # impulso observável e que a ordem ainda expire na própria vela.
+    if decorridos < INTRAVELA_MIN_SEGUNDOS_DECORRIDOS:
+        return None
+    if restantes < INTRAVELA_MIN_SEGUNDOS_RESTANTES:
+        return None
+
+    atr14 = _atr_cache_5m(active_id)
+    if atr14 is None or atr14 <= 0:
+        return None
+
+    movimento_minimo = max(
+        atr14 * INTRAVELA_IMPULSO_ATR_MIN,
+        abs(abertura) * INTRAVELA_MOVIMENTO_MIN_PCT,
+    )
+
+    impulso_alta = maxima - abertura
+    impulso_baixa = abertura - minima
+
+    candle_key = (int(active_id), candle_from)
+
+    with _intravela_lock:
+        st = _intravela_estado.setdefault(
+            candle_key,
+            {
+                "ultimo_close": fechamento,
+                "eventos": 0,
+                "maxima": maxima,
+                "minima": minima,
+            }
+        )
+        ultimo_close = float(st.get("ultimo_close", fechamento))
+        st["eventos"] = int(st.get("eventos", 0)) + 1
+        st["maxima"] = max(float(st.get("maxima", maxima)), maxima)
+        st["minima"] = min(float(st.get("minima", minima)), minima)
+        st["ultimo_close"] = fechamento
+        eventos = st["eventos"]
+
+    # Precisa de pelo menos uma atualização anterior da mesma vela
+    # para provar que o preço começou a voltar.
+    if eventos < 2:
+        return None
+
+    # Impulso de alta -> retração para baixo -> PUT.
+    if impulso_alta >= movimento_minimo and impulso_alta >= impulso_baixa:
+        retracao = maxima - fechamento
+        ratio = retracao / max(impulso_alta, 1e-12)
+        pavio_sup = maxima - max(abertura, fechamento)
+
+        confirmacao = (
+            fechamento < ultimo_close
+            and INTRAVELA_RETRACAO_MIN <= ratio <= INTRAVELA_RETRACAO_MAX
+            and pavio_sup >= impulso_alta * INTRAVELA_PAVIO_MIN_FRACAO_IMPULSO
+        )
+
+        if confirmacao:
+            score = 10
+            if impulso_alta >= atr14 * 0.90:
+                score += 1
+            if ratio >= 0.38:
+                score += 1
+            return {
+                "sinal": "PUT",
+                "score": score,
+                "score_call": 1,
+                "score_put": score,
+                "preco": fechamento,
+                "vela": datetime.fromtimestamp(candle_from, TZ),
+                "estrategia": "RETRACAO_MESMA_VELA",
+                "regime": "INTRAVELA",
+                "pullback": f"RETRACAO {ratio*100:.1f}% DO IMPULSO",
+                "rejeicao": "CONFIRMADA",
+                "lateral": "N/A",
+                "atr": atr14,
+                "rsi": None,
+                "ema5": None,
+                "ema13": None,
+                "ema21": None,
+                "tendencia_5m": "N/A",
+                "tendencia_15m": "N/A",
+                "zona_fibonacci": "-",
+                "bloqueio": "SINAL",
+                "mensagem": (
+                    f"PUT intravela | impulso alta={impulso_alta:.6f} | "
+                    f"retração={ratio*100:.1f}% | restam={restantes:.1f}s"
+                ),
+                "candle_from": candle_from,
+                "candle_to": candle_to,
+                "segundos_decorridos": decorridos,
+                "segundos_restantes": restantes,
+                "impulso": impulso_alta,
+                "retracao_ratio": ratio,
+            }
+
+    # Impulso de baixa -> retração para cima -> CALL.
+    if impulso_baixa >= movimento_minimo and impulso_baixa > impulso_alta:
+        retracao = fechamento - minima
+        ratio = retracao / max(impulso_baixa, 1e-12)
+        pavio_inf = min(abertura, fechamento) - minima
+
+        confirmacao = (
+            fechamento > ultimo_close
+            and INTRAVELA_RETRACAO_MIN <= ratio <= INTRAVELA_RETRACAO_MAX
+            and pavio_inf >= impulso_baixa * INTRAVELA_PAVIO_MIN_FRACAO_IMPULSO
+        )
+
+        if confirmacao:
+            score = 10
+            if impulso_baixa >= atr14 * 0.90:
+                score += 1
+            if ratio >= 0.38:
+                score += 1
+            return {
+                "sinal": "CALL",
+                "score": score,
+                "score_call": score,
+                "score_put": 1,
+                "preco": fechamento,
+                "vela": datetime.fromtimestamp(candle_from, TZ),
+                "estrategia": "RETRACAO_MESMA_VELA",
+                "regime": "INTRAVELA",
+                "pullback": f"RETRACAO {ratio*100:.1f}% DO IMPULSO",
+                "rejeicao": "CONFIRMADA",
+                "lateral": "N/A",
+                "atr": atr14,
+                "rsi": None,
+                "ema5": None,
+                "ema13": None,
+                "ema21": None,
+                "tendencia_5m": "N/A",
+                "tendencia_15m": "N/A",
+                "zona_fibonacci": "-",
+                "bloqueio": "SINAL",
+                "mensagem": (
+                    f"CALL intravela | impulso baixa={impulso_baixa:.6f} | "
+                    f"retração={ratio*100:.1f}% | restam={restantes:.1f}s"
+                ),
+                "candle_from": candle_from,
+                "candle_to": candle_to,
+                "segundos_decorridos": decorridos,
+                "segundos_restantes": restantes,
+                "impulso": impulso_baixa,
+                "retracao_ratio": ratio,
+            }
+
+    return None
+
+
+def _atualizar_dashboard_intravela(symbol, resultado):
+    estado["ativo"] = symbol
+    estado["sinal"] = resultado.get("sinal", "AGUARDAR")
+    estado["score"] = resultado.get("score", 0)
+    estado["preco"] = f"{float(resultado.get('preco', 0)):.5f}"
+    vela = resultado.get("vela")
+    estado["vela"] = (
+        vela.strftime("%Y-%m-%d %H:%M:%S BRT")
+        if isinstance(vela, datetime) else "-"
+    )
+    estado["atualizado"] = agora_brt().strftime("%H:%M:%S BRT")
+    estado["atualidade_min"] = "TEMPO REAL"
+    estado["mensagem"] = resultado.get("mensagem", "")
+    estado["detalhes"] = {
+        "score_call": resultado.get("score_call", "-"),
+        "score_put": resultado.get("score_put", "-"),
+        "rsi": "-",
+        "ema5": "-",
+        "ema13": "-",
+        "ema21": "-",
+        "tendencia_5m": "N/A",
+        "tendencia_15m": "N/A",
+        "pullback": resultado.get("pullback", "-"),
+        "confirmacao": resultado.get("rejeicao", "-"),
+        "lateral": "N/A",
+        "atr": (
+            f"{resultado['atr']:.6f}"
+            if isinstance(resultado.get("atr"), (int, float)) else "-"
+        ),
+        "bloqueio": resultado.get("bloqueio", "-"),
+        "regime": "INTRAVELA",
+        "estrategia": "RETRACAO_MESMA_VELA",
         "zona_fibonacci": "-",
     }
 
 
-def _detectar_regime(candles_5m, candles_15m):
-    c = closes(candles_5m)
-    preco = c[-1]
-    ema5_v = ema(c, 5)
-    ema13_v = ema(c, 13)
-    ema21_v = ema(c, 21)
-    atr14 = atr(candles_5m, 14)
+def _processar_sinal_intravela(active_id, msg):
+    codigo, symbol = _symbol_por_active_id(active_id)
+    if not codigo or not symbol:
+        return
 
-    t5 = tendencia_timeframe(candles_5m)
-    t15 = tendencia_timeframe(candles_15m)
-    lateral = mercado_lateral(preco, ema5_v, ema13_v, ema21_v, atr14)
+    if not dentro_do_horario():
+        return
 
-    # Mercado lateral tem prioridade: estratégia de tendência fica desligada.
-    if lateral or (t5 == "NEUTRA" and t15 == "NEUTRA"):
-        return "LATERAL"
+    resultado = _resultado_retracao_intravela(msg, active_id)
+    if resultado is None:
+        return
 
-    # Tendência alinhada: o seletor decide entre Fibonacci e pullback por EMA.
-    if t5 == t15 and t5 in ("ALTA", "BAIXA"):
-        return "TENDENCIA"
+    candle_key = (int(active_id), int(resultado["candle_from"]))
 
-    # Sem alinhamento suficiente para operar.
-    return "TRANSICAO"
+    with _intravela_lock:
+        if candle_key in _intravela_velas_tentadas:
+            return
+        _intravela_velas_tentadas.add(candle_key)
 
+    _atualizar_dashboard_intravela(symbol, resultado)
 
-def _fib_setup_info(candles_5m, direcao):
-    """Detecta impulso recente e zona 50%-61,8% no 5M.
-
-    Usa somente velas já fechadas. A vela atual é confirmação; as duas
-    anteriores podem ser a retração.
-    """
-    if len(candles_5m) < 30:
-        return None
-
-    janela = candles_5m[-18:-1]
-    atr14 = atr(candles_5m, 14)
-    if not atr14 or atr14 <= 0:
-        return None
-
-    infos = [candle_info(x) for x in janela]
-    lows = [x["low"] for x in infos]
-    highs = [x["high"] for x in infos]
-
-    if direcao == "CALL":
-        idx_low = min(range(len(lows)), key=lows.__getitem__)
-        # O topo do impulso precisa vir depois do fundo.
-        candidatos_high = list(range(idx_low + 1, len(highs)))
-        if not candidatos_high:
-            return None
-        idx_high = max(candidatos_high, key=lambda i: highs[i])
-        fundo = lows[idx_low]
-        topo = highs[idx_high]
-        impulso = topo - fundo
-        if impulso < atr14 * 1.6:
-            return None
-
-        fib50 = topo - impulso * 0.50
-        fib618 = topo - impulso * 0.618
-        zona_low, zona_high = min(fib50, fib618), max(fib50, fib618)
-
-        pb1 = candle_info(candles_5m[-2])
-        pb2 = candle_info(candles_5m[-3])
-        toque1 = pb1["low"] <= zona_high and pb1["high"] >= zona_low
-        toque2 = pb2["low"] <= zona_high and pb2["high"] >= zona_low
-        pb = pb1 if toque1 else pb2 if toque2 else None
-        if pb is None:
-            return None
-
-        conf = candle_info(candles_5m[-1])
-        confirmada = (
-            conf["close"] > conf["open"]
-            and conf["close"] > pb["high"]
-            and conf["body_ratio"] >= 0.35
-        )
-        return {
-            "direcao": "CALL",
-            "impulso": impulso,
-            "fib50": fib50,
-            "fib618": fib618,
-            "zona_low": zona_low,
-            "zona_high": zona_high,
-            "pullback": True,
-            "confirmada": confirmada,
-        }
-
-    idx_high = max(range(len(highs)), key=highs.__getitem__)
-    candidatos_low = list(range(idx_high + 1, len(lows)))
-    if not candidatos_low:
-        return None
-    idx_low = min(candidatos_low, key=lambda i: lows[i])
-    topo = highs[idx_high]
-    fundo = lows[idx_low]
-    impulso = topo - fundo
-    if impulso < atr14 * 1.6:
-        return None
-
-    fib50 = fundo + impulso * 0.50
-    fib618 = fundo + impulso * 0.618
-    zona_low, zona_high = min(fib50, fib618), max(fib50, fib618)
-
-    pb1 = candle_info(candles_5m[-2])
-    pb2 = candle_info(candles_5m[-3])
-    toque1 = pb1["low"] <= zona_high and pb1["high"] >= zona_low
-    toque2 = pb2["low"] <= zona_high and pb2["high"] >= zona_low
-    pb = pb1 if toque1 else pb2 if toque2 else None
-    if pb is None:
-        return None
-
-    conf = candle_info(candles_5m[-1])
-    confirmada = (
-        conf["close"] < conf["open"]
-        and conf["close"] < pb["low"]
-        and conf["body_ratio"] >= 0.35
-    )
-    return {
-        "direcao": "PUT",
-        "impulso": impulso,
-        "fib50": fib50,
-        "fib618": fib618,
-        "zona_low": zona_low,
-        "zona_high": zona_high,
-        "pullback": True,
-        "confirmada": confirmada,
-    }
-
-
-def analisar_fibonacci_pullback(candles_5m, candles_15m):
-    resultado = _resultado_base_multi(
-        candles_5m, candles_15m, "FIBONACCI_PULLBACK", "TENDENCIA"
+    log(
+        f"[INTRAVELA] {symbol} -> {resultado['sinal']} | "
+        f"score={resultado['score']} | "
+        f"{resultado['pullback']} | "
+        f"decorridos={resultado['segundos_decorridos']:.1f}s | "
+        f"restantes={resultado['segundos_restantes']:.1f}s | "
+        f"preco={resultado['preco']:.5f}"
     )
 
-    t5 = resultado["tendencia_5m"]
-    t15 = resultado["tendencia_15m"]
-    if t5 != t15 or t5 not in ("ALTA", "BAIXA"):
-        resultado["bloqueio"] = "Fibonacci exige tendência 5M e 15M alinhadas."
-        resultado["mensagem"] = "AGUARDAR | tendência não alinhada para Fibonacci."
-        return resultado
-
-    direcao = "CALL" if t5 == "ALTA" else "PUT"
-    fib = _fib_setup_info(candles_5m, direcao)
-    if fib is None:
-        resultado["bloqueio"] = "Sem retração válida na zona Fibonacci 50%-61,8%."
-        resultado["mensagem"] = "AGUARDAR | sem setup Fibonacci."
-        return resultado
-
-    conf = candle_info(candles_5m[-1])
-    atr14 = resultado["atr"]
-    preco = resultado["preco"]
-
-    score = 0
-    score += 3  # 5M alinhado
-    score += 2  # 15M alinhado
-    score += 3  # toque 50%-61,8%
-    if fib["confirmada"]:
-        score += 3
-    if conf["body_ratio"] >= 0.50:
-        score += 1
-
-    resultado["pullback"] = "FIB 50%-61,8%"
-    resultado["rejeicao"] = "CONFIRMADA" if fib["confirmada"] else "NÃO"
-    resultado["zona_fibonacci"] = (
-        f"{fib['zona_low']:.5f} - {fib['zona_high']:.5f}"
-    )
-    resultado["lateral"] = "NÃO"
-
-    # Evita impulso pequeno demais ou volatilidade anormal.
-    atr_ok = bool(atr14 and preco and 0.00008 <= atr14 / preco <= 0.0040)
-
-    if direcao == "CALL":
-        resultado["score_call"] = score
-        resultado["score_put"] = 1
-    else:
-        resultado["score_put"] = score
-        resultado["score_call"] = 1
-
-    resultado["score"] = score
-
-    if not atr_ok:
-        resultado["bloqueio"] = "ATR fora da faixa ideal para Fibonacci."
-    elif not fib["confirmada"]:
-        resultado["bloqueio"] = "Tocou Fibonacci, mas faltou confirmação."
-    elif score < 10:
-        resultado["bloqueio"] = "Setup Fibonacci abaixo da qualidade mínima."
-    else:
-        resultado["sinal"] = direcao
-        resultado["bloqueio"] = "SINAL"
-        resultado["mensagem"] = (
-            f"{direcao} | Fibonacci 50%-61,8% + confirmação | score={score}/12"
-        )
-
-    return resultado
-
-
-def analisar_lateral_rejeicao(candles_5m, candles_15m):
-    resultado = _resultado_base_multi(
-        candles_5m, candles_15m, "LATERAL_REJEICAO", "LATERAL"
-    )
-
-    if len(candles_5m) < 30:
-        resultado["bloqueio"] = "Poucas velas para faixa lateral."
-        return resultado
-
-    c = closes(candles_5m)
-    preco = c[-1]
-    atr14 = resultado["atr"]
-    ema5_v = resultado["ema5"]
-    ema13_v = resultado["ema13"]
-    ema21_v = resultado["ema21"]
-
-    lateral = mercado_lateral(preco, ema5_v, ema13_v, ema21_v, atr14)
-    resultado["lateral"] = "SIM" if lateral else "NÃO"
-
-    if not lateral:
-        resultado["bloqueio"] = "Mercado não está lateral."
-        resultado["mensagem"] = "AGUARDAR | estratégia lateral desativada."
-        return resultado
-
-    # Faixa recente sem usar a vela de confirmação.
-    faixa = [candle_info(x) for x in candles_5m[-21:-1]]
-    suporte = min(x["low"] for x in faixa)
-    resistencia = max(x["high"] for x in faixa)
-    largura = resistencia - suporte
-
-    if not atr14 or largura < atr14 * 2.2 or largura > atr14 * 7.0:
-        resultado["bloqueio"] = "Faixa lateral sem largura adequada."
-        return resultado
-
-    conf = candle_info(candles_5m[-1])
-    tolerancia = atr14 * 0.30
-
-    perto_suporte = conf["low"] <= suporte + tolerancia
-    perto_resistencia = conf["high"] >= resistencia - tolerancia
-
-    rejeicao_call = (
-        perto_suporte
-        and conf["close"] > conf["open"]
-        and conf["lower_wick"] >= conf["body"] * 0.7
-        and conf["close"] > suporte + largura * 0.12
-    )
-    rejeicao_put = (
-        perto_resistencia
-        and conf["close"] < conf["open"]
-        and conf["upper_wick"] >= conf["body"] * 0.7
-        and conf["close"] < resistencia - largura * 0.12
-    )
-
-    score_call = 0
-    score_put = 0
-
-    if perto_suporte:
-        score_call += 4
-    if rejeicao_call:
-        score_call += 5
-    if resultado["tendencia_15m"] in ("NEUTRA", "ALTA"):
-        score_call += 1
-    if conf["body_ratio"] >= 0.25:
-        score_call += 1
-
-    if perto_resistencia:
-        score_put += 4
-    if rejeicao_put:
-        score_put += 5
-    if resultado["tendencia_15m"] in ("NEUTRA", "BAIXA"):
-        score_put += 1
-    if conf["body_ratio"] >= 0.25:
-        score_put += 1
-
-    resultado["score_call"] = score_call
-    resultado["score_put"] = score_put
-    resultado["score"] = max(score_call, score_put)
-    resultado["pullback"] = "FAIXA LATERAL"
-    resultado["rejeicao"] = (
-        "CONFIRMADA" if (rejeicao_call or rejeicao_put) else "NÃO"
-    )
-
-    # Conservador: só opera a borda da faixa, nunca o meio.
-    if rejeicao_call and score_call >= 10:
-        resultado["sinal"] = "CALL"
-        resultado["bloqueio"] = "SINAL"
-        resultado["mensagem"] = (
-            f"CALL | rejeição no suporte lateral | score={score_call}/11"
-        )
-    elif rejeicao_put and score_put >= 10:
-        resultado["sinal"] = "PUT"
-        resultado["bloqueio"] = "SINAL"
-        resultado["mensagem"] = (
-            f"PUT | rejeição na resistência lateral | score={score_put}/11"
-        )
-    else:
-        resultado["bloqueio"] = "Lateral, mas sem rejeição forte na borda."
-        resultado["mensagem"] = "AGUARDAR | sem rejeição lateral válida."
-
-    return resultado
-
-
-def analisar_multi_estrategia(candles_5m, candles_15m):
-    """Seleciona UMA estratégia conforme o regime atual do mercado."""
-    regime = _detectar_regime(candles_5m, candles_15m)
-
-    if regime == "LATERAL":
-        return analisar_lateral_rejeicao(candles_5m, candles_15m)
-
-    if regime == "TENDENCIA":
-        # Fibonacci recebe prioridade quando existe impulso + retração na zona.
-        t5 = tendencia_timeframe(candles_5m)
-        direcao = "CALL" if t5 == "ALTA" else "PUT"
-        fib = _fib_setup_info(candles_5m, direcao)
-
-        if fib is not None:
-            return analisar_fibonacci_pullback(candles_5m, candles_15m)
-
-        resultado = analisar_pullback(candles_5m, candles_15m)
-        resultado["estrategia"] = "TENDENCIA_PULLBACK"
-        resultado["regime"] = "TENDENCIA"
-        resultado["zona_fibonacci"] = "-"
-        return resultado
-
-    # Transição/desalinhamento: não força estratégia.
-    resultado = _resultado_base_multi(
-        candles_5m, candles_15m, "SEM_ESTRATEGIA", "TRANSICAO"
-    )
-    resultado["bloqueio"] = "Mercado em transição; nenhuma estratégia habilitada."
-    resultado["mensagem"] = "AGUARDAR | regime de transição."
-    return resultado
+    # Nunca bloqueia o callback do WebSocket esperando a resposta da ordem.
+    threading.Thread(
+        target=registrar_operacao_intravela,
+        args=(symbol, resultado),
+        daemon=True,
+        name=f"intravela-order-{codigo}-{resultado['candle_from']}",
+    ).start()
 
 
 def calcular_estatisticas_por_estrategia():
-    saida = {}
+    wins = losses = dojis = 0
     for item in _historico_resultados:
-        estrategia = item.get("estrategia", "BASE")
-        if estrategia == "BASE":
+        if item.get("estrategia") != "RETRACAO_MESMA_VELA":
             continue
-        bloco = saida.setdefault(
-            estrategia,
-            {"total": 0, "wins": 0, "losses": 0, "dojis": 0, "taxa": 0.0}
-        )
-        bloco["total"] += 1
-        if item.get("resultado") == "WIN":
-            bloco["wins"] += 1
-        elif item.get("resultado") == "LOSS":
-            bloco["losses"] += 1
-        elif item.get("resultado") == "DOJI":
-            bloco["dojis"] += 1
-
-    for bloco in saida.values():
-        decididos = bloco["wins"] + bloco["losses"]
-        bloco["taxa"] = round(
-            bloco["wins"] / decididos * 100 if decididos else 0.0,
-            2
-        )
-    return saida
+        r = item.get("resultado")
+        if r == "WIN":
+            wins += 1
+        elif r == "LOSS":
+            losses += 1
+        elif r == "DOJI":
+            dojis += 1
+    total = wins + losses + dojis
+    decididos = wins + losses
+    return {
+        "RETRACAO_MESMA_VELA": {
+            "total": total,
+            "wins": wins,
+            "losses": losses,
+            "dojis": dojis,
+            "taxa": round(wins / decididos * 100 if decididos else 0.0, 2),
+        }
+    }
 
 
 # ============================================================
@@ -3666,157 +3592,110 @@ def enviar_sinal_telegram(
 # REGISTRAR OPERAÇÃO
 # ============================================================
 
-def registrar_operacao(
-    symbol,
-    resultado,
-    candles
-):
-    global _operacao_global_ativa
-
+def registrar_operacao_intravela(symbol, resultado):
     sinal = resultado.get("sinal")
     if sinal not in ("CALL", "PUT"):
         return
 
-    vela_sinal = resultado.get("vela")
-    if not isinstance(vela_sinal, datetime):
-        return
-
-    vela_entrada = vela_sinal + timedelta(minutes=5)
-    vela_expiracao = vela_entrada
-    chave = f"{symbol}|{vela_sinal.isoformat()}"
+    candle_from = int(resultado["candle_from"])
+    candle_dt = datetime.fromtimestamp(candle_from, TZ)
+    chave = f"{symbol}|INTRAVELA|{candle_from}"
 
     if _ultimas_operacoes_registradas.get(symbol) == chave:
-        log(f"{symbol}: operacao duplicada para a mesma vela ignorada.")
         return
+
     if symbol in _operacoes_pendentes:
-        log(f"{symbol}: ja existe operacao pendente.")
+        return
+
+    status = executar_ordem_intravela(symbol, sinal, resultado)
+    if status != "CONFIRMADA":
         return
 
     with _execucao_lock:
-        if UMA_OPERACAO_GLOBAL and _operacao_global_ativa is not None:
-            log(f"{symbol}: sinal ignorado porque existe operação global ativa.")
-            return
+        info = (_operacao_global_ativa or {}).copy()
 
     operacao = {
         "id": chave,
         "symbol": symbol,
         "sinal": sinal,
         "score": resultado.get("score", 0),
-        "estrategia": resultado.get("estrategia", "TENDENCIA_PULLBACK"),
-        "regime": resultado.get("regime", "-"),
+        "estrategia": "RETRACAO_MESMA_VELA",
+        "regime": "INTRAVELA",
         "preco_sinal": float(resultado["preco"]),
-        "vela_sinal": vela_sinal,
-        "vela_entrada": vela_entrada,
-        "vela_expiracao": vela_expiracao,
-        "entrada": None,
+        "vela_sinal": candle_dt,
+        "vela_entrada": candle_dt,
+        "vela_expiracao": candle_dt,
+        "entrada": float(resultado["preco"]),
         "saida": None,
         "resultado": "PENDENTE",
-        "ordem_automatica": False,
-        "valor": _valor_entrada_atual(),
-        "instrument_id": None,
-        "instrument_index": None,
-        "balance_id": None,
+        "ordem_automatica": True,
+        "valor": info.get("valor", _valor_entrada_atual()),
+        "balance_id": info.get("balance_id"),
+        "produto": info.get("produto", "BINARIA_INTRAVELA"),
+        "option_id": info.get("option_id"),
+        "candle_to": int(resultado["candle_to"]),
+        "retracao_ratio": resultado.get("retracao_ratio"),
+        "impulso": resultado.get("impulso"),
     }
-
-    if BULLEX_AUTO_TRADE:
-        status = executar_ordem_demo(symbol, sinal, resultado)
-        if status != "CONFIRMADA":
-            return
-        with _execucao_lock:
-            info = _operacao_global_ativa or {}
-        operacao.update({
-            "ordem_automatica": True,
-            "valor": info.get("valor", operacao["valor"]),
-            "instrument_id": info.get("instrument_id"),
-            "instrument_index": info.get("instrument_index"),
-            "balance_id": info.get("balance_id"),
-            "produto": info.get("produto"),
-        })
 
     _operacoes_pendentes[symbol] = operacao
     _ultimas_operacoes_registradas[symbol] = chave
-    log(f"{symbol}: operacao registrada {sinal} | vela entrada={vela_entrada.strftime('%H:%M')}")
+
+    log(
+        f"[INTRAVELA] {symbol}: operação registrada {sinal} | "
+        f"entrada={operacao['entrada']:.5f} | "
+        f"expira={datetime.fromtimestamp(int(resultado['candle_to']), TZ).strftime('%H:%M:%S')}"
+    )
+
+    threading.Thread(
+        target=enviar_sinal_telegram,
+        args=(symbol, resultado),
+        daemon=True,
+        name=f"telegram-intravela-{symbol}-{candle_from}",
+    ).start()
+
+
 
 
 # ============================================================
 # AVALIAR WIN / LOSS
 # ============================================================
 
-def avaliar_operacao(
-    symbol,
-    candles
-):
+def avaliar_operacao(symbol, candles):
     global _operacao_global_ativa
 
-    operacao = (
-        _operacoes_pendentes.get(
-            symbol
-        )
-    )
-
+    operacao = _operacoes_pendentes.get(symbol)
     if not operacao:
         return
 
     agora = agora_brt()
+    alvo_dt = operacao["vela_expiracao"]
 
-    alvo_dt = operacao[
-        "vela_expiracao"
-    ]
-
-    for candle in candles:
+    for candle in ordenar_candles(candles):
         dt = candle["_dt"]
-
         if dt != alvo_dt:
             continue
 
-        if (
-            dt
-            +
-            timedelta(minutes=5)
-            >
-            agora
-        ):
+        if dt + timedelta(minutes=5) > agora:
             return
 
-        info = candle_info(
-            candle
-        )
-
-        entrada = info["open"]
+        info = candle_info(candle)
+        entrada = float(operacao.get("entrada") or operacao.get("preco_sinal"))
         saida = info["close"]
 
         operacao["entrada"] = entrada
         operacao["saida"] = saida
 
         if operacao["sinal"] == "CALL":
-            if saida > entrada:
-                resultado = "WIN"
-            elif saida < entrada:
-                resultado = "LOSS"
-            else:
-                resultado = "DOJI"
+            resultado = "WIN" if saida > entrada else "LOSS" if saida < entrada else "DOJI"
         else:
-            if saida < entrada:
-                resultado = "WIN"
-            elif saida > entrada:
-                resultado = "LOSS"
-            else:
-                resultado = "DOJI"
+            resultado = "WIN" if saida < entrada else "LOSS" if saida > entrada else "DOJI"
 
         operacao["resultado"] = resultado
         operacao["finalizado_em"] = agora
+        _historico_resultados.append(operacao.copy())
+        del _operacoes_pendentes[symbol]
 
-        _historico_resultados.append(
-            operacao.copy()
-        )
-
-        del _operacoes_pendentes[
-            symbol
-        ]
-
-        # A ordem automática confirmada ocupa a trava global.
-        # Ao finalizar WIN/LOSS/DOJI, libera a trava para permitir
-        # que o próximo sinal possa executar uma nova ordem.
         with _execucao_lock:
             if (
                 _operacao_global_ativa is not None
@@ -3824,38 +3703,21 @@ def avaliar_operacao(
             ):
                 _operacao_global_ativa = None
 
-        # Atualiza o Soros/Martingale configurado:
-        # WIN volta para R$ 5,00; LOSS avança 5 -> 10,50 -> 23.
-        # DOJI mantém o nível atual.
         _atualizar_progressao(resultado)
         _atualizar_estado_execucao()
 
-        log(
-            f"[AUTO DEMO] Operação finalizada e trava global liberada | "
-            f"{symbol} resultado={resultado} | "
-            f"próximo_valor=R${_valor_entrada_atual():.2f}"
-        )
-
-        estatisticas = (
-            calcular_estatisticas()
-        )
+        estatisticas = calcular_estatisticas()
 
         log(
-            f"{symbol}: "
-            f"{operacao['sinal']} -> "
-            f"{resultado} | "
-            f"entrada={entrada:.5f} | "
-            f"saida={saida:.5f} | "
-            f"taxa="
-            f"{estatisticas['taxa']:.2f}%"
+            f"[RESULTADO INTRAVELA] {symbol} {operacao['sinal']} -> {resultado} | "
+            f"entrada={entrada:.5f} | fechamento_mesma_vela={saida:.5f} | "
+            f"taxa_total={estatisticas['taxa']:.2f}%"
         )
 
-        enviar_resultado_telegram(
-            operacao,
-            estatisticas
-        )
-
+        enviar_resultado_telegram(operacao, estatisticas)
         return
+
+
 
 
 # ============================================================
@@ -3944,372 +3806,38 @@ def finalizar_operacoes_vencidas_antes_da_leitura():
 # PROCESSAR ATIVO
 # ============================================================
 
-def processar_ativo(
-    chave,
-    symbol,
-    executar_sinal=True
-):
-    inicio_processamento = time.time()
+def processar_ativo(chave, symbol, executar_sinal=False):
+    """Na R13 o loop de 5 minutos não cria sinais.
 
+    Ele apenas mantém histórico atualizado e finaliza operações.
+    Os sinais surgem exclusivamente do candle-generated da vela corrente.
+    """
     with _bullex_assets_lock:
-        config_disponivel = ATIVO_BULLEX.get(chave)
+        config = ATIVO_BULLEX.get(chave)
 
-    if not config_disponivel:
-        log(
-            f"[OPEN MARKET] {symbol}: aguardando active_id; leitura ignorada nesta rodada."
-        )
-        return
+    if not config:
+        return None
 
     try:
-        log(
-            f"Consultando 5M: {symbol}"
-        )
+        candles_5m = obter_candles(symbol, TIMEFRAME, OUTPUTSIZE)
+        avaliar_operacao(symbol, candles_5m)
 
-        candles_5m = obter_candles(
-            symbol,
-            TIMEFRAME,
-            OUTPUTSIZE
-        )
-
-        ultimo_raw, idade = (
-            idade_do_ultimo_candle(
-                candles_5m
-            )
-        )
-
-        if ultimo_raw is None:
-            raise RuntimeError(
-                "Ultimo candle nao encontrado."
-            )
-
-        log(
-            f"{symbol} | "
-            f"ultimo 5M="
-            f"{ultimo_raw['_dt'].strftime('%Y-%m-%d %H:%M:%S')} "
-            f"BRT | "
-            f"atraso="
-            f"{idade:.2f} min"
-        )
-
-        avaliar_operacao(
-            symbol,
-            candles_5m
-        )
-
-        if idade > MAX_ATRASO_MINUTOS:
+        ultimo, idade = idade_do_ultimo_candle(candles_5m)
+        if ultimo is not None:
             estado["ativo"] = symbol
-            estado["sinal"] = "AGUARDAR"
-            estado["score"] = 0
-            estado["preco"] = (
-                f"{float(ultimo_raw['close']):.5f}"
-            )
-            estado["vela"] = (
-                ultimo_raw["_dt"].strftime(
-                    "%Y-%m-%d %H:%M:%S BRT"
-                )
-            )
-            estado["atualidade_min"] = (
-                f"{idade:.1f} min"
-            )
-            estado["atualizado"] = (
-                agora_brt().strftime(
-                    "%H:%M:%S BRT"
-                )
-            )
-            estado["mensagem"] = (
-                f"Dado atrasado ({idade:.1f} min)."
-            )
-            return
-
-        fechadas_5m = (
-            somente_velas_fechadas(
-                candles_5m,
-                5
-            )
-        )
-
-        if len(fechadas_5m) < 40:
-            log(
-                f"{symbol}: poucas velas 5M."
-            )
-            return
-
-        log(
-            f"Consultando 15M: {symbol}"
-        )
-
-        candles_15m_raw = (
-            obter_candles(
-                symbol,
-                TIMEFRAME_TREND,
-                OUTPUTSIZE_15M
-            )
-        )
-
-        fechadas_15m = (
-            somente_velas_fechadas(
-                candles_15m_raw,
-                15
-            )
-        )
-
-        if len(fechadas_15m) < 40:
-            log(
-                f"{symbol}: poucas velas 15M."
-            )
-            return
-
-        resultado = analisar_multi_estrategia(
-            fechadas_5m,
-            fechadas_15m
-        )
-
-        estado["ativo"] = symbol
-        estado["sinal"] = resultado["sinal"]
-        estado["score"] = resultado["score"]
-
-        preco = resultado.get("preco")
-
-        estado["preco"] = (
-            f"{preco:.5f}"
-            if isinstance(
-                preco,
-                (float, int)
-            )
-            else "-"
-        )
-
-        vela = resultado.get("vela")
-
-        estado["vela"] = (
-            vela.strftime(
-                "%Y-%m-%d %H:%M:%S BRT"
-            )
-            if isinstance(
-                vela,
-                datetime
-            )
-            else "-"
-        )
-
-        estado["atualizado"] = (
-            agora_brt().strftime(
-                "%H:%M:%S BRT"
-            )
-        )
-
-        estado["atualidade_min"] = (
-            f"{idade:.1f} min"
-        )
-
-        estado["mensagem"] = (
-            resultado.get(
-                "mensagem",
-                ""
-            )
-        )
-
-        estado["detalhes"] = {
-            "score_call":
-                resultado.get(
-                    "score_call",
-                    "-"
-                ),
-
-            "score_put":
-                resultado.get(
-                    "score_put",
-                    "-"
-                ),
-
-            "rsi": (
-                f"{resultado['rsi']:.2f}"
-                if isinstance(
-                    resultado.get("rsi"),
-                    (float, int)
-                )
-                else "-"
-            ),
-
-            "ema5": (
-                f"{resultado['ema5']:.5f}"
-                if isinstance(
-                    resultado.get("ema5"),
-                    (float, int)
-                )
-                else "-"
-            ),
-
-            "ema13": (
-                f"{resultado['ema13']:.5f}"
-                if isinstance(
-                    resultado.get("ema13"),
-                    (float, int)
-                )
-                else "-"
-            ),
-
-            "ema21": (
-                f"{resultado['ema21']:.5f}"
-                if isinstance(
-                    resultado.get("ema21"),
-                    (float, int)
-                )
-                else "-"
-            ),
-
-            "tendencia_5m":
-                resultado.get(
-                    "tendencia_5m",
-                    "-"
-                ),
-
-            "tendencia_15m":
-                resultado.get(
-                    "tendencia_15m",
-                    "-"
-                ),
-
-            "pullback":
-                resultado.get(
-                    "pullback",
-                    "-"
-                ),
-
-            "confirmacao":
-                resultado.get(
-                    "rejeicao",
-                    "-"
-                ),
-
-            "lateral":
-                resultado.get(
-                    "lateral",
-                    "-"
-                ),
-
-            "atr": (
-                f"{resultado['atr']:.6f}"
-                if isinstance(
-                    resultado.get("atr"),
-                    (float, int)
-                )
-                else "-"
-            ),
-
-            "bloqueio": resultado.get(
-                "bloqueio",
-                "-"
-            ),
-
-            "regime": resultado.get(
-                "regime",
-                "-"
-            ),
-
-            "estrategia": resultado.get(
-                "estrategia",
-                "-"
-            ),
-
-            "zona_fibonacci": resultado.get(
-                "zona_fibonacci",
-                "-"
-            ),
-        }
-
-        log(
-            f"{symbol} -> "
-            f"{resultado['sinal']} | "
-            f"estrategia={resultado.get('estrategia', '-')} | "
-            f"regime={resultado.get('regime', '-')} | "
-            f"score="
-            f"{resultado['score']} | "
-            f"CALL="
-            f"{resultado.get('score_call', 0)} | "
-            f"PUT="
-            f"{resultado.get('score_put', 0)} | "
-            f"5M="
-            f"{resultado.get('tendencia_5m', '-')} | "
-            f"15M="
-            f"{resultado.get('tendencia_15m', '-')} | "
-            f"pullback="
-            f"{resultado.get('pullback', '-')} | "
-            f"confirmacao="
-            f"{resultado.get('rejeicao', '-')} | "
-            f"lateral="
-            f"{resultado.get('lateral', '-')} | "
-            f"preco="
-            f"{estado['preco']}"
-            f" | bloqueio="
-            f"{resultado.get('bloqueio', '-')}"
-        )
-
-        candidato = None
-
-        if resultado["sinal"] in (
-            "CALL",
-            "PUT"
-        ):
-            janela_diag = _janela_execucao_5m()
-            log(
-                f"[LATENCIA] {symbol} sinal pronto em "
-                f"{time.time() - inicio_processamento:.3f}s | "
-                f"atraso_na_vela={janela_diag['atraso_segundos']:.3f}s"
-            )
-
-            candidato = {
-                "chave": chave,
-                "symbol": symbol,
-                "resultado": resultado,
-                "candles": fechadas_5m,
-                "score": int(resultado.get("score", 0) or 0),
-                "margem_score": abs(
-                    int(resultado.get("score_call", 0) or 0)
-                    - int(resultado.get("score_put", 0) or 0)
-                ),
-                "atraso": float(janela_diag["atraso_segundos"]),
-            }
-
-            if executar_sinal:
-                registrar_operacao(
-                    symbol,
-                    resultado,
-                    fechadas_5m
-                )
-
-                threading.Thread(
-                    target=enviar_sinal_telegram,
-                    args=(symbol, resultado),
-                    daemon=True,
-                    name=f"telegram-sinal-{chave}",
-                ).start()
-
-        estado[
-            "estatisticas"
-        ] = calcular_estatisticas()
-
-        return candidato
+            estado["preco"] = f"{float(ultimo['close']):.5f}"
+            estado["atualizado"] = agora_brt().strftime("%H:%M:%S BRT")
+            estado["atualidade_min"] = f"{idade:.1f} min" if idade is not None else "-"
+            if estado.get("sinal") not in ("CALL", "PUT"):
+                estado["sinal"] = "AGUARDAR"
+                estado["mensagem"] = "Monitorando retração na vela atual em tempo real."
+        return None
 
     except Exception as e:
-        log(
-            f"ERRO em {symbol}: {e}"
-        )
+        log(f"ERRO manutenção {symbol}: {e}")
+        return None
 
-        estado["ativo"] = symbol
-        estado["sinal"] = "AGUARDAR"
-        estado["score"] = 0
-        estado["preco"] = "-"
-        estado["vela"] = "-"
-        estado["atualizado"] = (
-            agora_brt().strftime(
-                "%H:%M:%S BRT"
-            )
-        )
-        estado["atualidade_min"] = "-"
-        estado["mensagem"] = (
-            f"Erro: {e}"
-        )
+
 
 
 # ============================================================
@@ -4390,76 +3918,12 @@ def executar_leitura():
 
         return
 
-    # 1) Primeiro apura a operação anterior e libera a trava, se já venceu.
+    # Na R13, sinais NÃO são gerados aqui.
+    # A retração é detectada em tempo real no candle-generated.
     finalizar_operacoes_vencidas_antes_da_leitura()
 
-    # 2) Analisa TODOS os pares antes de decidir qual ordem enviar.
-    candidatos = []
-
     for chave, symbol in ATIVOS.items():
-        candidato = processar_ativo(
-            chave,
-            symbol,
-            executar_sinal=False
-        )
-        if candidato is not None:
-            candidatos.append(candidato)
-
-    # 3) Se houver vários sinais na mesma vela, executa apenas o melhor.
-    if candidatos:
-        # Prioridade:
-        #   1. maior score total;
-        #   2. maior diferença entre score CALL e PUT;
-        #   3. menor atraso;
-        #   4. nome do ativo apenas para desempate determinístico.
-        candidatos.sort(
-            key=lambda c: (
-                -c["score"],
-                -c["margem_score"],
-                c["atraso"],
-                c["symbol"],
-            )
-        )
-
-        melhor = candidatos[0]
-
-        if len(candidatos) > 1:
-            log(
-                "[SELECAO] Sinais válidos desta vela: "
-                + ", ".join(
-                    f"{c['symbol']}={c['resultado']['sinal']}"
-                    f"(score={c['score']})"
-                    for c in candidatos
-                )
-            )
-
-        log(
-            f"[SELECAO] Melhor sinal: {melhor['symbol']} "
-            f"{melhor['resultado']['sinal']} | "
-            f"score={melhor['score']} | "
-            f"margem={melhor['margem_score']} | "
-            f"atraso={melhor['atraso']:.3f}s"
-        )
-
-        registrar_operacao(
-            melhor["symbol"],
-            melhor["resultado"],
-            melhor["candles"]
-        )
-
-        threading.Thread(
-            target=enviar_sinal_telegram,
-            args=(melhor["symbol"], melhor["resultado"]),
-            daemon=True,
-            name=f"telegram-sinal-{melhor['chave']}",
-        ).start()
-
-        for descartado in candidatos[1:]:
-            log(
-                f"[SELECAO] {descartado['symbol']} "
-                f"{descartado['resultado']['sinal']} não executado: "
-                "houve sinal melhor na mesma vela."
-            )
+        processar_ativo(chave, symbol, executar_sinal=False)
 
     estado[
         "estatisticas"
@@ -4788,7 +4252,7 @@ Robo Forex Pullback PRO
 
 <div class="subtitulo">
 
-Multi-estratégia: Tendência + Fibonacci + Lateral
+Estratégia única: retração intravela na mesma vela
 
 </div>
 
@@ -4866,13 +4330,13 @@ Filtros da entrada
 </div>
 
 <div class="linha">
-<span>Estratégia escolhida</span>
+<span>Estratégia</span>
 <span class="valor">{{ estado.detalhes.estrategia }}</span>
 </div>
 
 <div class="linha">
-<span>Zona Fibonacci</span>
-<span class="valor">{{ estado.detalhes.zona_fibonacci }}</span>
+<span>Expiração</span>
+<span class="valor">MESMA VELA 5M</span>
 </div>
 
 <div class="linha">
@@ -5137,10 +4601,7 @@ def health():
             ),
         "estrategia":
             (
-                "5M + 15M + "
-                "pullback + "
-                "confirmacao "
-                "em vela separada"
+                "Retracao intravela na mesma vela de 5 minutos"
             ),
         "fonte_candles": "Bullex",
         "execucao_automatica": BULLEX_AUTO_TRADE,
