@@ -122,7 +122,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OTC-ONLY-BINARY-5-BRL-20260909-R19-SR-M5-7PAIRS-22H20H-DASHFIX"
+BULLEX_DIAGNOSTIC_VERSION = "OTC-ONLY-BINARY-5-BRL-20260909-R20-DASH-7PAIRS-STATS"
 
 _bullex_diag = {
     "messages": 0,
@@ -3811,6 +3811,58 @@ def calcular_estatisticas():
     }
 
 
+def calcular_estatisticas_por_ativo():
+    """Estatísticas individuais somente das operações que possuem ativo identificado."""
+    resultado = {}
+
+    # Mantém todos os ativos visíveis no dashboard, mesmo com 0 operações.
+    for _, symbol in ATIVOS.items():
+        resultado[symbol] = {
+            "total": 0,
+            "wins": 0,
+            "losses": 0,
+            "dojis": 0,
+            "taxa": 0.0,
+        }
+
+    for item in _historico_resultados:
+        symbol = item.get("symbol")
+        if not symbol:
+            # A base histórica antiga não informa qual ativo originou a operação.
+            # Por isso ela não é distribuída artificialmente entre os pares.
+            continue
+
+        if symbol not in resultado:
+            resultado[symbol] = {
+                "total": 0,
+                "wins": 0,
+                "losses": 0,
+                "dojis": 0,
+                "taxa": 0.0,
+            }
+
+        r = item.get("resultado")
+        if r == "WIN":
+            resultado[symbol]["wins"] += 1
+        elif r == "LOSS":
+            resultado[symbol]["losses"] += 1
+        elif r == "DOJI":
+            resultado[symbol]["dojis"] += 1
+        else:
+            continue
+
+        resultado[symbol]["total"] += 1
+
+    for stats in resultado.values():
+        decididos = stats["wins"] + stats["losses"]
+        stats["taxa"] = round(
+            stats["wins"] / decididos * 100 if decididos else 0.0,
+            2,
+        )
+
+    return resultado
+
+
 # ============================================================
 # TELEGRAM
 # ============================================================
@@ -4665,6 +4717,88 @@ h1 {
     margin-top: 15px;
 }
 
+
+.ativos-grid {
+
+    display: grid;
+
+    grid-template-columns:
+    repeat(auto-fit, minmax(210px, 1fr));
+
+    gap: 12px;
+}
+
+.ativo-card {
+
+    background: #1d1d1d;
+
+    border-radius: 15px;
+
+    padding: 16px;
+
+    box-shadow:
+    0 4px 15px
+    rgba(0,0,0,.25);
+}
+
+.ativo-nome {
+
+    font-size: 18px;
+
+    font-weight: bold;
+
+    text-align: center;
+
+    margin-bottom: 12px;
+}
+
+.ativo-estatisticas {
+
+    display: grid;
+
+    grid-template-columns:
+    repeat(3, 1fr);
+
+    gap: 8px;
+}
+
+.ativo-box {
+
+    background: #292929;
+
+    border-radius: 9px;
+
+    padding: 10px 6px;
+
+    text-align: center;
+
+    font-size: 12px;
+}
+
+.ativo-numero {
+
+    font-size: 21px;
+
+    font-weight: bold;
+
+    margin-top: 4px;
+}
+
+.ativo-taxa {
+
+    margin-top: 10px;
+
+    padding-top: 10px;
+
+    border-top: 1px solid #333;
+
+    display: flex;
+
+    justify-content: space-between;
+
+    gap: 8px;
+}
+
 </style>
 
 </head>
@@ -4852,57 +4986,51 @@ Filtros da entrada
 
 </div>
 
-<div class="card">
+<h2 style="text-align:center; margin: 22px 0 12px;">
+Desempenho por ativo
+</h2>
 
-<h3>
-Estatísticas
-</h3>
+<div class="ativos-grid">
 
-<div class="estatisticas">
+{% for symbol, stats in estatisticas_por_ativo.items() %}
+<div class="ativo-card">
 
-<div class="box">
-Total
-<div class="numero">
-{{ estado.estatisticas.total }}
-</div>
+<div class="ativo-nome">
+{{ symbol }}
 </div>
 
-<div class="box">
+<div class="ativo-estatisticas">
+
+<div class="ativo-box">
 WIN
-<div class="numero">
-{{ estado.estatisticas.wins }}
+<div class="ativo-numero">
+{{ stats.wins }}
 </div>
 </div>
 
-<div class="box">
+<div class="ativo-box">
 LOSS
-<div class="numero">
-{{ estado.estatisticas.losses }}
+<div class="ativo-numero">
+{{ stats.losses }}
 </div>
 </div>
 
-<div class="box">
-DOJI
-<div class="numero">
-{{ estado.estatisticas.dojis }}
+<div class="ativo-box">
+TOTAL
+<div class="ativo-numero">
+{{ stats.total }}
 </div>
 </div>
 
 </div>
 
-<br>
-
-<div class="linha">
-
-<span>
-Taxa de acerto
-</span>
-
-<span class="valor">
-{{ estado.estatisticas.taxa }}%
-</span>
+<div class="ativo-taxa">
+<span>Taxa de acerto</span>
+<span class="valor">{{ "%.2f"|format(stats.taxa) }}%</span>
+</div>
 
 </div>
+{% endfor %}
 
 </div>
 
@@ -4999,9 +5127,12 @@ def index():
         "estatisticas"
     ] = calcular_estatisticas()
 
+    estatisticas_por_ativo = calcular_estatisticas_por_ativo()
+
     return render_template_string(
         HTML,
-        estado=estado
+        estado=estado,
+        estatisticas_por_ativo=estatisticas_por_ativo,
     )
 
 
@@ -5012,6 +5143,9 @@ def dados():
     estado[
         "estatisticas"
     ] = calcular_estatisticas()
+    estado[
+        "estatisticas_por_ativo"
+    ] = calcular_estatisticas_por_ativo()
 
     return jsonify(
         estado
@@ -5076,6 +5210,8 @@ def health():
         },
         "estatisticas":
             calcular_estatisticas(),
+        "estatisticas_por_ativo":
+            calcular_estatisticas_por_ativo(),
         "estatisticas_por_estrategia":
             calcular_estatisticas_por_estrategia(),
     })
