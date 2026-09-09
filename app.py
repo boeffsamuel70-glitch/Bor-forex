@@ -79,6 +79,16 @@ PARES_MERCADO_ABERTO = {
     "AUDJPY": "AUD/JPY",
 }
 
+# OTC populares. Os active_id NÃO são fixos:
+# são descobertos automaticamente na lista da Traderoom.
+PARES_OTC_ALVO = {
+    "EURUSD": "EUR/USD OTC",
+    "GBPUSD": "GBP/USD OTC",
+    "USDJPY": "USD/JPY OTC",
+    "GBPJPY": "GBP/JPY OTC",
+    "EURJPY": "EUR/JPY OTC",
+}
+
 _bullex_assets_lock = threading.RLock()
 _bullex_assets_detected = False
 _bullex_assets_last_error = None
@@ -110,7 +120,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OPEN-MARKET-BINARY-ONLY-5-BRL-20260909-R15-M5-M15-SR-INTRABAR"
+BULLEX_DIAGNOSTIC_VERSION = "OPEN-MARKET-BINARY-ONLY-5-BRL-20260909-R16-OPEN-OTC-M5-M15-SR-INTRABAR"
 
 _bullex_diag = {
     "messages": 0,
@@ -209,6 +219,12 @@ ATIVOS = {
     "AUDUSD": "AUD/USD",
     "USDCAD": "USD/CAD",
     "AUDJPY": "AUD/JPY",
+
+    "EURUSD_OTC": "EUR/USD OTC",
+    "GBPUSD_OTC": "GBP/USD OTC",
+    "USDJPY_OTC": "USD/JPY OTC",
+    "GBPJPY_OTC": "GBP/JPY OTC",
+    "EURJPY_OTC": "EUR/JPY OTC",
 }
 
 # ============================================================
@@ -1801,12 +1817,8 @@ def _primeiro_valor(item, chaves):
 
 
 def _normalizar_par_mercado_aberto(item):
-    """Normaliza um underlying de Forex e rejeita explicitamente qualquer OTC."""
+    """Normaliza Forex normal e os OTC explicitamente configurados."""
     if not isinstance(item, dict):
-        return None
-
-    # Rejeição forte por flag e por texto: esta versão não negocia OTC.
-    if item.get("is_otc") is True or item.get("isOtc") is True:
         return None
 
     campos_texto = [
@@ -1818,9 +1830,15 @@ def _normalizar_par_mercado_aberto(item):
             "instrument_type",
         )
     ]
-    texto = " ".join(str(x) for x in campos_texto if x not in (None, "")).upper()
-    if "OTC" in texto:
-        return None
+    texto = " ".join(
+        str(x) for x in campos_texto if x not in (None, "")
+    ).upper()
+
+    is_otc = (
+        item.get("is_otc") is True
+        or item.get("isOtc") is True
+        or "OTC" in texto
+    )
 
     active_id = _primeiro_valor(
         item,
@@ -1843,15 +1861,29 @@ def _normalizar_par_mercado_aberto(item):
     base = re.sub(r"[^A-Z]", "", str(ticker or symbol or "").upper())
     if len(base) < 6:
         return None
+
     par = base[:6]
-    if par not in PARES_MERCADO_ABERTO:
-        return None
+
+    if is_otc:
+        if par not in PARES_OTC_ALVO:
+            return None
+        codigo = f"{par}_OTC"
+        symbol_final = PARES_OTC_ALVO[par]
+        mercado = "OTC"
+    else:
+        if par not in PARES_MERCADO_ABERTO:
+            return None
+        codigo = par
+        symbol_final = PARES_MERCADO_ABERTO[par]
+        mercado = "ABERTO"
 
     return {
-        "codigo": par,
-        "symbol": PARES_MERCADO_ABERTO[par],
+        "codigo": codigo,
+        "symbol": symbol_final,
         "active_id": active_id,
-        "ticker": str(ticker or par).strip(),
+        "ticker": str(ticker or (par + ("-OTC" if is_otc else ""))).strip(),
+        "is_otc": bool(is_otc),
+        "mercado": mercado,
         "raw": item,
     }
 
@@ -1874,7 +1906,11 @@ def _extrair_mercado_aberto_da_resposta(resposta):
         score_atual = int(raw_atual.get("is_visible") is True) + int(raw_atual.get("is_active") is True)
         if score_novo > score_atual:
             encontrados[codigo] = normalizado
-    return [encontrados[c] for c in PARES_MERCADO_ABERTO if c in encontrados]
+    ordem = (
+        list(PARES_MERCADO_ABERTO.keys())
+        + [f"{c}_OTC" for c in PARES_OTC_ALVO.keys()]
+    )
+    return [encontrados[c] for c in ordem if c in encontrados]
 
 
 def _corpo_lista_instrumentos(nome):
@@ -1891,8 +1927,8 @@ def _consultar_lista_mercado_aberto(nome, versoes=("2.0", "1.0")):
             resposta = _enviar_e_aguardar(nome, versao, body, timeout=12)
             ativos = _extrair_mercado_aberto_da_resposta(resposta)
             log(
-                f"[OPEN MARKET] {nome} v{versao}: "
-                f"{len(ativos)} par(es) normal(is) reconhecido(s)."
+                f"[ATIVOS] {nome} v{versao}: "
+                f"{len(ativos)} ativo(s) configurado(s) reconhecido(s)."
             )
             if ativos:
                 return resposta, ativos
@@ -1923,6 +1959,8 @@ def _atualizar_ativos_mercado_aberto(ativos, origem):
             "symbol": item["symbol"],
             "active_id": int(item["active_id"]),
             "ticker": item["ticker"],
+            "is_otc": bool(item.get("is_otc")),
+            "mercado": item.get("mercado", "OTC" if item.get("is_otc") else "ABERTO"),
         }
         novos_ativos[codigo] = item["symbol"]
 
@@ -1936,7 +1974,7 @@ def _atualizar_ativos_mercado_aberto(ativos, origem):
         _bullex_assets_ready_event.set()
 
     estado["ativos_info"] = {
-        "tipo": "MERCADO_ABERTO",
+        "tipo": "MERCADO_ABERTO_E_OTC",
         "quantidade": len(novos_bullex),
         "status": "AUTOMÁTICO",
         "lista": ", ".join(
@@ -1945,7 +1983,7 @@ def _atualizar_ativos_mercado_aberto(ativos, origem):
         ) or "-",
     }
     log(
-        "[OPEN MARKET] Ativos carregados: "
+        "[ATIVOS] Mercado aberto + OTC carregados: "
         + ", ".join(
             f"{cfg['ticker']}={cfg['active_id']}"
             for cfg in novos_bullex.values()
@@ -1954,7 +1992,7 @@ def _atualizar_ativos_mercado_aberto(ativos, origem):
 
 
 def _inicializar_ativos_mercado_aberto():
-    """Descobre somente Forex normal; se falhar, não usa fallback OTC.
+    """Descobre Forex normal e os OTC configurados automaticamente.
 
     A inicialização é serializada para impedir duas descobertas concorrentes
     após reconexões rápidas do WebSocket.
@@ -1973,7 +2011,7 @@ def _inicializar_ativos_mercado_aberto():
             _, ativos = _consultar_lista_mercado_aberto(fonte_digital)
             if not ativos:
                 raise RuntimeError(
-                    "Lista digital não retornou os pares normais configurados."
+                    "Lista digital não retornou os pares configurados."
                 )
 
             _atualizar_ativos_mercado_aberto(ativos, fonte_digital)
@@ -2009,7 +2047,7 @@ def _inicializar_ativos_mercado_aberto():
             _bullex_assets_ready_event.clear()
 
         estado["ativos_info"] = {
-            "tipo": "MERCADO_ABERTO",
+            "tipo": "MERCADO_ABERTO_E_OTC",
             "quantidade": 0,
             "status": "AGUARDANDO",
             "lista": "-",
@@ -2017,7 +2055,7 @@ def _inicializar_ativos_mercado_aberto():
         }
         log(
             "[OPEN MARKET] Ativos ainda não disponíveis. "
-            "A leitura ficará bloqueada até nova autenticação/descoberta; OTC não será usado."
+            "A leitura ficará bloqueada até nova autenticação/descoberta."
         )
     finally:
         _bullex_assets_init_lock.release()
@@ -3561,7 +3599,7 @@ def _processar_sinal_intravela(active_id, msg):
     _atualizar_dashboard_intravela(symbol, resultado)
 
     log(
-        f"[INTRAVELA] {symbol} -> {resultado['sinal']} | "
+        f"[INTRAVELA] {symbol} [{_mercado_do_symbol(symbol)}] -> {resultado['sinal']} | "
         f"score={resultado['score']} | "
         f"nivel={resultado.get('tipo_nivel')} "
         f"{resultado.get('nivel_m15', 0):.5f} | "
@@ -3718,6 +3756,12 @@ def enviar_telegram(texto):
 # ENVIAR SINAL
 # ============================================================
 
+
+def _mercado_do_symbol(symbol):
+    texto = str(symbol or "").upper()
+    return "OTC" if "OTC" in texto else "ABERTO"
+
+
 def enviar_sinal_telegram(
     symbol,
     resultado
@@ -3779,6 +3823,7 @@ def enviar_sinal_telegram(
     texto = (
         f"{emoji} SINAL FOREX 5M\n\n"
         f"Ativo: {symbol}\n"
+        f"Mercado: {_mercado_do_symbol(symbol)}\n"
         f"Direcao: {sinal}\n"
         f"Score: {resultado.get('score', 0)}\n"
         f"Estrategia: {resultado.get('estrategia', '-')}\n"
@@ -3804,8 +3849,8 @@ def enviar_sinal_telegram(
         f"{fmt(resultado.get('ema21'))}\n"
         f"ATR 14: "
         f"{fmt(resultado.get('atr'), 6)}\n\n"
-        f"➡️ ENTRADA: PROXIMA VELA\n"
-        f"⏱️ EXPIRACAO: 5 MINUTOS\n\n"
+        f"➡️ ENTRADA: RETRACAO NA VELA ATUAL\n"
+        f"⏱️ EXPIRACAO: FIM DA MESMA VELA M5\n\n"
         f"⚠️ Sinal tecnico experimental."
     )
 
@@ -3848,6 +3893,7 @@ def registrar_operacao_intravela(symbol, resultado):
     operacao = {
         "id": chave,
         "symbol": symbol,
+        "mercado": _mercado_do_symbol(symbol),
         "sinal": sinal,
         "score": resultado.get("score", 0),
         "estrategia": "SR_M5_M15_RETRACAO_MESMA_VELA",
@@ -3986,6 +4032,7 @@ def enviar_resultado_telegram(
     texto = (
         f"{emoji} RESULTADO DA OPERACAO\n\n"
         f"Ativo: {operacao['symbol']}\n"
+        f"Mercado: {_mercado_do_symbol(operacao['symbol'])}\n"
         f"Direcao: {operacao['sinal']}\n"
         f"Estrategia: {operacao.get('estrategia', '-')}\n"
         f"Regime: {operacao.get('regime', '-')}\n"
