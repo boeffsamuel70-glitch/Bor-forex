@@ -67,33 +67,31 @@ BULLEX_USER_AGENT = os.getenv(
 
 # Somente mercado aberto. Os active_id não ficam fixos no código:
 # são descobertos automaticamente na lista digital da Traderoom após autenticar.
-ATIVO_BULLEX = {}
-
-PARES_MERCADO_ABERTO = {
-    "EURUSD": "EUR/USD",
-    "GBPUSD": "GBP/USD",
-    "USDJPY": "USD/JPY",
-    "GBPJPY": "GBP/JPY",
-    "AUDUSD": "AUD/USD",
-    "USDCAD": "USD/CAD",
-    "AUDJPY": "AUD/JPY",
+ATIVO_BULLEX = {
+    "EURUSD_OTC": {"symbol": "EUR/USD OTC", "active_id": 76, "ticker": "EURUSD-OTC", "is_otc": True, "mercado": "OTC"},
+    "EURJPY_OTC": {"symbol": "EUR/JPY OTC", "active_id": 79, "ticker": "EURJPY-OTC", "is_otc": True, "mercado": "OTC"},
+    "GBPUSD_OTC": {"symbol": "GBP/USD OTC", "active_id": 81, "ticker": "GBPUSD-OTC", "is_otc": True, "mercado": "OTC"},
+    "USDJPY_OTC": {"symbol": "USD/JPY OTC", "active_id": 85, "ticker": "USDJPY-OTC", "is_otc": True, "mercado": "OTC"},
+    "GBPJPY_OTC": {"symbol": "GBP/JPY OTC", "active_id": 84, "ticker": "GBPJPY-OTC", "is_otc": True, "mercado": "OTC"},
 }
+
+PARES_MERCADO_ABERTO = {}
 
 # OTC populares. Os active_id NÃO são fixos:
 # são descobertos automaticamente na lista da Traderoom.
 PARES_OTC_ALVO = {
     "EURUSD": "EUR/USD OTC",
+    "EURJPY": "EUR/JPY OTC",
     "GBPUSD": "GBP/USD OTC",
     "USDJPY": "USD/JPY OTC",
     "GBPJPY": "GBP/JPY OTC",
-    "EURJPY": "EUR/JPY OTC",
 }
 
 _bullex_assets_lock = threading.RLock()
-_bullex_assets_detected = False
+_bullex_assets_detected = True
 _bullex_assets_last_error = None
 _bullex_assets_updated_at = None
-_bullex_assets_source = None
+_bullex_assets_source = "OTC_STATIC_FALLBACK_76_79_81_85_84"
 _bullex_assets_ready_event = threading.Event()
 _bullex_assets_init_lock = threading.Lock()
 
@@ -120,7 +118,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OPEN-OTC-BINARY-5-BRL-20260909-R17B-SR-M5-INTRABAR-HOTFIX"
+BULLEX_DIAGNOSTIC_VERSION = "OTC-ONLY-BINARY-5-BRL-20260909-R18-SR-M5-INTRABAR"
 
 _bullex_diag = {
     "messages": 0,
@@ -206,19 +204,11 @@ _intravela_velas_tentadas = set()
 # ============================================================
 
 ATIVOS = {
-    "EURUSD": "EUR/USD",
-    "GBPUSD": "GBP/USD",
-    "USDJPY": "USD/JPY",
-    "GBPJPY": "GBP/JPY",
-    "AUDUSD": "AUD/USD",
-    "USDCAD": "USD/CAD",
-    "AUDJPY": "AUD/JPY",
-
     "EURUSD_OTC": "EUR/USD OTC",
+    "EURJPY_OTC": "EUR/JPY OTC",
     "GBPUSD_OTC": "GBP/USD OTC",
     "USDJPY_OTC": "USD/JPY OTC",
     "GBPJPY_OTC": "GBP/JPY OTC",
-    "EURJPY_OTC": "EUR/JPY OTC",
 }
 
 # ============================================================
@@ -2037,7 +2027,7 @@ def _atualizar_ativos_mercado_aberto(ativos, origem):
         _bullex_assets_ready_event.set()
 
     estado["ativos_info"] = {
-        "tipo": "MERCADO_ABERTO_E_OTC",
+        "tipo": "OTC",
         "quantidade": len(novos_bullex),
         "status": "AUTOMÁTICO",
         "lista": ", ".join(
@@ -2120,7 +2110,7 @@ def _inicializar_ativos_mercado_aberto():
             _bullex_assets_ready_event.clear()
 
         estado["ativos_info"] = {
-            "tipo": "MERCADO_ABERTO_E_OTC",
+            "tipo": "OTC",
             "quantidade": 0,
             "status": "AGUARDANDO",
             "lista": "-",
@@ -4302,7 +4292,7 @@ def executar_leitura():
         )
 
     log(
-        f"[MONITOR] ativos mapeados={len(ativos_ciclo)} | "
+        f"[MONITOR OTC] ativos mapeados={len(ativos_ciclo)} | "
         f"ABERTO={qtd_aberto} | OTC={qtd_otc} | "
         "sinais=intravela/candle-generated"
     )
@@ -4986,7 +4976,7 @@ def health():
             ),
         "estrategia":
             (
-                "S/R M5 + retracao intravela na mesma vela de 5 minutos"
+                "S/R M5 + retracao intravela na mesma vela M5 | SOMENTE OTC"
             ),
         "fonte_candles": "Bullex",
         "execucao_automatica": BULLEX_AUTO_TRADE,
