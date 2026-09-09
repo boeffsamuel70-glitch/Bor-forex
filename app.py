@@ -120,7 +120,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OPEN-OTC-BINARY-5-BRL-20260909-R17-SR-M5-INTRABAR-FIX"
+BULLEX_DIAGNOSTIC_VERSION = "OPEN-OTC-BINARY-5-BRL-20260909-R17B-SR-M5-INTRABAR-HOTFIX"
 
 _bullex_diag = {
     "messages": 0,
@@ -251,7 +251,7 @@ estado = {
         "bloqueio": "-",
         "regime": "-",
         "estrategia": "-",
-        "zona_fibonacci": resultado.get("zona_fibonacci", "-"),
+        "zona_fibonacci": "-",
     },
 
     "estatisticas": {
