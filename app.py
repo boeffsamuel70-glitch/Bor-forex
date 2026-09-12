@@ -77,7 +77,7 @@ _bullex_assets_source = None
 _bullex_assets_ready_event = threading.Event()
 _bullex_assets_init_lock = threading.Lock()
 
-_BULLEX_CANDLE_SIZES = {"1min": 60, "15min": 900}
+_BULLEX_CANDLE_SIZES = {"1min": 60, "5min": 300}
 
 _bullex_ws = None
 _bullex_ws_lock = threading.RLock()
@@ -100,7 +100,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "R18-OTC-AUTO-REVERSAO-M1-REALTIME-COOLDOWN40-SCHEDULER-FIX"
+BULLEX_DIAGNOSTIC_VERSION = "R19-OTC-AUTO-SR-M5-REVERSAO-M1-REALTIME-COOLDOWN40"
 
 _bullex_diag = {
     "messages": 0,
@@ -124,13 +124,13 @@ TELEGRAM_CHAT_ID = os.getenv(
 ).strip()
 
 TIMEFRAME = "1min"
-TIMEFRAME_TREND = "15min"
+TIMEFRAME_TREND = "5min"
 
 TIMEZONE = "America/Sao_Paulo"
 TZ = ZoneInfo(TIMEZONE)
 
 OUTPUTSIZE = 150
-OUTPUTSIZE_15M = 100
+OUTPUTSIZE_5M = 100
 
 HORA_INICIO = 22
 HORA_FIM = 15
@@ -158,11 +158,11 @@ EXPIRACAO_MINUTOS = 1
 INTRAVELA_MIN_SEGUNDOS_DECORRIDOS = 8
 INTRAVELA_MIN_SEGUNDOS_RESTANTES = 15
 
-# Suporte/Resistência M15 é OBRIGATÓRIO.
-SR_M15_LOOKBACK = 80
-SR_M15_PIVOT_JANELA = 2
-SR_M15_MIN_TOQUES = 2
-SR_M15_TOLERANCIA_ATR = 0.18
+# Suporte/Resistência M5 é OBRIGATÓRIO.
+SR_M5_LOOKBACK = 100
+SR_M5_PIVOT_JANELA = 2
+SR_M5_MIN_TOQUES = 2
+SR_M5_TOLERANCIA_ATR = 0.18
 
 # A vela M1 precisa vir de uma distância mínima até o nível.
 # Se abrir colada no suporte/resistência, não opera.
@@ -2018,12 +2018,12 @@ def _aguardar_ativos_mercado_aberto(timeout=30):
     return False
 
 def _assinar_candles_mercado_aberto():
-    """Assina M1 e M15 dos ativos usados pelo robô."""
+    """Assina M1 e M5 dos ativos usados pelo robô."""
     assinaturas = set()
 
     for config in ATIVO_BULLEX.values():
         active_id = int(config["active_id"])
-        for size in (60, 900):
+        for size in (60, 300):
             chave = (active_id, size)
             if chave in assinaturas:
                 continue
@@ -2789,7 +2789,7 @@ def analisar_pullback(
     candles_5m,
     candles_15m
 ):
-    """Estratégia principal 5M + 15M + pullback + confirmação separada.
+    """Estratégia principal 5M + 5M + pullback + confirmação separada.
 
     A lógica mantém o núcleo conservador, mas elimina filtros redundantes
     que estavam transformando quase todos os setups válidos em AGUARDAR.
@@ -2811,7 +2811,7 @@ def analisar_pullback(
             "score": 0,
             "preco": float(candles_5m[-1]["close"]),
             "vela": candles_5m[-1]["_dt"],
-            "mensagem": "Poucas velas de 15M.",
+            "mensagem": "Poucas velas de 5M.",
             "score_call": 0,
             "score_put": 0,
         }
@@ -2969,7 +2969,7 @@ def analisar_pullback(
         bloqueio = f"RSI extremo ({rsi14:.2f})."
     elif tendencia_5m == "ALTA":
         if tendencia_15m != "ALTA":
-            bloqueio = "5M em alta, mas 15M não confirma."
+            bloqueio = "5M em alta, mas 5M não confirma."
         elif not pullback_call:
             bloqueio = "Alta alinhada, mas sem pullback válido."
         elif not confirmacao_call:
@@ -2980,7 +2980,7 @@ def analisar_pullback(
             sinal = "CALL"
     elif tendencia_5m == "BAIXA":
         if tendencia_15m != "BAIXA":
-            bloqueio = "5M em baixa, mas 15M não confirma."
+            bloqueio = "5M em baixa, mas 5M não confirma."
         elif not pullback_put:
             bloqueio = "Baixa alinhada, mas sem pullback válido."
         elif not confirmacao_put:
@@ -3008,13 +3008,13 @@ def analisar_pullback(
 
     if sinal == "CALL":
         mensagem = (
-            "CALL FORTE | 5M ALTA + 15M ALTA | "
+            "CALL FORTE | 5M ALTA + 5M ALTA | "
             "Pullback real | Confirmação em vela separada | "
             f"Score={score_call}/12 | RSI={rsi14:.2f}"
         )
     elif sinal == "PUT":
         mensagem = (
-            "PUT FORTE | 5M BAIXA + 15M BAIXA | "
+            "PUT FORTE | 5M BAIXA + 5M BAIXA | "
             "Pullback real | Confirmação em vela separada | "
             f"Score={score_put}/12 | RSI={rsi14:.2f}"
         )
@@ -3022,7 +3022,7 @@ def analisar_pullback(
         mensagem = f"AGUARDAR | {bloqueio}"
     else:
         mensagem = (
-            f"AGUARDAR | 5M={tendencia_5m} | 15M={tendencia_15m} | "
+            f"AGUARDAR | 5M={tendencia_5m} | 5M={tendencia_15m} | "
             f"Pullback={detalhes_pullback} | Confirmação={detalhes_confirmacao} | "
             f"CALL={score_call} | PUT={score_put}"
         )
@@ -3057,7 +3057,7 @@ def analisar_pullback(
 
 
 # ============================================================
-# ESTRATÉGIA ÚNICA - S/R M15 + REVERSÃO NA MESMA VELA M1
+# ESTRATÉGIA ÚNICA - S/R M5 + REVERSÃO NA MESMA VELA M1
 # ============================================================
 
 def _bloqueio_loss_restante(symbol):
@@ -3112,20 +3112,20 @@ def _atr_cache_1m(active_id):
     return atr(fechadas, 14)
 
 
-def _atr_cache_15m(active_id):
-    candles = _candles_cache(active_id, 900)
-    fechadas = somente_velas_fechadas(candles, 15)
+def _atr_cache_5m(active_id):
+    candles = _candles_cache(active_id, 300)
+    fechadas = somente_velas_fechadas(candles, 5)
     if len(fechadas) < 15:
         return None
     return atr(fechadas, 14)
 
 
-def _pivos_m15(candles):
-    """Retorna pivôs de suporte e resistência usando apenas candles M15 fechados."""
+def _pivos_m5(candles):
+    """Retorna pivôs de suporte e resistência usando apenas candles M5 fechados."""
     infos = [candle_info(c) for c in candles]
     suportes = []
     resistencias = []
-    w = SR_M15_PIVOT_JANELA
+    w = SR_M5_PIVOT_JANELA
 
     for i in range(w, len(infos) - w):
         atual = infos[i]
@@ -3167,35 +3167,35 @@ def _agrupar_niveis(valores, tolerancia):
     return grupos
 
 
-def _niveis_sr_m15(active_id):
-    candles = _candles_cache(active_id, 900)
-    fechadas = somente_velas_fechadas(candles, 15)
+def _niveis_sr_m5(active_id):
+    candles = _candles_cache(active_id, 300)
+    fechadas = somente_velas_fechadas(candles, 5)
 
     if len(fechadas) < 25:
         return [], [], None
 
-    fechadas = fechadas[-SR_M15_LOOKBACK:]
-    atr15 = atr(fechadas, 14)
-    if not atr15 or atr15 <= 0:
+    fechadas = fechadas[-SR_M5_LOOKBACK:]
+    atr5 = atr(fechadas, 14)
+    if not atr5 or atr5 <= 0:
         return [], [], None
 
-    tolerancia = atr15 * SR_M15_TOLERANCIA_ATR
-    sup_pivos, res_pivos = _pivos_m15(fechadas)
+    tolerancia = atr5 * SR_M5_TOLERANCIA_ATR
+    sup_pivos, res_pivos = _pivos_m5(fechadas)
 
     suportes = [
         g for g in _agrupar_niveis(sup_pivos, tolerancia)
-        if g["toques"] >= SR_M15_MIN_TOQUES
+        if g["toques"] >= SR_M5_MIN_TOQUES
     ]
     resistencias = [
         g for g in _agrupar_niveis(res_pivos, tolerancia)
-        if g["toques"] >= SR_M15_MIN_TOQUES
+        if g["toques"] >= SR_M5_MIN_TOQUES
     ]
 
-    return suportes, resistencias, atr15
+    return suportes, resistencias, atr5
 
 
 def _nivel_mais_proximo(niveis, preco, lado):
-    """Escolhe o nível M15 relevante mais próximo do preço atual."""
+    """Escolhe o nível M5 relevante mais próximo do preço atual."""
     if not niveis:
         return None
 
@@ -3212,12 +3212,12 @@ def _nivel_mais_proximo(niveis, preco, lado):
 
 
 def _resultado_retracao_intravela(msg, active_id):
-    """Sinal somente quando há S/R forte no M15 e rejeição na mesma vela M1.
+    """Sinal somente quando há S/R forte no M5 e rejeição na mesma vela M1.
 
     CALL:
-      vela M1 vem de cima, toca suporte M15 e rejeita para cima.
+      vela M1 vem de cima, toca suporte M5 e rejeita para cima.
     PUT:
-      vela M1 vem de baixo, toca resistência M15 e rejeita para baixo.
+      vela M1 vem de baixo, toca resistência M5 e rejeita para baixo.
 
     Se a vela M1 abrir perto demais do nível, NÃO opera.
     A expiração continua sendo o fechamento da própria vela M1.
@@ -3248,11 +3248,11 @@ def _resultado_retracao_intravela(msg, active_id):
     if atr1 is None or atr1 <= 0:
         return None
 
-    suportes, resistencias, atr15 = _niveis_sr_m15(active_id)
-    if atr15 is None:
+    suportes, resistencias, atr5 = _niveis_sr_m5(active_id)
+    if atr5 is None:
         return None
 
-    tolerancia_nivel = atr15 * SR_M15_TOLERANCIA_ATR
+    tolerancia_nivel = atr5 * SR_M5_TOLERANCIA_ATR
     distancia_minima_abertura = atr1 * SR_M1_DISTANCIA_ABERTURA_ATR_MIN
 
     candle_key = (int(active_id), candle_from)
@@ -3278,7 +3278,7 @@ def _resultado_retracao_intravela(msg, active_id):
         return None
 
     # --------------------------------------------------------
-    # CALL: suporte M15
+    # CALL: suporte M5
     # --------------------------------------------------------
     suporte = _nivel_mais_proximo(suportes, minima, "SUPORTE")
     if suporte is not None:
@@ -3321,9 +3321,9 @@ def _resultado_retracao_intravela(msg, active_id):
                 "score_put": 1,
                 "preco": fechamento,
                 "vela": datetime.fromtimestamp(candle_from, TZ),
-                "estrategia": "SR_M15_REVERSAO_M1_MESMA_VELA",
+                "estrategia": "SR_M5_REVERSAO_M1_MESMA_VELA",
                 "regime": "INTRAVELA",
-                "pullback": f"REJEICAO SUPORTE M15 | retração={ratio*100:.1f}%",
+                "pullback": f"REJEICAO SUPORTE M5 | retração={ratio*100:.1f}%",
                 "rejeicao": "CONFIRMADA",
                 "lateral": "N/A",
                 "atr": atr1,
@@ -3332,11 +3332,11 @@ def _resultado_retracao_intravela(msg, active_id):
                 "ema13": None,
                 "ema21": None,
                 "tendencia_5m": "N/A",
-                "tendencia_15m": "S/R M15",
-                "zona_fibonacci": f"SUPORTE M15 {nivel:.5f} ({suporte['toques']} toques)",
+                "tendencia_15m": "S/R M5",
+                "zona_fibonacci": f"SUPORTE M5 {nivel:.5f} ({suporte['toques']} toques)",
                 "bloqueio": "SINAL",
                 "mensagem": (
-                    f"CALL | suporte M15={nivel:.5f} | "
+                    f"CALL | suporte M5={nivel:.5f} | "
                     f"toques={suporte['toques']} | "
                     f"dist_abertura={distancia_abertura:.6f} | "
                     f"retração={ratio*100:.1f}% | restam={restantes:.1f}s"
@@ -3347,14 +3347,14 @@ def _resultado_retracao_intravela(msg, active_id):
                 "segundos_restantes": restantes,
                 "impulso": movimento_ate_nivel,
                 "retracao_ratio": ratio,
-                "nivel_m15": nivel,
+                "nivel_m5": nivel,
                 "tipo_nivel": "SUPORTE",
                 "toques_nivel": suporte["toques"],
                 "distancia_abertura_nivel": distancia_abertura,
             }
 
     # --------------------------------------------------------
-    # PUT: resistência M15
+    # PUT: resistência M5
     # --------------------------------------------------------
     resistencia = _nivel_mais_proximo(resistencias, maxima, "RESISTENCIA")
     if resistencia is not None:
@@ -3396,9 +3396,9 @@ def _resultado_retracao_intravela(msg, active_id):
                 "score_put": score,
                 "preco": fechamento,
                 "vela": datetime.fromtimestamp(candle_from, TZ),
-                "estrategia": "SR_M15_REVERSAO_M1_MESMA_VELA",
+                "estrategia": "SR_M5_REVERSAO_M1_MESMA_VELA",
                 "regime": "INTRAVELA",
-                "pullback": f"REJEICAO RESISTENCIA M15 | retração={ratio*100:.1f}%",
+                "pullback": f"REJEICAO RESISTENCIA M5 | retração={ratio*100:.1f}%",
                 "rejeicao": "CONFIRMADA",
                 "lateral": "N/A",
                 "atr": atr1,
@@ -3407,11 +3407,11 @@ def _resultado_retracao_intravela(msg, active_id):
                 "ema13": None,
                 "ema21": None,
                 "tendencia_5m": "N/A",
-                "tendencia_15m": "S/R M15",
-                "zona_fibonacci": f"RESISTENCIA M15 {nivel:.5f} ({resistencia['toques']} toques)",
+                "tendencia_15m": "S/R M5",
+                "zona_fibonacci": f"RESISTENCIA M5 {nivel:.5f} ({resistencia['toques']} toques)",
                 "bloqueio": "SINAL",
                 "mensagem": (
-                    f"PUT | resistência M15={nivel:.5f} | "
+                    f"PUT | resistência M5={nivel:.5f} | "
                     f"toques={resistencia['toques']} | "
                     f"dist_abertura={distancia_abertura:.6f} | "
                     f"retração={ratio*100:.1f}% | restam={restantes:.1f}s"
@@ -3422,7 +3422,7 @@ def _resultado_retracao_intravela(msg, active_id):
                 "segundos_restantes": restantes,
                 "impulso": movimento_ate_nivel,
                 "retracao_ratio": ratio,
-                "nivel_m15": nivel,
+                "nivel_m5": nivel,
                 "tipo_nivel": "RESISTENCIA",
                 "toques_nivel": resistencia["toques"],
                 "distancia_abertura_nivel": distancia_abertura,
@@ -3462,7 +3462,7 @@ def _atualizar_dashboard_intravela(symbol, resultado):
         ),
         "bloqueio": resultado.get("bloqueio", "-"),
         "regime": "INTRAVELA",
-        "estrategia": "SR_M15_REVERSAO_M1_MESMA_VELA",
+        "estrategia": "SR_M5_REVERSAO_M1_MESMA_VELA",
         "zona_fibonacci": "-",
     }
 
@@ -3497,7 +3497,7 @@ def _processar_sinal_intravela(active_id, msg):
         f"[INTRAVELA] {symbol} -> {resultado['sinal']} | "
         f"score={resultado['score']} | "
         f"nivel={resultado.get('tipo_nivel')} "
-        f"{resultado.get('nivel_m15', 0):.5f} | "
+        f"{resultado.get('nivel_m5', 0):.5f} | "
         f"toques={resultado.get('toques_nivel')} | "
         f"dist_abertura={resultado.get('distancia_abertura_nivel', 0):.6f} | "
         f"{resultado['pullback']} | "
@@ -3518,7 +3518,7 @@ def _processar_sinal_intravela(active_id, msg):
 def calcular_estatisticas_por_estrategia():
     wins = losses = dojis = 0
     for item in _historico_resultados:
-        if item.get("estrategia") != "SR_M15_REVERSAO_M1_MESMA_VELA":
+        if item.get("estrategia") != "SR_M5_REVERSAO_M1_MESMA_VELA":
             continue
         r = item.get("resultado")
         if r == "WIN":
@@ -3530,7 +3530,7 @@ def calcular_estatisticas_por_estrategia():
     total = wins + losses + dojis
     decididos = wins + losses
     return {
-        "SR_M15_REVERSAO_M1_MESMA_VELA": {
+        "SR_M5_REVERSAO_M1_MESMA_VELA": {
             "total": total,
             "wins": wins,
             "losses": losses,
@@ -3721,7 +3721,7 @@ def enviar_sinal_telegram(
         f"{vela.strftime('%Y-%m-%d %H:%M:%S BRT')}\n\n"
         f"Tendencia 5M: "
         f"{resultado.get('tendencia_5m', '-')}\n"
-        f"Tendencia 15M: "
+        f"Tendencia 5M: "
         f"{resultado.get('tendencia_15m', '-')}\n"
         f"Pullback: "
         f"{resultado.get('pullback', '-')}\n"
@@ -3783,7 +3783,7 @@ def registrar_operacao_intravela(symbol, resultado):
         "symbol": symbol,
         "sinal": sinal,
         "score": resultado.get("score", 0),
-        "estrategia": "SR_M15_REVERSAO_M1_MESMA_VELA",
+        "estrategia": "SR_M5_REVERSAO_M1_MESMA_VELA",
         "regime": "INTRAVELA",
         "preco_sinal": float(resultado["preco"]),
         "vela_sinal": candle_dt,
@@ -3800,7 +3800,7 @@ def registrar_operacao_intravela(symbol, resultado):
         "candle_to": int(resultado["candle_to"]),
         "retracao_ratio": resultado.get("retracao_ratio"),
         "impulso": resultado.get("impulso"),
-        "nivel_m15": resultado.get("nivel_m15"),
+        "nivel_m5": resultado.get("nivel_m5"),
         "tipo_nivel": resultado.get("tipo_nivel"),
         "toques_nivel": resultado.get("toques_nivel"),
         "distancia_abertura_nivel": resultado.get("distancia_abertura_nivel"),
@@ -3959,14 +3959,14 @@ def finalizar_operacoes_vencidas_antes_da_leitura():
 
     for symbol in pendentes:
         try:
-            candles_5m = obter_candles(
+            candles_1m = obter_candles(
                 symbol,
                 TIMEFRAME,
                 OUTPUTSIZE
             )
             avaliar_operacao(
                 symbol,
-                candles_5m
+                candles_1m
             )
         except Exception as e:
             log(
@@ -3992,10 +3992,12 @@ def processar_ativo(chave, symbol, executar_sinal=False):
         return None
 
     try:
-        candles_5m = obter_candles(symbol, TIMEFRAME, OUTPUTSIZE)
-        avaliar_operacao(symbol, candles_5m)
+        candles_1m = obter_candles(symbol, TIMEFRAME, OUTPUTSIZE)
+        # Mantém histórico M5 carregado para construir suporte/resistência.
+        obter_candles(symbol, TIMEFRAME_TREND, OUTPUTSIZE_5M)
+        avaliar_operacao(symbol, candles_1m)
 
-        ultimo, idade = idade_do_ultimo_candle(candles_5m)
+        ultimo, idade = idade_do_ultimo_candle(candles_1m)
         if ultimo is not None:
             estado["ativo"] = symbol
             estado["preco"] = f"{float(ultimo['close']):.5f}"
@@ -4147,7 +4149,7 @@ def esperar_ate_proxima_leitura():
     )
 
     log(
-        "[R18][M1] Proxima leitura M1: "
+        "[R19][M1] Proxima leitura M1: "
         f"{proxima.strftime('%H:%M:%S BRT')}"
     )
 
@@ -4163,7 +4165,7 @@ def loop_robo():
         "Loop do robo iniciado."
     )
     log(
-        f"[R18][M1] Scheduler ativo: leitura/manutencao a cada 1 minuto | "
+        f"[R19][M1] Scheduler ativo: leitura/manutencao a cada 1 minuto | "
         f"expiracao={EXPIRACAO_MINUTOS} minuto(s) | cooldown_loss={BLOQUEIO_LOSS_MINUTOS} min"
     )
 
@@ -4421,7 +4423,7 @@ Robo Forex Pullback PRO
 
 <div class="subtitulo">
 
-Estratégia única: S/R M15 + retração intravela na mesma vela
+Estratégia única: S/R M5 + retração intravela na mesma vela
 
 </div>
 
@@ -4504,7 +4506,7 @@ Filtros da entrada
 </div>
 
 <div class="linha">
-<span>Nível M15</span>
+<span>Nível M5</span>
 <span class="valor">MESMA VELA M1</span>
 </div>
 
@@ -4516,7 +4518,7 @@ Filtros da entrada
 </div>
 
 <div class="linha">
-<span>Tendência 15M</span>
+<span>Tendência 5M</span>
 <span class="valor">
 {{ estado.detalhes.tendencia_15m }}
 </span>
