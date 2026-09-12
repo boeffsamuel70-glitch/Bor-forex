@@ -100,7 +100,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "R28-OTC-FIM-ENTRADA-ATE1S-MAX2-GESTAO-META60"
+BULLEX_DIAGNOSTIC_VERSION = "R29-OTC-FIM-ATE1S-MAX2-DIAGNOSTICO-GESTAO-META60"
 
 _bullex_diag = {
     "messages": 0,
@@ -3656,6 +3656,18 @@ def _nivel_mais_proximo(niveis, preco, lado):
     return min(candidatos, key=lambda g: abs(preco - g["nivel"]))
 
 
+
+def _log_fim_diagnostico(active_id, symbol, status, **dados):
+    """Log compacto para entender por que a FIM entrou ou bloqueou."""
+    partes = [f"[FIM][DIAG] {symbol}", status]
+    for chave, valor in dados.items():
+        if isinstance(valor, float):
+            partes.append(f"{chave}={valor:.3f}")
+        else:
+            partes.append(f"{chave}={valor}")
+    log(" | ".join(partes))
+
+
 def _resultado_retracao_intravela(msg, active_id):
     """FIM EXPERIMENTAL — Fluxo, Impulso e Momento.
 
@@ -3672,6 +3684,8 @@ def _resultado_retracao_intravela(msg, active_id):
     if not isinstance(msg, dict):
         return None
 
+    symbol = ACTIVE_ID_TO_SYMBOL.get(int(active_id), str(active_id))
+
     try:
         abertura = float(msg["open"])
         fechamento = float(msg["close"])
@@ -3686,22 +3700,52 @@ def _resultado_retracao_intravela(msg, active_id):
     decorridos = max(0.0, server_ts - candle_from)
     restantes = max(0.0, candle_to - server_ts)
 
+    _log_fim_diagnostico(
+        active_id,
+        symbol,
+        "M1_RECEBIDA",
+        atraso_s=decorridos,
+        restantes_s=restantes,
+    )
+
     # Entrada imediata: a análise principal já vem das velas fechadas.
     # Só aceita a oportunidade até 1 segundo após abrir a nova M1.
-    if decorridos < 0 or decorridos > 1.0 or restantes < 58:
+    if decorridos < 0:
+        _log_fim_diagnostico(active_id, symbol, "BLOQUEADA_RELOGIO", atraso_s=decorridos)
+        return None
+    if decorridos > 1.0 or restantes < 58:
+        _log_fim_diagnostico(
+            active_id,
+            symbol,
+            "BLOQUEADA_ATRASO",
+            atraso_s=decorridos,
+            limite_s=1.0,
+        )
         return None
 
     contexto_m5 = _contexto_forca_m5(active_id)
     if not contexto_m5:
+        _log_fim_diagnostico(active_id, symbol, "BLOQUEADA_SEM_CONTEXTO_M5")
         return None
 
     direcao = contexto_m5.get("direcao")
     adx5 = float(contexto_m5.get("adx") or 0.0)
-    if direcao not in ("CALL", "PUT") or adx5 < 20:
+    if direcao not in ("CALL", "PUT"):
+        _log_fim_diagnostico(active_id, symbol, "BLOQUEADA_SEM_DIRECAO_M5", adx=adx5)
+        return None
+    if adx5 < 20:
+        _log_fim_diagnostico(
+            active_id, symbol, "BLOQUEADA_ADX_BAIXO",
+            direcao=direcao, adx=adx5, minimo=20
+        )
         return None
 
     candles = somente_velas_fechadas(_candles_cache(active_id, 60), 1)
     if len(candles) < 40:
+        _log_fim_diagnostico(
+            active_id, symbol, "BLOQUEADA_POUCAS_VELAS",
+            candles=len(candles), minimo=40
+        )
         return None
     candles = candles[-70:]
 
@@ -3714,6 +3758,7 @@ def _resultado_retracao_intravela(msg, active_id):
     atr1 = atr(candles, 14)
 
     if None in (ema9, ema21) or not atr1 or atr1 <= 0:
+        _log_fim_diagnostico(active_id, symbol, "BLOQUEADA_INDICADORES_INVALIDOS")
         return None
 
     ultimas = infos[-5:]
@@ -3739,6 +3784,10 @@ def _resultado_retracao_intravela(msg, active_id):
     # --------------------------------------------------------
     sep = abs(ema9 - ema21)
     if sep < atr1 * 0.06:
+        _log_fim_diagnostico(
+            active_id, symbol, "BLOQUEADA_COMPRESSAO",
+            separacao=sep, atr=atr1
+        )
         return None  # mercado excessivamente comprimido/lateral
 
     if direcao == "CALL":
@@ -3824,9 +3873,17 @@ def _resultado_retracao_intravela(msg, active_id):
     # --------------------------------------------------------
     distancia_ema = abs(ultima["close"] - ema9)
     if distancia_ema > atr1 * 1.15:
+        _log_fim_diagnostico(
+            active_id, symbol, "BLOQUEADA_ESTICADA_EMA",
+            distancia_ema=distancia_ema, atr=atr1
+        )
         return None
 
     if ultima["range"] > atr1 * 1.65:
+        _log_fim_diagnostico(
+            active_id, symbol, "BLOQUEADA_VELA_ANOMALA",
+            range_ultima=ultima["range"], atr=atr1
+        )
         return None
 
     # --------------------------------------------------------
@@ -3842,9 +3899,28 @@ def _resultado_retracao_intravela(msg, active_id):
     # Exige múltiplas evidências; não existe entrada por um único indicador.
     SCORE_MINIMO_FIM = 6
     if score < SCORE_MINIMO_FIM:
+        _log_fim_diagnostico(
+            active_id, symbol, "BLOQUEADA_SCORE",
+            direcao=direcao,
+            score=score,
+            minimo=SCORE_MINIMO_FIM,
+            adx=adx5,
+            motivos=";".join(motivos),
+        )
         return None
 
     qualidade = "FORTE" if score >= 10 else "NORMAL"
+
+    _log_fim_diagnostico(
+        active_id,
+        symbol,
+        "SINAL_APROVADO",
+        direcao=direcao,
+        score=score,
+        qualidade=qualidade,
+        atraso_s=decorridos,
+        adx=adx5,
+    )
 
     return {
         "sinal": direcao,
@@ -4633,7 +4709,7 @@ def esperar_ate_proxima_leitura():
     )
 
     log(
-        "[R20][M1] Proxima leitura M1: "
+        "[R28][M1] Proxima leitura M1: "
         f"{proxima.strftime('%H:%M:%S BRT')}"
     )
 
@@ -4649,7 +4725,7 @@ def loop_robo():
         "Loop do robo iniciado."
     )
     log(
-        f"[R20][M1] Scheduler ativo: leitura/manutencao a cada 1 minuto | "
+        f"[R28][M1] Scheduler ativo: leitura/manutencao a cada 1 minuto | "
         f"expiracao={EXPIRACAO_MINUTOS} minuto(s) | cooldown_loss={BLOQUEIO_LOSS_MINUTOS} min"
     )
 
