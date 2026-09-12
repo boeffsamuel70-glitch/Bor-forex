@@ -100,7 +100,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OTC-AUTO-5-BRL-20260911-R16-M15-SR-REVERSAO-M1-COOLDOWN40"
+BULLEX_DIAGNOSTIC_VERSION = "R18-OTC-AUTO-REVERSAO-M1-REALTIME-COOLDOWN40-SCHEDULER-FIX"
 
 _bullex_diag = {
     "messages": 0,
@@ -3980,10 +3980,10 @@ def finalizar_operacoes_vencidas_antes_da_leitura():
 # ============================================================
 
 def processar_ativo(chave, symbol, executar_sinal=False):
-    """Na R13 o loop de 5 minutos não cria sinais.
+    """O ciclo M1 de manutenção não cria sinais por polling.
 
-    Ele apenas mantém histórico atualizado e finaliza operações.
-    Os sinais surgem exclusivamente do candle-generated da vela corrente.
+    Ele mantém histórico atualizado, dashboard e finaliza operações.
+    Os sinais surgem exclusivamente do candle-generated M1 em tempo real.
     """
     with _bullex_assets_lock:
         config = ATIVO_BULLEX.get(chave)
@@ -4091,7 +4091,7 @@ def executar_leitura():
 
         return
 
-    # Na R13, sinais NÃO são gerados aqui.
+    # No ciclo M1, sinais NÃO são gerados aqui por polling.
     # A retração é detectada em tempo real no candle-generated.
     finalizar_operacoes_vencidas_antes_da_leitura()
 
@@ -4124,38 +4124,30 @@ def executar_leitura():
 # ============================================================
 
 def esperar_ate_proxima_leitura():
+    """Sincroniza a manutenção do robô com cada nova vela M1.
+
+    O gatilho intravela continua vindo em tempo real pelo candle-generated.
+    Esta rotina apenas garante que histórico, resultados pendentes, dashboard
+    e descoberta/manutenção dos ativos sejam atualizados a cada minuto.
+    """
     agora = agora_brt()
 
-    proximo_bloco = (
-        (agora.minute // 5)
-        + 1
-    ) * 5
-
-    if proximo_bloco >= 60:
-        proxima = (
-            agora + timedelta(hours=1)
-        ).replace(
-            minute=0,
-            second=0,
-            microsecond=100000,
-        )
-
-    else:
-        proxima = agora.replace(
-            minute=proximo_bloco,
-            second=0,
-            microsecond=100000,
-        )
+    # Próximo fechamento/abertura de vela M1. Pequena folga de 100 ms
+    # evita consultar exatamente antes da virada do minuto.
+    proxima = (
+        agora + timedelta(minutes=1)
+    ).replace(
+        second=0,
+        microsecond=100000,
+    )
 
     segundos = max(
-        (
-            proxima - agora
-        ).total_seconds(),
-        1
+        (proxima - agora).total_seconds(),
+        0.2,
     )
 
     log(
-        "Proxima leitura: "
+        "[R18][M1] Proxima leitura M1: "
         f"{proxima.strftime('%H:%M:%S BRT')}"
     )
 
@@ -4169,6 +4161,10 @@ def esperar_ate_proxima_leitura():
 def loop_robo():
     log(
         "Loop do robo iniciado."
+    )
+    log(
+        f"[R18][M1] Scheduler ativo: leitura/manutencao a cada 1 minuto | "
+        f"expiracao={EXPIRACAO_MINUTOS} minuto(s) | cooldown_loss={COOLDOWN_LOSS_MINUTOS} min"
     )
 
     try:
@@ -4665,13 +4661,13 @@ Quando houver sinal:
 <br>
 
 <strong>
-Entrada: próxima vela de 5 minutos
+Entrada: reversão intravela M1 em tempo real
 </strong>
 
 <br>
 
 <strong>
-Expiração: 5 minutos
+Expiração: 1 minuto
 </strong>
 
 <br><br>
@@ -4774,7 +4770,7 @@ def health():
             ),
         "estrategia":
             (
-                "Retracao intravela na mesma vela de 5 minutos"
+                "Retracao intravela na mesma vela de 1 minuto"
             ),
         "fonte_candles": "Bullex",
         "execucao_automatica": BULLEX_AUTO_TRADE,
