@@ -100,7 +100,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "R40-OTC-FIM-M5-M15-TIMEFRAME-E-LOGS-CORRIGIDOS"
+BULLEX_DIAGNOSTIC_VERSION = "R41-OTC-FIM-M5-M15-CACHE-RELOGIO-CORRIGIDO"
 
 _bullex_diag = {
     "messages": 0,
@@ -4179,7 +4179,7 @@ def _ultimo_candle_fechado_m5(active_id, abertura_nova_m5):
     """Busca no cache o último candle M5 cujo 'to' já terminou."""
     try:
         with _candles_lock:
-            candles = list(_candles_cache.get((int(active_id), 300), []))
+            candles = list(_candles_cache(int(active_id), 300) or [])
     except Exception:
         candles = []
 
@@ -4265,6 +4265,52 @@ def _disparar_fim_m5_pelo_relogio():
             daemon=True,
             name=f"fim-m5-clock-{active_id}",
         ).start()
+
+
+def _ativos_para_scan_m5():
+    """Retorna active_ids conhecidos que já possuem histórico M5 utilizável."""
+    candidatos = set()
+
+    # Mapas conhecidos de ativos do app.
+    for nome in (
+        "ACTIVE_ID_TO_SYMBOL",
+        "ACTIVE_ID_TO_TICKER",
+        "ATIVOS_POR_ID",
+        "BULLEX_ACTIVE_ID_TO_SYMBOL",
+    ):
+        mapa = globals().get(nome)
+        if isinstance(mapa, dict):
+            for chave in mapa.keys():
+                try:
+                    candidatos.add(int(chave))
+                except Exception:
+                    pass
+
+    # Alguns mapas podem ser symbol -> active_id.
+    for nome in (
+        "SYMBOL_TO_ACTIVE_ID",
+        "TICKER_TO_ACTIVE_ID",
+        "ATIVOS",
+        "BULLEX_SYMBOL_TO_ACTIVE_ID",
+    ):
+        mapa = globals().get(nome)
+        if isinstance(mapa, dict):
+            for valor in mapa.values():
+                try:
+                    candidatos.add(int(valor))
+                except Exception:
+                    pass
+
+    prontos = []
+    for active_id in sorted(candidatos):
+        try:
+            candles = list(_candles_cache(int(active_id), 300) or [])
+            if candles:
+                prontos.append(int(active_id))
+        except Exception:
+            continue
+
+    return prontos
 
 
 def _loop_gatilho_relogio_m5():
