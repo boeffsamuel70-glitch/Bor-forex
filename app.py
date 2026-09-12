@@ -100,7 +100,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "R34-OTC-FIM-M5-M15-RELOGIO-ATE3S-MAX2-FINAL"
+BULLEX_DIAGNOSTIC_VERSION = "R35-OTC-FIM-M5-M15-RELOGIO-ATE3S-EXPIRACAO-M5"
 
 _bullex_diag = {
     "messages": 0,
@@ -4654,7 +4654,7 @@ def avaliar_operacao(symbol, candles):
         if dt != alvo_dt:
             continue
 
-        if dt + timedelta(minutes=1) > agora:
+        if dt + timedelta(minutes=5) > agora:
             return
 
         info = candle_info(candle)
