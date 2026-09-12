@@ -100,7 +100,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "R32-OTC-FIM-M5-M15-ENTRADA-M5-REAL-MAX2-DIAG"
+BULLEX_DIAGNOSTIC_VERSION = "R34-OTC-FIM-M5-M15-RELOGIO-ATE3S-MAX2-FINAL"
 
 _bullex_diag = {
     "messages": 0,
@@ -1724,14 +1724,12 @@ def _on_bullex_message(ws, raw_message):
                 with _bullex_diag_lock:
                     _bullex_diag["stored"] += 1
 
-                # Estratégia FIM M5: dispara somente na abertura/atualização da vela M5.
+                # FIM M5:
+                # o candle-generated M5 apenas alimenta o cache.
+                # O disparo da análise/ordem é feito pelo relógio do servidor,
+                # nos primeiros 3 segundos da nova vela M5.
                 if int(size) == 300:
-                    threading.Thread(
-                        target=_processar_sinal_intravela,
-                        args=(active_id, dict(msg)),
-                        daemon=True,
-                        name=f"intravela-scan-{active_id}",
-                    ).start()
+                    pass
         return
 
     # ========================================================
@@ -3846,17 +3844,17 @@ def _resultado_retracao_intravela(msg, active_id):
     )
 
     # Entrada imediata: a análise principal já vem das velas fechadas.
-    # Só aceita a oportunidade até 1 segundo após abrir a nova M5.
+    # Só aceita a oportunidade até 3 segundos após abrir a nova M5.
     if decorridos < 0:
         _log_fim_diagnostico(active_id, symbol, "BLOQUEADA_RELOGIO", atraso_s=decorridos)
         return None
-    if decorridos > 1.0 or restantes < 298:
+    if decorridos > 3.0 or restantes < 297:
         _log_fim_diagnostico(
             active_id,
             symbol,
             "BLOQUEADA_ATRASO",
             atraso_s=decorridos,
-            limite_s=1.0,
+            limite_s=3.0,
         )
         return None
 
@@ -4026,7 +4024,7 @@ def _resultado_retracao_intravela(msg, active_id):
     # --------------------------------------------------------
     # 7. TIMING IMEDIATO
     # --------------------------------------------------------
-    # Para entrar em até 1 segundo, não aguardamos a formação do corpo
+    # Para entrar em até 3 segundos, não aguardamos a formação do corpo
     # da nova vela. A decisão é baseada nas velas M5 já fechadas + M15.
     motivos.append("entrada imediata <=1s")
 
@@ -4127,6 +4125,156 @@ def _atualizar_dashboard_intravela(symbol, resultado):
         "estrategia": "FIM_M5_FLUXO_IMPULSO_MOMENTO",
         "zona_fibonacci": "-",
     }
+
+
+
+_relogio_m5_lock = threading.Lock()
+_relogio_m5_ultima_janela = None
+
+
+def _ativos_para_scan_m5():
+    """Retorna os active_ids conhecidos pelo robô."""
+    ativos = set()
+
+    # Preferência: ativos realmente presentes no cache de candles M5.
+    try:
+        with _candles_lock:
+            for chave in _candles_cache.keys():
+                if isinstance(chave, tuple) and len(chave) >= 2:
+                    aid, size = chave[0], chave[1]
+                    try:
+                        if int(size) == 300:
+                            ativos.add(int(aid))
+                    except (TypeError, ValueError):
+                        pass
+    except Exception:
+        pass
+
+    # Fallback: tenta extrair IDs dos mapas existentes.
+    if not ativos:
+        for nome in ("ATIVOS_OTC", "ATIVOS", "OTC_ATIVOS", "BULLEX_ATIVOS", "ACTIVE_IDS"):
+            mapa = globals().get(nome)
+            if not isinstance(mapa, dict):
+                continue
+            for chave, valor in mapa.items():
+                try:
+                    if isinstance(valor, dict):
+                        aid = valor.get("active_id") or valor.get("id") or valor.get("activeId")
+                        if aid is not None:
+                            ativos.add(int(aid))
+                    else:
+                        # mapa id->nome
+                        try:
+                            ativos.add(int(chave))
+                        except Exception:
+                            # mapa nome->id
+                            ativos.add(int(valor))
+                except Exception:
+                    pass
+
+    return sorted(ativos)
+
+
+def _ultimo_candle_fechado_m5(active_id, abertura_nova_m5):
+    """Busca no cache o último candle M5 cujo 'to' já terminou."""
+    try:
+        with _candles_lock:
+            candles = list(_candles_cache.get((int(active_id), 300), []))
+    except Exception:
+        candles = []
+
+    candidatos = []
+    for c in candles:
+        if not isinstance(c, dict):
+            continue
+        try:
+            c_from = int(float(c.get("from")))
+            c_to = int(float(c.get("to") or (c_from + 300)))
+        except Exception:
+            continue
+        if c_to <= int(abertura_nova_m5):
+            candidatos.append((c_to, c))
+
+    if not candidatos:
+        return None
+
+    candidatos.sort(key=lambda x: x[0])
+    return dict(candidatos[-1][1])
+
+
+def _disparar_fim_m5_pelo_relogio():
+    """
+    Dispara a FIM na abertura exata de cada M5 usando o relógio do servidor.
+    A ordem só pode ser enviada dentro dos primeiros 3 segundos.
+    """
+    global _relogio_m5_ultima_janela
+
+    try:
+        ts_servidor, fonte = _horario_servidor_atual()
+        ts_servidor = float(ts_servidor)
+    except Exception:
+        return
+
+    abertura_m5 = int(ts_servidor // 300) * 300
+    decorridos = ts_servidor - abertura_m5
+
+    # Fora da janela de entrada.
+    if decorridos < 0 or decorridos > 3.0:
+        return
+
+    with _relogio_m5_lock:
+        if _relogio_m5_ultima_janela == abertura_m5:
+            return
+        _relogio_m5_ultima_janela = abertura_m5
+
+    ativos = _ativos_para_scan_m5()
+    if not ativos:
+        log("[FIM-M5][RELOGIO] Nenhum ativo M5 disponível no cache.")
+        return
+
+    log(
+        f"[FIM-M5][RELOGIO] Nova M5 detectada | "
+        f"abertura={datetime.fromtimestamp(abertura_m5, TZ).strftime('%H:%M:%S')} "
+        f"| atraso={decorridos:.3f}s | fonte={fonte} | ativos={len(ativos)}"
+    )
+
+    for active_id in ativos:
+        ultimo = _ultimo_candle_fechado_m5(active_id, abertura_m5)
+        if ultimo is None:
+            log(f"[FIM-M5][RELOGIO] active_id={active_id} sem M5 fechado disponível.")
+            continue
+
+        # Mensagem sintética da NOVA vela M5.
+        # A lógica FIM usa o cache das velas fechadas para os indicadores.
+        msg_nova = {
+            "active_id": int(active_id),
+            "size": 300,
+            "from": int(abertura_m5),
+            "to": int(abertura_m5 + 300),
+            "open": ultimo.get("close"),
+            "close": ultimo.get("close"),
+            "min": ultimo.get("close"),
+            "max": ultimo.get("close"),
+            "phase": "deal",
+            "_gatilho": "RELOGIO_SERVIDOR",
+        }
+
+        threading.Thread(
+            target=_processar_sinal_intravela,
+            args=(int(active_id), msg_nova),
+            daemon=True,
+            name=f"fim-m5-clock-{active_id}",
+        ).start()
+
+
+def _loop_gatilho_relogio_m5():
+    """Loop leve: verifica a virada da vela M5 várias vezes por segundo."""
+    while True:
+        try:
+            _disparar_fim_m5_pelo_relogio()
+        except Exception as exc:
+            log(f"[FIM-M5][RELOGIO] erro: {type(exc).__name__}: {exc}")
+        time.sleep(0.10)
 
 
 def _processar_sinal_intravela(active_id, msg):
@@ -4702,7 +4850,7 @@ def processar_ativo(chave, symbol, executar_sinal=False):
             estado["atualidade_min"] = f"{idade:.1f} min" if idade is not None else "-"
             if estado.get("sinal") not in ("CALL", "PUT"):
                 estado["sinal"] = "AGUARDAR"
-                estado["mensagem"] = "Monitorando FIM M5: decisão pelas velas M5 fechadas + contexto M15, entrada até 1s da nova M5 e máximo 2 operações simultâneas."
+                estado["mensagem"] = "Monitorando FIM M5: decisão pelas velas M5 fechadas + contexto M15, entrada até 3s da nova M5 e máximo 2 operações simultâneas."
         return None
 
     except Exception as e:
@@ -5541,6 +5689,15 @@ log(
     f"ATIVOS={list(ATIVO_BULLEX.keys())} | "
     f"WS={BULLEX_WS_URL}"
 )
+
+
+# Gatilho independente da FIM M5 pela virada do relógio do servidor.
+_fim_m5_clock_thread = threading.Thread(
+    target=_loop_gatilho_relogio_m5,
+    daemon=True,
+    name="fim-m5-clock",
+)
+_fim_m5_clock_thread.start()
 
 if __name__ == "__main__":
     garantir_robo_iniciado()
