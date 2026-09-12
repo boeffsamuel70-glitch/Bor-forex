@@ -100,7 +100,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "R30-OTC-FIM-M5-M15-ATE1S-MAX2-DIAGNOSTICO-GESTAO-META60"
+BULLEX_DIAGNOSTIC_VERSION = "R31-OTC-FIM-M5-M15-ATE1S-MAX2-DIAG-CORRIGIDO"
 
 _bullex_diag = {
     "messages": 0,
@@ -3749,7 +3749,71 @@ def _resultado_retracao_intravela(msg, active_id):
     if not isinstance(msg, dict):
         return None
 
-    symbol = ACTIVE_ID_TO_SYMBOL.get(int(active_id), str(active_id))
+    # Resolve o nome do ativo sem depender de ACTIVE_ID_TO_SYMBOL,
+    # que não existe nesta base do robô.
+    symbol = str(active_id)
+    try:
+        aid = int(active_id)
+
+        # Procura primeiro nos cadastros/dicionários já existentes.
+        for _nome_mapa in (
+            "ATIVOS_OTC",
+            "ATIVOS",
+            "OTC_ATIVOS",
+            "BULLEX_ATIVOS",
+            "ACTIVE_IDS",
+        ):
+            _mapa = globals().get(_nome_mapa)
+            if not isinstance(_mapa, dict):
+                continue
+
+            # Formato active_id -> nome
+            if aid in _mapa:
+                _valor = _mapa[aid]
+                if isinstance(_valor, dict):
+                    symbol = str(
+                        _valor.get("symbol")
+                        or _valor.get("ticker")
+                        or _valor.get("codigo")
+                        or _valor.get("name")
+                        or aid
+                    )
+                else:
+                    symbol = str(_valor)
+                break
+
+            # Formato nome -> active_id / dados
+            for _chave, _valor in _mapa.items():
+                if isinstance(_valor, dict):
+                    _id = (
+                        _valor.get("active_id")
+                        or _valor.get("id")
+                        or _valor.get("activeId")
+                    )
+                    try:
+                        if _id is not None and int(_id) == aid:
+                            symbol = str(
+                                _valor.get("symbol")
+                                or _valor.get("ticker")
+                                or _valor.get("codigo")
+                                or _valor.get("name")
+                                or _chave
+                            )
+                            break
+                    except (TypeError, ValueError):
+                        pass
+                else:
+                    try:
+                        if int(_valor) == aid:
+                            symbol = str(_chave)
+                            break
+                    except (TypeError, ValueError):
+                        pass
+
+            if symbol != str(active_id):
+                break
+    except (TypeError, ValueError):
+        pass
 
     try:
         abertura = float(msg["open"])
