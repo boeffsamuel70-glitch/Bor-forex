@@ -100,7 +100,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "R27-OTC-FIM-M1-M5-GESTAO-AUTONOMA-META60-STOP24-TRAVA-LUCRO"
+BULLEX_DIAGNOSTIC_VERSION = "R28-OTC-FIM-ENTRADA-ATE1S-MAX2-GESTAO-META60"
 
 _bullex_diag = {
     "messages": 0,
@@ -208,7 +208,8 @@ INTRAVELA_RETRACAO_MAX = 0.68
 INTRAVELA_REJEICAO_ATR_MIN = 0.10
 INTRAVELA_PAVIO_MIN_FRACAO_MOVIMENTO = 0.10
 
-UMA_OPERACAO_GLOBAL = True
+UMA_OPERACAO_GLOBAL = False
+MAX_OPERACOES_SIMULTANEAS = 2
 
 # Após um LOSS, somente o ativo que perdeu fica bloqueado por 40 minutos.
 BLOQUEIO_LOSS_MINUTOS = 40
@@ -938,7 +939,9 @@ def _atualizar_estado_execucao():
         "valor_atual": valor,
         "nivel_progressao": nivel,
         "payout_lucro_percentual": PAYOUT_LUCRO_PERCENTUAL,
-        "operacao_ativa": _operacao_global_ativa is not None,
+        "operacao_ativa": bool(_operacoes_pendentes) or _operacao_global_ativa is not None,
+        "operacoes_abertas": len(_operacoes_pendentes),
+        "max_operacoes_simultaneas": MAX_OPERACOES_SIMULTANEAS,
         "balance_id_disponivel": _bullex_balance_id is not None,
         "balance_source": _bullex_balance_source,
         "gerenciamento": resumo,
@@ -1114,12 +1117,14 @@ def executar_ordem_intravela(symbol, sinal, resultado):
         return "SEM_BALANCE_ID"
 
     with _execucao_lock:
-        if UMA_OPERACAO_GLOBAL and _operacao_global_ativa is not None:
+        em_confirmacao = 1 if _operacao_global_ativa is not None else 0
+        abertas = len(_operacoes_pendentes) + em_confirmacao
+        if abertas >= MAX_OPERACOES_SIMULTANEAS:
             log(
                 f"[INTRAVELA] {symbol}: sinal ignorado; "
-                "já existe operação global ativa."
+                f"limite de {MAX_OPERACOES_SIMULTANEAS} operações simultâneas atingido."
             )
-            return "BLOQUEADA_GLOBAL"
+            return "LIMITE_OPERACOES"
 
     balance_id = _obter_balance_id()
     if not balance_id:
@@ -3681,8 +3686,9 @@ def _resultado_retracao_intravela(msg, active_id):
     decorridos = max(0.0, server_ts - candle_from)
     restantes = max(0.0, candle_to - server_ts)
 
-    # Entrada rápida: toda a leitura principal já vem das velas fechadas.
-    if decorridos < 2 or decorridos > 8 or restantes < 50:
+    # Entrada imediata: a análise principal já vem das velas fechadas.
+    # Só aceita a oportunidade até 1 segundo após abrir a nova M1.
+    if decorridos < 0 or decorridos > 1.0 or restantes < 58:
         return None
 
     contexto_m5 = _contexto_forca_m5(active_id)
@@ -3824,50 +3830,17 @@ def _resultado_retracao_intravela(msg, active_id):
         return None
 
     # --------------------------------------------------------
-    # 7. CONFIRMAÇÃO MICRO DA NOVA VELA
-    # Não esperamos corpo grande: apenas início de deslocamento.
+    # 7. TIMING IMEDIATO
     # --------------------------------------------------------
-    candle_key = (int(active_id), candle_from)
-    with _intravela_lock:
-        st = _intravela_estado.setdefault(
-            candle_key,
-            {"ultimo_close": fechamento, "eventos": 0},
-        )
-        ultimo_close = float(st.get("ultimo_close", fechamento))
-        st["ultimo_close"] = fechamento
-        st["eventos"] = int(st.get("eventos", 0)) + 1
-        eventos = st["eventos"]
-
-    if eventos < 2:
-        return None
-
-    corpo_atual = abs(fechamento - abertura)
-    micro_min = atr1 * 0.008
-
-    if direcao == "CALL":
-        micro_confirma = (
-            fechamento >= abertura
-            and fechamento > ultimo_close
-            and corpo_atual >= micro_min
-        )
-    else:
-        micro_confirma = (
-            fechamento <= abertura
-            and fechamento < ultimo_close
-            and corpo_atual >= micro_min
-        )
-
-    if not micro_confirma:
-        return None
-
-    score += 2
-    motivos.append("microconfirmação")
+    # Para entrar em até 1 segundo, não aguardamos a formação do corpo
+    # da nova vela. A decisão é baseada nas velas M1 já fechadas + M5.
+    motivos.append("entrada imediata <=1s")
 
     # --------------------------------------------------------
     # 8. SCORE FINAL
     # --------------------------------------------------------
     # Exige múltiplas evidências; não existe entrada por um único indicador.
-    SCORE_MINIMO_FIM = 8
+    SCORE_MINIMO_FIM = 6
     if score < SCORE_MINIMO_FIM:
         return None
 
@@ -4222,6 +4195,8 @@ def enviar_sinal_telegram(
 # ============================================================
 
 def registrar_operacao_intravela(symbol, resultado):
+    global _operacao_global_ativa
+
     sinal = resultado.get("sinal")
     if sinal not in ("CALL", "PUT"):
         return
@@ -4273,6 +4248,15 @@ def registrar_operacao_intravela(symbol, resultado):
 
     _operacoes_pendentes[symbol] = operacao
     _ultimas_operacoes_registradas[symbol] = chave
+
+    # A ordem já foi copiada para as operações pendentes.
+    # Libera o slot temporário para permitir a segunda operação.
+    with _execucao_lock:
+        if (
+            _operacao_global_ativa is not None
+            and _operacao_global_ativa.get("symbol") == symbol
+        ):
+            _operacao_global_ativa = None
 
     log(
         f"[INTRAVELA] {symbol}: operação registrada {sinal} | "
@@ -4505,7 +4489,7 @@ def processar_ativo(chave, symbol, executar_sinal=False):
             estado["atualidade_min"] = f"{idade:.1f} min" if idade is not None else "-"
             if estado.get("sinal") not in ("CALL", "PUT"):
                 estado["sinal"] = "AGUARDAR"
-                estado["mensagem"] = "Monitorando FIM: Fluxo M5 + estrutura, impulso, retração, rejeição, volatilidade e timing M1."
+                estado["mensagem"] = "Monitorando FIM: decisão pelas velas fechadas + M5, entrada até 1s da nova M1 e máximo 2 operações simultâneas."
         return None
 
     except Exception as e:
