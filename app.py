@@ -100,7 +100,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "R46-OTC-LIMITE-ATOMICO-2-ORDENS"
+BULLEX_DIAGNOSTIC_VERSION = "R47-OTC-22A21-SEM-BLOQUEIO-LOSS"
 
 _bullex_diag = {
     "messages": 0,
@@ -219,8 +219,8 @@ INTRAVELA_PAVIO_MIN_FRACAO_MOVIMENTO = 0.10
 UMA_OPERACAO_GLOBAL = False
 MAX_OPERACOES_SIMULTANEAS = 2
 
-# Após um LOSS, somente o ativo que perdeu fica bloqueado por 40 minutos.
-BLOQUEIO_LOSS_MINUTOS = 40
+# Bloqueio após LOSS desativado nesta versão.
+BLOQUEIO_LOSS_MINUTOS = 0
 _bloqueio_loss_lock = threading.RLock()
 _bloqueio_loss_ate = {}
 
@@ -3626,27 +3626,13 @@ def analisar_pullback(
 # ============================================================
 
 def _bloqueio_loss_restante(symbol):
-    agora = agora_brt()
-    with _bloqueio_loss_lock:
-        ate = _bloqueio_loss_ate.get(symbol)
-        if ate is None:
-            return 0.0
-        restante = (ate - agora).total_seconds()
-        if restante <= 0:
-            _bloqueio_loss_ate.pop(symbol, None)
-            return 0.0
-        return restante
+    # Bloqueio após LOSS desativado.
+    return 0.0
 
 
 def _aplicar_bloqueio_loss(symbol):
-    ate = agora_brt() + timedelta(minutes=BLOQUEIO_LOSS_MINUTOS)
-    with _bloqueio_loss_lock:
-        _bloqueio_loss_ate[symbol] = ate
-    log(
-        f"[COOLDOWN] {symbol} bloqueado por {BLOQUEIO_LOSS_MINUTOS} min "
-        f"após LOSS, até {ate.strftime('%H:%M:%S BRT')}."
-    )
-    return ate
+    # Mantido apenas por compatibilidade com chamadas antigas.
+    return None
 
 
 def _symbol_por_active_id(active_id):
@@ -4381,11 +4367,6 @@ def _processar_sinal_intravela(active_id, msg):
     if not dentro_do_horario():
         return
 
-    restante_bloqueio = _bloqueio_loss_restante(symbol)
-    if restante_bloqueio > 0:
-        # LOSS recente: este ativo fica fora por 40 minutos; os demais seguem normais.
-        return
-
     resultado = _resultado_retracao_intravela(msg, active_id)
     if resultado is None:
         return
@@ -4806,10 +4787,6 @@ def avaliar_operacao(symbol, candles):
             ):
                 _operacao_global_ativa = None
 
-        if resultado == "LOSS":
-            bloqueado_ate = _aplicar_bloqueio_loss(symbol)
-            operacao["bloqueado_ate"] = bloqueado_ate.isoformat()
-
         _atualizar_progressao(resultado)
         _atualizar_estado_execucao()
 
@@ -4872,7 +4849,6 @@ def enviar_resultado_telegram(
         f"Estrategia: {operacao.get('estrategia', '-')}\n"
         f"Regime: {operacao.get('regime', '-')}\n"
         f"Resultado: {resultado}\n"
-        + (f"Bloqueio do ativo: {BLOQUEIO_LOSS_MINUTOS} minutos\n" if resultado == "LOSS" else "")
         + f"\nEntrada: {fmt(operacao.get('entrada'))}\n"
         f"Saida: {fmt(operacao.get('saida'))}\n"
         f"Fonte da vela: Bullex\n\n"
