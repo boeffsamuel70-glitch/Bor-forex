@@ -77,7 +77,7 @@ _bullex_assets_source = None
 _bullex_assets_ready_event = threading.Event()
 _bullex_assets_init_lock = threading.Lock()
 
-_BULLEX_CANDLE_SIZES = {"5min": 300, "5min": 300}
+_BULLEX_CANDLE_SIZES = {"5min": 300, "15min": 900}
 
 _bullex_ws = None
 _bullex_ws_lock = threading.RLock()
@@ -100,7 +100,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "R38-OTC-FIM-M5-M15-DASHBOARD-LIMPO-FINAL"
+BULLEX_DIAGNOSTIC_VERSION = "R39-OTC-FIM-M5-M15-TIMEFRAME15-CORRIGIDO"
 
 _bullex_diag = {
     "messages": 0,
@@ -4804,14 +4804,14 @@ def finalizar_operacoes_vencidas_antes_da_leitura():
 
     for symbol in pendentes:
         try:
-            candles_1m = obter_candles(
+            candles_5m = obter_candles(
                 symbol,
                 TIMEFRAME,
                 OUTPUTSIZE
             )
             avaliar_operacao(
                 symbol,
-                candles_1m
+                candles_5m
             )
         except Exception as e:
             log(
@@ -4837,12 +4837,12 @@ def processar_ativo(chave, symbol, executar_sinal=False):
         return None
 
     try:
-        candles_1m = obter_candles(symbol, TIMEFRAME, OUTPUTSIZE)
-        # Mantém histórico M5 carregado para o filtro de tendência/força.
+        candles_5m = obter_candles(symbol, TIMEFRAME, OUTPUTSIZE)
+        # Mantém histórico M15 carregado para o filtro de tendência/força.
         obter_candles(symbol, TIMEFRAME_TREND, OUTPUTSIZE_5M)
-        avaliar_operacao(symbol, candles_1m)
+        avaliar_operacao(symbol, candles_5m)
 
-        ultimo, idade = idade_do_ultimo_candle(candles_1m)
+        ultimo, idade = idade_do_ultimo_candle(candles_5m)
         if ultimo is not None:
             estado["ativo"] = symbol
             estado["preco"] = f"{float(ultimo['close']):.5f}"
