@@ -77,7 +77,7 @@ _bullex_assets_source = None
 _bullex_assets_ready_event = threading.Event()
 _bullex_assets_init_lock = threading.Lock()
 
-_BULLEX_CANDLE_SIZES = {"5min": 300, "15min": 900}
+_BULLEX_CANDLE_SIZES = {"5min": 300, "15min": 900, 300: 300, 900: 900}
 
 _bullex_ws = None
 _bullex_ws_lock = threading.RLock()
@@ -100,7 +100,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "R39-OTC-FIM-M5-M15-TIMEFRAME15-CORRIGIDO"
+BULLEX_DIAGNOSTIC_VERSION = "R40-OTC-FIM-M5-M15-TIMEFRAME-E-LOGS-CORRIGIDOS"
 
 _bullex_diag = {
     "messages": 0,
@@ -4992,7 +4992,7 @@ def esperar_ate_proxima_leitura():
     )
 
     log(
-        "[R32][M5] Proxima leitura M5: "
+        f"[{BULLEX_DIAGNOSTIC_VERSION}][M5] Proxima leitura M5: "
         f"{proxima.strftime('%H:%M:%S BRT')}"
     )
 
