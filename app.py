@@ -2,6 +2,7 @@ import os
 import time
 import threading
 import secrets
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import json
@@ -100,7 +101,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "R47-OTC-22A21-SEM-BLOQUEIO-LOSS"
+BULLEX_DIAGNOSTIC_VERSION = "R48-OTC-TOP2-RANQUEADO"
 
 _bullex_diag = {
     "messages": 0,
@@ -4124,6 +4125,11 @@ def _resultado_retracao_intravela(msg, active_id):
         "candle_to": candle_to,
         "segundos_decorridos": decorridos,
         "segundos_restantes": restantes,
+        # Métricas extras usadas apenas para ranquear sinais concorrentes.
+        # Não alteram a regra que aprova/reprova o sinal.
+        "adx_m15": float(adx15),
+        "distancia_ema_atr": float(distancia_ema / max(atr1, 1e-12)),
+        "range_ultima_atr": float(ultima["range"] / max(atr1, 1e-12)),
     }
 
 def _atualizar_dashboard_intravela(symbol, resultado):
@@ -4280,10 +4286,67 @@ def _ultimo_candle_fechado_m5(active_id, abertura_nova_m5):
 
 
 
+def _rank_sinal_fim_m5(resultado):
+    """
+    Ranking entre sinais JÁ aprovados pela estratégia.
+
+    Prioridade:
+      1) maior score da estratégia;
+      2) contexto M15 mais forte (ADX);
+      3) menor distância da EMA em unidades de ATR;
+      4) última vela menos esticada em unidades de ATR.
+
+    Isso não cria sinal novo nem relaxa filtros: apenas escolhe os melhores
+    quando há mais sinais aprovados do que vagas simultâneas.
+    """
+    return (
+        float(resultado.get("score", 0)),
+        float(resultado.get("adx_m15", 0)),
+        -float(resultado.get("distancia_ema_atr", 999)),
+        -float(resultado.get("range_ultima_atr", 999)),
+    )
+
+
+def _avaliar_candidato_fim_m5(active_id, abertura_m5):
+    """Avalia um ativo usando apenas caches já carregados, sem enviar ordem."""
+    codigo, symbol = _symbol_por_active_id(active_id)
+    if not codigo or not symbol:
+        return None
+
+    ultimo = _ultimo_candle_fechado_m5(active_id, abertura_m5)
+    if ultimo is None:
+        log(f"[FIM-M5][RELOGIO] active_id={active_id} sem M5 fechado disponível.")
+        return None
+
+    msg_nova = {
+        "active_id": int(active_id),
+        "size": 300,
+        "from": int(abertura_m5),
+        "to": int(abertura_m5 + 300),
+        "open": ultimo.get("close"),
+        "close": ultimo.get("close"),
+        "min": ultimo.get("close"),
+        "max": ultimo.get("close"),
+        "phase": "deal",
+        "_gatilho": "RELOGIO_SERVIDOR_RANK",
+    }
+
+    resultado = _resultado_retracao_intravela(msg_nova, active_id)
+    if resultado is None:
+        return None
+
+    return {
+        "active_id": int(active_id),
+        "codigo": codigo,
+        "symbol": symbol,
+        "resultado": resultado,
+    }
+
+
 def _disparar_fim_m5_pelo_relogio():
     """
-    Dispara a FIM na abertura exata de cada M5 usando o relógio do servidor.
-    A ordem só pode ser enviada dentro dos primeiros 3 segundos.
+    Na abertura de cada M5, avalia TODOS os ativos prontos, ranqueia os sinais
+    aprovados e envia somente os melhores, respeitando as vagas disponíveis.
     """
     global _relogio_m5_ultima_janela
 
@@ -4296,7 +4359,6 @@ def _disparar_fim_m5_pelo_relogio():
     abertura_m5 = int(ts_servidor // 300) * 300
     decorridos = ts_servidor - abertura_m5
 
-    # Fora da janela de entrada.
     if decorridos < 0 or decorridos > 3.0:
         return
 
@@ -4320,34 +4382,89 @@ def _disparar_fim_m5_pelo_relogio():
         f"| atraso={decorridos:.3f}s | fonte={fonte} | ativos={len(ativos)}"
     )
 
-    for active_id in ativos:
-        ultimo = _ultimo_candle_fechado_m5(active_id, abertura_m5)
-        if ultimo is None:
-            log(f"[FIM-M5][RELOGIO] active_id={active_id} sem M5 fechado disponível.")
-            continue
-
-        # Mensagem sintética da NOVA vela M5.
-        # A lógica FIM usa o cache das velas fechadas para os indicadores.
-        msg_nova = {
-            "active_id": int(active_id),
-            "size": 300,
-            "from": int(abertura_m5),
-            "to": int(abertura_m5 + 300),
-            "open": ultimo.get("close"),
-            "close": ultimo.get("close"),
-            "min": ultimo.get("close"),
-            "max": ultimo.get("close"),
-            "phase": "deal",
-            "_gatilho": "RELOGIO_SERVIDOR",
+    candidatos = []
+    workers = min(16, max(1, len(ativos)))
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="fim-rank") as executor:
+        futuros = {
+            executor.submit(_avaliar_candidato_fim_m5, int(active_id), abertura_m5): int(active_id)
+            for active_id in ativos
         }
+        for futuro in as_completed(futuros):
+            try:
+                item = futuro.result()
+                if item is not None:
+                    candidatos.append(item)
+            except Exception as exc:
+                log(
+                    f"[FIM-M5][RANK] active_id={futuros[futuro]} "
+                    f"erro={type(exc).__name__}: {exc}"
+                )
+
+    if not candidatos:
+        log("[FIM-M5][RANK] Nenhum sinal aprovado neste fechamento M5.")
+        return
+
+    candidatos.sort(key=lambda x: _rank_sinal_fim_m5(x["resultado"]), reverse=True)
+
+    with _execucao_lock:
+        ocupadas = len(_operacoes_pendentes) + len(_ordens_em_confirmacao)
+        vagas = max(0, MAX_OPERACOES_SIMULTANEAS - ocupadas)
+
+    if vagas <= 0:
+        log(
+            f"[FIM-M5][RANK] {len(candidatos)} sinais aprovados, mas sem vagas "
+            f"(ocupadas={ocupadas}/{MAX_OPERACOES_SIMULTANEAS})."
+        )
+        return
+
+    escolhidos = candidatos[:vagas]
+    descartados = candidatos[vagas:]
+
+    resumo = " | ".join(
+        f"#{i+1} {item['symbol']} {item['resultado']['sinal']} "
+        f"score={item['resultado']['score']} ADX={item['resultado'].get('adx_m15', 0):.1f} "
+        f"distEMA={item['resultado'].get('distancia_ema_atr', 0):.2f}ATR"
+        for i, item in enumerate(candidatos[:min(6, len(candidatos))])
+    )
+    log(
+        f"[FIM-M5][RANK] aprovados={len(candidatos)} | vagas={vagas} | "
+        f"selecionados={len(escolhidos)} | ranking: {resumo}"
+    )
+
+    for item in descartados:
+        r = item["resultado"]
+        log(
+            f"[FIM-M5][RANK] {item['symbol']} {r['sinal']} NÃO SELECIONADO | "
+            f"score={r['score']} | ADX={r.get('adx_m15', 0):.1f} | "
+            f"distEMA={r.get('distancia_ema_atr', 0):.2f}ATR"
+        )
+
+    for item in escolhidos:
+        active_id = item["active_id"]
+        codigo = item["codigo"]
+        symbol = item["symbol"]
+        resultado = item["resultado"]
+        candle_key = (int(active_id), int(resultado["candle_from"]))
+
+        with _intravela_lock:
+            if candle_key in _intravela_velas_tentadas:
+                continue
+            _intravela_velas_tentadas.add(candle_key)
+
+        _atualizar_dashboard_intravela(symbol, resultado)
+        log(
+            f"[INTRAVELA][TOP2] {symbol} -> {resultado['sinal']} | "
+            f"score={resultado['score']} | ADX={resultado.get('adx_m15', 0):.1f} | "
+            f"distEMA={resultado.get('distancia_ema_atr', 0):.2f}ATR | "
+            f"{resultado['pullback']} | preco={resultado['preco']:.5f}"
+        )
 
         threading.Thread(
-            target=_processar_sinal_intravela,
-            args=(int(active_id), msg_nova),
+            target=registrar_operacao_intravela,
+            args=(symbol, resultado),
             daemon=True,
-            name=f"fim-m5-clock-{active_id}",
+            name=f"intravela-top2-{codigo}-{resultado['candle_from']}",
         ).start()
-
 
 def _loop_gatilho_relogio_m5():
     """Loop leve: verifica a virada da vela M5 várias vezes por segundo."""
