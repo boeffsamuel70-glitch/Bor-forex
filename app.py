@@ -100,7 +100,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "R20-OTC-AUTO-EMA9-21-PULLBACK-M1-6-9-COOLDOWN40"
+BULLEX_DIAGNOSTIC_VERSION = "R21-OTC-M5-FORCA-M1-PULLBACK-EMA9-21-6-9-COOLDOWN40"
 
 _bullex_diag = {
     "messages": 0,
@@ -158,7 +158,16 @@ EXPIRACAO_MINUTOS = 1
 INTRAVELA_MIN_SEGUNDOS_DECORRIDOS = 8
 INTRAVELA_MIN_SEGUNDOS_RESTANTES = 15
 
-# Suporte/Resistência M5 é OBRIGATÓRIO.
+# Filtro de contexto/força no M5. O M5 não executa a entrada; ele apenas
+# autoriza operações na direção de uma tendência suficientemente forte.
+M5_ADX_PERIODO = 14
+M5_ADX_MINIMO = 20.0
+M5_SEPARACAO_EMAS_ATR_MIN = 0.12
+M5_INCLINACAO_ATR_MIN = 0.03
+M5_IMPULSO_CANDLES = 3
+M5_IMPULSO_MIN_DIRECIONAIS = 2
+
+# Parâmetros antigos de S/R mantidos apenas por compatibilidade com helpers legados.
 SR_M5_LOOKBACK = 100
 SR_M5_PIVOT_JANELA = 2
 SR_M5_MIN_TOQUES = 2
@@ -2574,6 +2583,128 @@ def atr(candles, period=14):
     )
 
 
+def adx(candles, period=14):
+    """Calcula ADX de Wilder para medir força de tendência, sem direção."""
+    if len(candles) < (period * 2) + 1:
+        return None
+
+    trs = []
+    plus_dm = []
+    minus_dm = []
+    for i in range(1, len(candles)):
+        atual = candles[i]
+        anterior = candles[i - 1]
+        high = float(atual["high"])
+        low = float(atual["low"])
+        prev_high = float(anterior["high"])
+        prev_low = float(anterior["low"])
+        prev_close = float(anterior["close"])
+
+        up = high - prev_high
+        down = prev_low - low
+        plus_dm.append(up if up > down and up > 0 else 0.0)
+        minus_dm.append(down if down > up and down > 0 else 0.0)
+        trs.append(max(high - low, abs(high - prev_close), abs(low - prev_close)))
+
+    if len(trs) < period * 2:
+        return None
+
+    tr_s = sum(trs[:period])
+    p_s = sum(plus_dm[:period])
+    m_s = sum(minus_dm[:period])
+    dxs = []
+
+    def _dx(trv, pv, mv):
+        if trv <= 0:
+            return None
+        pdi = 100.0 * pv / trv
+        mdi = 100.0 * mv / trv
+        den = pdi + mdi
+        if den <= 0:
+            return 0.0
+        return 100.0 * abs(pdi - mdi) / den
+
+    first = _dx(tr_s, p_s, m_s)
+    if first is not None:
+        dxs.append(first)
+
+    for i in range(period, len(trs)):
+        tr_s = tr_s - (tr_s / period) + trs[i]
+        p_s = p_s - (p_s / period) + plus_dm[i]
+        m_s = m_s - (m_s / period) + minus_dm[i]
+        valor = _dx(tr_s, p_s, m_s)
+        if valor is not None:
+            dxs.append(valor)
+
+    if len(dxs) < period:
+        return None
+
+    valor_adx = sum(dxs[:period]) / period
+    for valor in dxs[period:]:
+        valor_adx = ((valor_adx * (period - 1)) + valor) / period
+    return valor_adx
+
+
+def _contexto_forca_m5(active_id):
+    """Retorna direção M5 somente quando tendência e força são suficientes."""
+    candles = somente_velas_fechadas(_candles_cache(active_id, 300), 5)
+    if len(candles) < 40:
+        return None
+    candles = candles[-80:]
+
+    closes = [float(c["close"]) for c in candles]
+    ema9s = ema_series(closes, 9)
+    ema21s = ema_series(closes, 21)
+    ema9 = ema9s[-1]
+    ema21 = ema21s[-1]
+    ema9_prev = ema9s[-3] if len(ema9s) >= 3 else None
+    ema21_prev = ema21s[-3] if len(ema21s) >= 3 else None
+    atr5 = atr(candles, 14)
+    adx5 = adx(candles, M5_ADX_PERIODO)
+
+    if None in (ema9, ema21, ema9_prev, ema21_prev) or not atr5 or atr5 <= 0 or adx5 is None:
+        return None
+    if adx5 < M5_ADX_MINIMO:
+        return None
+
+    separacao = abs(ema9 - ema21)
+    if separacao < atr5 * M5_SEPARACAO_EMAS_ATR_MIN:
+        return None
+
+    inclinacao9 = ema9 - ema9_prev
+    inclinacao21 = ema21 - ema21_prev
+    ultimos = candles[-M5_IMPULSO_CANDLES:]
+    altas = sum(float(c["close"]) > float(c["open"]) for c in ultimos)
+    baixas = sum(float(c["close"]) < float(c["open"]) for c in ultimos)
+
+    min_inclinacao = atr5 * M5_INCLINACAO_ATR_MIN
+    if (
+        ema9 > ema21
+        and inclinacao9 >= min_inclinacao
+        and inclinacao21 > 0
+        and altas >= M5_IMPULSO_MIN_DIRECIONAIS
+    ):
+        return {
+            "direcao": "CALL", "ema9": ema9, "ema21": ema21,
+            "adx": adx5, "atr": atr5, "separacao": separacao,
+            "impulso": altas,
+        }
+
+    if (
+        ema9 < ema21
+        and inclinacao9 <= -min_inclinacao
+        and inclinacao21 < 0
+        and baixas >= M5_IMPULSO_MIN_DIRECIONAIS
+    ):
+        return {
+            "direcao": "PUT", "ema9": ema9, "ema21": ema21,
+            "adx": adx5, "atr": atr5, "separacao": separacao,
+            "impulso": baixas,
+        }
+
+    return None
+
+
 # ============================================================
 # INFORMAÇÕES DA VELA
 # ============================================================
@@ -3214,13 +3345,11 @@ def _nivel_mais_proximo(niveis, preco, lado):
 
 
 def _resultado_retracao_intravela(msg, active_id):
-    """Estratégia M1: EMA9/EMA21 + impulso + pullback + rejeição.
+    """Estratégia híbrida: força/tendência M5 + pullback/rejeição M1.
 
-    CALL: EMA9 acima da EMA21, tendência com inclinação e separação mínimas,
-    preço recua até a zona das EMAs e rejeita para cima.
-    PUT: regras espelhadas.
-
-    A entrada ocorre dentro da vela M1 e expira no fechamento da mesma vela.
+    O M5 precisa autorizar uma direção usando EMA9/EMA21, inclinação, separação,
+    ADX e impulso recente. O M1 então procura o pullback nas EMA9/EMA21 e uma
+    rejeição na mesma direção para executar a entrada de 1 minuto.
     """
     if not isinstance(msg, dict):
         return None
@@ -3238,7 +3367,11 @@ def _resultado_retracao_intravela(msg, active_id):
     server_ts, _ = _horario_servidor_atual()
     decorridos = max(0.0, server_ts - candle_from)
     restantes = max(0.0, candle_to - server_ts)
-    if decorridos < 8 or restantes < 15:
+    if decorridos < INTRAVELA_MIN_SEGUNDOS_DECORRIDOS or restantes < INTRAVELA_MIN_SEGUNDOS_RESTANTES:
+        return None
+
+    contexto_m5 = _contexto_forca_m5(active_id)
+    if not contexto_m5:
         return None
 
     candles = somente_velas_fechadas(_candles_cache(active_id, 60), 1)
@@ -3281,7 +3414,7 @@ def _resultado_retracao_intravela(msg, active_id):
     baixas = sum(float(c["close"]) < float(c["open"]) for c in ultimos3)
 
     # CALL: tendência de alta + pullback na zona + rejeição compradora.
-    if ema9 > ema21 and ema9 > ema9_prev and ema21 > ema21_prev and altas >= 2:
+    if (contexto_m5["direcao"] == "CALL" and ema9 > ema21 and ema9 > ema9_prev and ema21 > ema21_prev and altas >= 2):
         tocou = minima <= zona_max and maxima >= zona_min
         rejeicao = fechamento - minima
         pavio = min(abertura, fechamento) - minima
@@ -3296,19 +3429,19 @@ def _resultado_retracao_intravela(msg, active_id):
             return {
                 "sinal": "CALL", "score": score, "score_call": score, "score_put": 1,
                 "preco": fechamento, "vela": datetime.fromtimestamp(candle_from, TZ),
-                "estrategia": "EMA9_21_PULLBACK_REJEICAO_M1", "regime": "TENDENCIA_M1",
+                "estrategia": "M5_FORCA_M1_PULLBACK_REJEICAO", "regime": "TENDENCIA_M5_FORTE",
                 "pullback": "PULLBACK EMA9/21 + REJEICAO CALL", "rejeicao": "CONFIRMADA",
                 "lateral": "NAO", "atr": atr1, "rsi": None,
                 "ema5": None, "ema13": ema9, "ema21": ema21,
-                "tendencia_5m": "N/A", "tendencia_15m": "ALTA M1",
+                "tendencia_5m": f"ALTA FORTE | ADX {contexto_m5['adx']:.1f}", "tendencia_15m": "N/A",
                 "zona_fibonacci": "EMA9/EMA21 M1", "bloqueio": "SINAL",
-                "mensagem": f"CALL | EMA9>{ema21:.5f} | pullback/rejeicao M1 | restam={restantes:.1f}s",
+                "mensagem": f"CALL | M5 forte ADX={contexto_m5['adx']:.1f} | pullback/rejeicao M1 | restam={restantes:.1f}s",
                 "candle_from": candle_from, "candle_to": candle_to,
                 "segundos_decorridos": decorridos, "segundos_restantes": restantes,
             }
 
     # PUT: tendência de baixa + pullback na zona + rejeição vendedora.
-    if ema9 < ema21 and ema9 < ema9_prev and ema21 < ema21_prev and baixas >= 2:
+    if (contexto_m5["direcao"] == "PUT" and ema9 < ema21 and ema9 < ema9_prev and ema21 < ema21_prev and baixas >= 2):
         tocou = minima <= zona_max and maxima >= zona_min
         rejeicao = maxima - fechamento
         pavio = maxima - max(abertura, fechamento)
@@ -3323,13 +3456,13 @@ def _resultado_retracao_intravela(msg, active_id):
             return {
                 "sinal": "PUT", "score": score, "score_call": 1, "score_put": score,
                 "preco": fechamento, "vela": datetime.fromtimestamp(candle_from, TZ),
-                "estrategia": "EMA9_21_PULLBACK_REJEICAO_M1", "regime": "TENDENCIA_M1",
+                "estrategia": "M5_FORCA_M1_PULLBACK_REJEICAO", "regime": "TENDENCIA_M5_FORTE",
                 "pullback": "PULLBACK EMA9/21 + REJEICAO PUT", "rejeicao": "CONFIRMADA",
                 "lateral": "NAO", "atr": atr1, "rsi": None,
                 "ema5": None, "ema13": ema9, "ema21": ema21,
-                "tendencia_5m": "N/A", "tendencia_15m": "BAIXA M1",
+                "tendencia_5m": f"BAIXA FORTE | ADX {contexto_m5['adx']:.1f}", "tendencia_15m": "N/A",
                 "zona_fibonacci": "EMA9/EMA21 M1", "bloqueio": "SINAL",
-                "mensagem": f"PUT | EMA9<{ema21:.5f} | pullback/rejeicao M1 | restam={restantes:.1f}s",
+                "mensagem": f"PUT | M5 forte ADX={contexto_m5['adx']:.1f} | pullback/rejeicao M1 | restam={restantes:.1f}s",
                 "candle_from": candle_from, "candle_to": candle_to,
                 "segundos_decorridos": decorridos, "segundos_restantes": restantes,
             }
@@ -3355,7 +3488,7 @@ def _atualizar_dashboard_intravela(symbol, resultado):
         "ema5": "-",
         "ema13": "-",
         "ema21": "-",
-        "tendencia_5m": "N/A",
+        "tendencia_5m": resultado.get("tendencia_5m", "-"),
         "tendencia_15m": "N/A",
         "pullback": resultado.get("pullback", "-"),
         "confirmacao": resultado.get("rejeicao", "-"),
@@ -3366,7 +3499,7 @@ def _atualizar_dashboard_intravela(symbol, resultado):
         ),
         "bloqueio": resultado.get("bloqueio", "-"),
         "regime": "INTRAVELA",
-        "estrategia": "EMA9_21_PULLBACK_REJEICAO_M1",
+        "estrategia": "M5_FORCA_M1_PULLBACK_REJEICAO",
         "zona_fibonacci": "-",
     }
 
@@ -3684,7 +3817,7 @@ def registrar_operacao_intravela(symbol, resultado):
         "symbol": symbol,
         "sinal": sinal,
         "score": resultado.get("score", 0),
-        "estrategia": "EMA9_21_PULLBACK_REJEICAO_M1",
+        "estrategia": "M5_FORCA_M1_PULLBACK_REJEICAO",
         "regime": "INTRAVELA",
         "preco_sinal": float(resultado["preco"]),
         "vela_sinal": candle_dt,
@@ -3894,7 +4027,7 @@ def processar_ativo(chave, symbol, executar_sinal=False):
 
     try:
         candles_1m = obter_candles(symbol, TIMEFRAME, OUTPUTSIZE)
-        # Mantém histórico M5 carregado para construir suporte/resistência.
+        # Mantém histórico M5 carregado para o filtro de tendência/força.
         obter_candles(symbol, TIMEFRAME_TREND, OUTPUTSIZE_5M)
         avaliar_operacao(symbol, candles_1m)
 
@@ -3906,7 +4039,7 @@ def processar_ativo(chave, symbol, executar_sinal=False):
             estado["atualidade_min"] = f"{idade:.1f} min" if idade is not None else "-"
             if estado.get("sinal") not in ("CALL", "PUT"):
                 estado["sinal"] = "AGUARDAR"
-                estado["mensagem"] = "Monitorando retração na vela atual em tempo real."
+                estado["mensagem"] = "Monitorando força M5 e pullback/rejeição M1 em tempo real."
         return None
 
     except Exception as e:
