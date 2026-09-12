@@ -4164,7 +4164,7 @@ def loop_robo():
     )
     log(
         f"[R18][M1] Scheduler ativo: leitura/manutencao a cada 1 minuto | "
-        f"expiracao={EXPIRACAO_MINUTOS} minuto(s) | cooldown_loss={COOLDOWN_LOSS_MINUTOS} min"
+        f"expiracao={EXPIRACAO_MINUTOS} minuto(s) | cooldown_loss={BLOQUEIO_LOSS_MINUTOS} min"
     )
 
     try:
