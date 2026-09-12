@@ -100,7 +100,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "R29-OTC-FIM-ATE1S-MAX2-DIAGNOSTICO-GESTAO-META60"
+BULLEX_DIAGNOSTIC_VERSION = "R30-OTC-FIM-M5-M15-ATE1S-MAX2-DIAGNOSTICO-GESTAO-META60"
 
 _bullex_diag = {
     "messages": 0,
@@ -414,7 +414,7 @@ def _janela_execucao_m1():
 
     current = int(server_ts)
     candle_open = current - (current % 60)
-    candle_close = candle_open + 60
+    candle_close = candle_open + 300
     atraso = max(0.0, server_ts - candle_open)
 
     restante = max(0.0, candle_close - server_ts)
@@ -2972,11 +2972,11 @@ def _contexto_forca_m5(active_id):
     ema9_prev = ema9s[-3] if len(ema9s) >= 3 else None
     ema21_prev = ema21s[-3] if len(ema21s) >= 3 else None
     atr5 = atr(candles, 14)
-    adx5 = adx(candles, M5_ADX_PERIODO)
+    adx15 = adx(candles, M5_ADX_PERIODO)
 
-    if None in (ema9, ema21, ema9_prev, ema21_prev) or not atr5 or atr5 <= 0 or adx5 is None:
+    if None in (ema9, ema21, ema9_prev, ema21_prev) or not atr5 or atr5 <= 0 or adx15 is None:
         return None
-    if adx5 < M5_ADX_MINIMO:
+    if adx15 < M5_ADX_MINIMO:
         return None
 
     separacao = abs(ema9 - ema21)
@@ -2998,7 +2998,7 @@ def _contexto_forca_m5(active_id):
     ):
         return {
             "direcao": "CALL", "ema9": ema9, "ema21": ema21,
-            "adx": adx5, "atr": atr5, "separacao": separacao,
+            "adx": adx15, "atr": atr5, "separacao": separacao,
             "impulso": altas,
         }
 
@@ -3010,7 +3010,72 @@ def _contexto_forca_m5(active_id):
     ):
         return {
             "direcao": "PUT", "ema9": ema9, "ema21": ema21,
-            "adx": adx5, "atr": atr5, "separacao": separacao,
+            "adx": adx15, "atr": atr5, "separacao": separacao,
+            "impulso": baixas,
+        }
+
+    return None
+
+
+# ============================================================
+# INFORMAÇÕES DA VELA
+# ============================================================
+
+
+def _contexto_forca_m15(active_id):
+    """Retorna direção M15 somente quando tendência e força são suficientes."""
+    candles = somente_velas_fechadas(_candles_cache(active_id, 900), 5)
+    if len(candles) < 40:
+        return None
+    candles = candles[-80:]
+
+    closes = [float(c["close"]) for c in candles]
+    ema9s = ema_series(closes, 9)
+    ema21s = ema_series(closes, 21)
+    ema9 = ema9s[-1]
+    ema21 = ema21s[-1]
+    ema9_prev = ema9s[-3] if len(ema9s) >= 3 else None
+    ema21_prev = ema21s[-3] if len(ema21s) >= 3 else None
+    atr5 = atr(candles, 14)
+    adx15 = adx(candles, M15_ADX_PERIODO)
+
+    if None in (ema9, ema21, ema9_prev, ema21_prev) or not atr5 or atr5 <= 0 or adx15 is None:
+        return None
+    if adx15 < M15_ADX_MINIMO:
+        return None
+
+    separacao = abs(ema9 - ema21)
+    if separacao < atr5 * M15_SEPARACAO_EMAS_ATR_MIN:
+        return None
+
+    inclinacao9 = ema9 - ema9_prev
+    inclinacao21 = ema21 - ema21_prev
+    ultimos = candles[-M15_IMPULSO_CANDLES:]
+    altas = sum(float(c["close"]) > float(c["open"]) for c in ultimos)
+    baixas = sum(float(c["close"]) < float(c["open"]) for c in ultimos)
+
+    min_inclinacao = atr5 * M15_INCLINACAO_ATR_MIN
+    if (
+        ema9 > ema21
+        and inclinacao9 >= min_inclinacao
+        and inclinacao21 > 0
+        and altas >= M15_IMPULSO_MIN_DIRECIONAIS
+    ):
+        return {
+            "direcao": "CALL", "ema9": ema9, "ema21": ema21,
+            "adx": adx15, "atr": atr5, "separacao": separacao,
+            "impulso": altas,
+        }
+
+    if (
+        ema9 < ema21
+        and inclinacao9 <= -min_inclinacao
+        and inclinacao21 < 0
+        and baixas >= M15_IMPULSO_MIN_DIRECIONAIS
+    ):
+        return {
+            "direcao": "PUT", "ema9": ema9, "ema21": ema21,
+            "adx": adx15, "atr": atr5, "separacao": separacao,
             "impulso": baixas,
         }
 
@@ -3659,7 +3724,7 @@ def _nivel_mais_proximo(niveis, preco, lado):
 
 def _log_fim_diagnostico(active_id, symbol, status, **dados):
     """Log compacto para entender por que a FIM entrou ou bloqueou."""
-    partes = [f"[FIM][DIAG] {symbol}", status]
+    partes = [f"[FIM-M5][DIAG] {symbol}", status]
     for chave, valor in dados.items():
         if isinstance(valor, float):
             partes.append(f"{chave}={valor:.3f}")
@@ -3671,14 +3736,14 @@ def _log_fim_diagnostico(active_id, symbol, status, **dados):
 def _resultado_retracao_intravela(msg, active_id):
     """FIM EXPERIMENTAL — Fluxo, Impulso e Momento.
 
-    Estratégia autoral para M1:
+    Estratégia autoral para M5:
     1. Fluxo M5: direção + força (ADX).
-    2. Estrutura M1: EMA9/EMA21 e inclinação.
+    2. Estrutura M5: EMA9/EMA21 e inclinação.
     3. Impulso: corpos e fechamentos recentes.
     4. Retração: procura perda de força contra o fluxo.
     5. Rejeição: pavios/posição do fechamento.
     6. Volatilidade: ATR evita mercado morto e vela esticada.
-    7. Timing: só entra no começo da nova M1.
+    7. Timing: só entra no começo da nova M5.
     8. Score: exige várias evidências simultâneas.
     """
     if not isinstance(msg, dict):
@@ -3703,17 +3768,17 @@ def _resultado_retracao_intravela(msg, active_id):
     _log_fim_diagnostico(
         active_id,
         symbol,
-        "M1_RECEBIDA",
+        "M5_RECEBIDA",
         atraso_s=decorridos,
         restantes_s=restantes,
     )
 
     # Entrada imediata: a análise principal já vem das velas fechadas.
-    # Só aceita a oportunidade até 1 segundo após abrir a nova M1.
+    # Só aceita a oportunidade até 1 segundo após abrir a nova M5.
     if decorridos < 0:
         _log_fim_diagnostico(active_id, symbol, "BLOQUEADA_RELOGIO", atraso_s=decorridos)
         return None
-    if decorridos > 1.0 or restantes < 58:
+    if decorridos > 1.0 or restantes < 298:
         _log_fim_diagnostico(
             active_id,
             symbol,
@@ -3723,24 +3788,24 @@ def _resultado_retracao_intravela(msg, active_id):
         )
         return None
 
-    contexto_m5 = _contexto_forca_m5(active_id)
-    if not contexto_m5:
-        _log_fim_diagnostico(active_id, symbol, "BLOQUEADA_SEM_CONTEXTO_M5")
+    contexto_m15 = _contexto_forca_m15(active_id)
+    if not contexto_m15:
+        _log_fim_diagnostico(active_id, symbol, "BLOQUEADA_SEM_CONTEXTO_M55")
         return None
 
-    direcao = contexto_m5.get("direcao")
-    adx5 = float(contexto_m5.get("adx") or 0.0)
+    direcao = contexto_m15.get("direcao")
+    adx15 = float(contexto_m15.get("adx") or 0.0)
     if direcao not in ("CALL", "PUT"):
-        _log_fim_diagnostico(active_id, symbol, "BLOQUEADA_SEM_DIRECAO_M5", adx=adx5)
+        _log_fim_diagnostico(active_id, symbol, "BLOQUEADA_SEM_DIRECAO_M55", adx=adx15)
         return None
-    if adx5 < 20:
+    if adx15 < 20:
         _log_fim_diagnostico(
             active_id, symbol, "BLOQUEADA_ADX_BAIXO",
-            direcao=direcao, adx=adx5, minimo=20
+            direcao=direcao, adx=adx15, minimo=20
         )
         return None
 
-    candles = somente_velas_fechadas(_candles_cache(active_id, 60), 1)
+    candles = somente_velas_fechadas(_candles_cache(active_id, 300), 1)
     if len(candles) < 40:
         _log_fim_diagnostico(
             active_id, symbol, "BLOQUEADA_POUCAS_VELAS",
@@ -3769,10 +3834,10 @@ def _resultado_retracao_intravela(msg, active_id):
     # --------------------------------------------------------
     # 1. FLUXO M5
     # --------------------------------------------------------
-    if adx5 >= 28:
+    if adx15 >= 28:
         score += 3
         motivos.append("M5 muito forte")
-    elif adx5 >= 23:
+    elif adx15 >= 23:
         score += 2
         motivos.append("M5 forte")
     else:
@@ -3780,7 +3845,7 @@ def _resultado_retracao_intravela(msg, active_id):
         motivos.append("M5 válido")
 
     # --------------------------------------------------------
-    # 2. ESTRUTURA M1 — EMA + inclinação
+    # 2. ESTRUTURA M5 — EMA + inclinação
     # --------------------------------------------------------
     sep = abs(ema9 - ema21)
     if sep < atr1 * 0.06:
@@ -3793,7 +3858,7 @@ def _resultado_retracao_intravela(msg, active_id):
     if direcao == "CALL":
         if ema9 >= ema21:
             score += 2
-            motivos.append("EMA M1 alta")
+            motivos.append("EMA M5 alta")
         else:
             score -= 2
         inclinacao = ema9s[-1] - ema9s[-4]
@@ -3803,7 +3868,7 @@ def _resultado_retracao_intravela(msg, active_id):
     else:
         if ema9 <= ema21:
             score += 2
-            motivos.append("EMA M1 baixa")
+            motivos.append("EMA M5 baixa")
         else:
             score -= 2
         inclinacao = ema9s[-1] - ema9s[-4]
@@ -3890,7 +3955,7 @@ def _resultado_retracao_intravela(msg, active_id):
     # 7. TIMING IMEDIATO
     # --------------------------------------------------------
     # Para entrar em até 1 segundo, não aguardamos a formação do corpo
-    # da nova vela. A decisão é baseada nas velas M1 já fechadas + M5.
+    # da nova vela. A decisão é baseada nas velas M5 já fechadas + M15.
     motivos.append("entrada imediata <=1s")
 
     # --------------------------------------------------------
@@ -3904,7 +3969,7 @@ def _resultado_retracao_intravela(msg, active_id):
             direcao=direcao,
             score=score,
             minimo=SCORE_MINIMO_FIM,
-            adx=adx5,
+            adx=adx15,
             motivos=";".join(motivos),
         )
         return None
@@ -3919,7 +3984,7 @@ def _resultado_retracao_intravela(msg, active_id):
         score=score,
         qualidade=qualidade,
         atraso_s=decorridos,
-        adx=adx5,
+        adx=adx15,
     )
 
     return {
@@ -3929,7 +3994,7 @@ def _resultado_retracao_intravela(msg, active_id):
         "score_put": score if direcao == "PUT" else 1,
         "preco": fechamento,
         "vela": datetime.fromtimestamp(candle_from, TZ),
-        "estrategia": "FIM_FLUXO_IMPULSO_MOMENTO",
+        "estrategia": "FIM_M5_FLUXO_IMPULSO_MOMENTO",
         "regime": qualidade,
         "pullback": "RETRAÇÃO CONTROLADA" if retracao else "IMPULSO DIRETO",
         "rejeicao": " + ".join(motivos[-3:]),
@@ -3940,14 +4005,14 @@ def _resultado_retracao_intravela(msg, active_id):
         "ema13": ema9,
         "ema21": ema21,
         "tendencia_5m": (
-            f"{'ALTA' if direcao == 'CALL' else 'BAIXA'} | ADX {adx5:.1f}"
+            f"{'ALTA' if direcao == 'CALL' else 'BAIXA'} | ADX {adx15:.1f}"
         ),
         "tendencia_15m": "N/A",
         "zona_fibonacci": f"FIM SCORE {score}",
         "bloqueio": "SINAL",
         "mensagem": (
             f"{direcao} FIM {qualidade} | score={score} | "
-            f"M5 ADX={adx5:.1f} | entrada={decorridos:.1f}s | "
+            f"M5 ADX={adx15:.1f} | entrada={decorridos:.1f}s | "
             f"{', '.join(motivos)}"
         ),
         "candle_from": candle_from,
@@ -3987,7 +4052,7 @@ def _atualizar_dashboard_intravela(symbol, resultado):
         ),
         "bloqueio": resultado.get("bloqueio", "-"),
         "regime": "INTRAVELA",
-        "estrategia": "FIM_FLUXO_IMPULSO_MOMENTO",
+        "estrategia": "FIM_M5_FLUXO_IMPULSO_MOMENTO",
         "zona_fibonacci": "-",
     }
 
@@ -4040,7 +4105,7 @@ def _processar_sinal_intravela(active_id, msg):
 def calcular_estatisticas_por_estrategia():
     wins = losses = dojis = 0
     for item in _historico_resultados:
-        if item.get("estrategia") != "FIM_FLUXO_IMPULSO_MOMENTO":
+        if item.get("estrategia") != "FIM_M5_FLUXO_IMPULSO_MOMENTO":
             continue
         r = item.get("resultado")
         if r == "WIN":
@@ -4052,7 +4117,7 @@ def calcular_estatisticas_por_estrategia():
     total = wins + losses + dojis
     decididos = wins + losses
     return {
-        "FIM_FLUXO_IMPULSO_MOMENTO": {
+        "FIM_M5_FLUXO_IMPULSO_MOMENTO": {
             "total": total,
             "wins": wins,
             "losses": losses,
@@ -4224,7 +4289,7 @@ def enviar_sinal_telegram(
     )
 
     texto = (
-        f"{emoji} SINAL REVERSAO M1\n\n"
+        f"{emoji} SINAL FIM M5\n\n"
         f"Ativo: {symbol}\n"
         f"Direcao: {sinal}\n"
         f"Score: {resultado.get('score', 0)}\n"
@@ -4233,9 +4298,9 @@ def enviar_sinal_telegram(
         f"Preco: {fmt(resultado.get('preco'))}\n"
         f"Vela analisada: "
         f"{vela.strftime('%Y-%m-%d %H:%M:%S BRT')}\n\n"
-        f"Tendencia 5M: "
+        f"Tendencia 15M: "
         f"{resultado.get('tendencia_5m', '-')}\n"
-        f"Tendencia 5M: "
+        f"Tendencia 15M: "
         f"{resultado.get('tendencia_15m', '-')}\n"
         f"Pullback: "
         f"{resultado.get('pullback', '-')}\n"
@@ -4299,7 +4364,7 @@ def registrar_operacao_intravela(symbol, resultado):
         "symbol": symbol,
         "sinal": sinal,
         "score": resultado.get("score", 0),
-        "estrategia": "FIM_FLUXO_IMPULSO_MOMENTO",
+        "estrategia": "FIM_M5_FLUXO_IMPULSO_MOMENTO",
         "regime": "INTRAVELA",
         "preco_sinal": float(resultado["preco"]),
         "vela_sinal": candle_dt,
@@ -4565,7 +4630,7 @@ def processar_ativo(chave, symbol, executar_sinal=False):
             estado["atualidade_min"] = f"{idade:.1f} min" if idade is not None else "-"
             if estado.get("sinal") not in ("CALL", "PUT"):
                 estado["sinal"] = "AGUARDAR"
-                estado["mensagem"] = "Monitorando FIM: decisão pelas velas fechadas + M5, entrada até 1s da nova M1 e máximo 2 operações simultâneas."
+                estado["mensagem"] = "Monitorando FIM M5: decisão pelas velas M5 fechadas + contexto M15, entrada até 1s da nova M5 e máximo 2 operações simultâneas."
         return None
 
     except Exception as e:
@@ -4709,7 +4774,7 @@ def esperar_ate_proxima_leitura():
     )
 
     log(
-        "[R28][M1] Proxima leitura M1: "
+        "[R30][M5] Proxima leitura M1: "
         f"{proxima.strftime('%H:%M:%S BRT')}"
     )
 
@@ -4725,7 +4790,7 @@ def loop_robo():
         "Loop do robo iniciado."
     )
     log(
-        f"[R28][M1] Scheduler ativo: leitura/manutencao a cada 1 minuto | "
+        f"[R30][M5] Scheduler ativo: leitura/manutencao a cada 1 minuto | "
         f"expiracao={EXPIRACAO_MINUTOS} minuto(s) | cooldown_loss={BLOQUEIO_LOSS_MINUTOS} min"
     )
 
@@ -5071,14 +5136,14 @@ Filtros da entrada
 </div>
 
 <div class="linha">
-<span>Tendência 5M</span>
+<span>Tendência 15M</span>
 <span class="valor">
 {{ estado.detalhes.tendencia_5m }}
 </span>
 </div>
 
 <div class="linha">
-<span>Tendência 5M</span>
+<span>Tendência 15M</span>
 <span class="valor">
 {{ estado.detalhes.tendencia_15m }}
 </span>
