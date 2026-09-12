@@ -100,7 +100,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "R45-OTC-FIM-M5-PRESERVA-FROM-TO"
+BULLEX_DIAGNOSTIC_VERSION = "R46-OTC-LIMITE-ATOMICO-2-ORDENS"
 
 _bullex_diag = {
     "messages": 0,
@@ -325,6 +325,12 @@ _bullex_settlements = {}
 
 _execucao_lock = threading.RLock()
 _operacao_global_ativa = None
+# Reserva atômica de vagas para impedir que várias threads ultrapassem
+# MAX_OPERACOES_SIMULTANEAS antes de as ordens serem confirmadas/registradas.
+_ordens_em_confirmacao = set()
+# Dados da confirmação separados por ativo para evitar sobrescrita entre
+# confirmações simultâneas.
+_ordens_confirmadas_por_symbol = {}
 _nivel_progressao = 0
 _bullex_balance_id = None
 _bullex_balance_source = None
@@ -947,8 +953,9 @@ def _atualizar_estado_execucao():
         "valor_atual": valor,
         "nivel_progressao": nivel,
         "payout_lucro_percentual": PAYOUT_LUCRO_PERCENTUAL,
-        "operacao_ativa": bool(_operacoes_pendentes) or _operacao_global_ativa is not None,
+        "operacao_ativa": bool(_operacoes_pendentes) or bool(_ordens_em_confirmacao) or _operacao_global_ativa is not None,
         "operacoes_abertas": len(_operacoes_pendentes),
+        "ordens_em_confirmacao": len(_ordens_em_confirmacao),
         "max_operacoes_simultaneas": MAX_OPERACOES_SIMULTANEAS,
         "balance_id_disponivel": _bullex_balance_id is not None,
         "balance_source": _bullex_balance_source,
@@ -1124,15 +1131,8 @@ def executar_ordem_intravela(symbol, sinal, resultado):
         _atualizar_estado_execucao()
         return "SEM_BALANCE_ID"
 
-    with _execucao_lock:
-        em_confirmacao = 1 if _operacao_global_ativa is not None else 0
-        abertas = len(_operacoes_pendentes) + em_confirmacao
-        if abertas >= MAX_OPERACOES_SIMULTANEAS:
-            log(
-                f"[INTRAVELA] {symbol}: sinal ignorado; "
-                f"limite de {MAX_OPERACOES_SIMULTANEAS} operações simultâneas atingido."
-            )
-            return "LIMITE_OPERACOES"
+    # A vaga não é reservada aqui ainda: primeiro validamos ativo/horário.
+    # A reserva atômica acontece imediatamente antes do envio da ordem.
 
     balance_id = _obter_balance_id()
     if not balance_id:
@@ -1190,6 +1190,27 @@ def executar_ordem_intravela(symbol, sinal, resultado):
         "refund_value": 0,
     }
 
+    # Reserva ATÔMICA da vaga. Enquanto a corretora responde, esta ordem já
+    # conta no limite. Assim, duas threads podem ocupar as duas vagas, mas a
+    # terceira é bloqueada antes de enviar qualquer comando ao WebSocket.
+    with _execucao_lock:
+        if symbol in _operacoes_pendentes or symbol in _ordens_em_confirmacao:
+            log(f"[INTRAVELA] {symbol}: sinal ignorado; ativo já possui ordem pendente/em confirmação.")
+            return "ATIVO_JA_EM_OPERACAO"
+
+        abertas_ou_reservadas = len(_operacoes_pendentes) + len(_ordens_em_confirmacao)
+        if abertas_ou_reservadas >= MAX_OPERACOES_SIMULTANEAS:
+            log(
+                f"[INTRAVELA] {symbol}: sinal ignorado; "
+                f"limite de {MAX_OPERACOES_SIMULTANEAS} operações simultâneas atingido "
+                f"(pendentes={len(_operacoes_pendentes)}, confirmando={len(_ordens_em_confirmacao)})."
+            )
+            return "LIMITE_OPERACOES"
+
+        _ordens_em_confirmacao.add(symbol)
+
+    manter_reserva = False
+
     log(
         f"[AUTO INTRAVELA] Enviando {symbol} {sinal} R${valor:.2f} | "
         f"entrada_estimada={resultado['preco']:.5f} | "
@@ -1225,23 +1246,27 @@ def executar_ordem_intravela(symbol, sinal, resultado):
         with _bullex_diag_lock:
             _bullex_diag["orders_confirmed"] += 1
 
-        status = _registrar_ordem_confirmada(
-            symbol,
-            ticker,
-            sinal,
-            valor,
-            active_id,
-            balance_id,
-            "BINARIA_INTRAVELA",
-            resposta,
-            janela,
-        )
-
         with _execucao_lock:
+            status = _registrar_ordem_confirmada(
+                symbol,
+                ticker,
+                sinal,
+                valor,
+                active_id,
+                balance_id,
+                "BINARIA_INTRAVELA",
+                resposta,
+                janela,
+            )
+
             if _operacao_global_ativa is not None:
                 _operacao_global_ativa["preco_entrada_estimado"] = float(resultado["preco"])
                 _operacao_global_ativa["estrategia"] = "RETRACAO_MESMA_VELA"
                 _operacao_global_ativa["regime"] = "INTRAVELA"
+                _ordens_confirmadas_por_symbol[symbol] = _operacao_global_ativa.copy()
+
+            # Mantém a reserva até registrar a operação em _operacoes_pendentes.
+            manter_reserva = (status == "CONFIRMADA")
 
         return status
 
@@ -1253,6 +1278,14 @@ def executar_ordem_intravela(symbol, sinal, resultado):
         _atualizar_estado_execucao()
         log(f"[AUTO INTRAVELA] ERRO ao enviar ordem: {e}")
         return "ERRO"
+    finally:
+        # Em falha/recusa, libera a vaga imediatamente. Em sucesso, a vaga só
+        # é liberada depois que registrar_operacao_intravela mover a ordem para
+        # _operacoes_pendentes, evitando qualquer janela de corrida.
+        if not manter_reserva:
+            with _execucao_lock:
+                _ordens_em_confirmacao.discard(symbol)
+                _ordens_confirmadas_por_symbol.pop(symbol, None)
 
 
 
@@ -4640,7 +4673,11 @@ def registrar_operacao_intravela(symbol, resultado):
         return
 
     with _execucao_lock:
-        info = (_operacao_global_ativa or {}).copy()
+        # Cada ativo usa os próprios dados de confirmação; isso evita que duas
+        # ordens confirmadas quase juntas troquem option_id/valor entre si.
+        info = _ordens_confirmadas_por_symbol.get(symbol, {}).copy()
+        if not info:
+            info = (_operacao_global_ativa or {}).copy()
 
     operacao = {
         "id": chave,
@@ -4670,12 +4707,15 @@ def registrar_operacao_intravela(symbol, resultado):
         "distancia_abertura_nivel": resultado.get("distancia_abertura_nivel"),
     }
 
-    _operacoes_pendentes[symbol] = operacao
-    _ultimas_operacoes_registradas[symbol] = chave
-
-    # A ordem já foi copiada para as operações pendentes.
-    # Libera o slot temporário para permitir a segunda operação.
+    # Registro e liberação da reserva acontecem sob o mesmo lock: não existe
+    # instante em que a ordem deixe de contar no limite entre confirmação e
+    # entrada em _operacoes_pendentes.
     with _execucao_lock:
+        _operacoes_pendentes[symbol] = operacao
+        _ultimas_operacoes_registradas[symbol] = chave
+        _ordens_em_confirmacao.discard(symbol)
+        _ordens_confirmadas_por_symbol.pop(symbol, None)
+
         if (
             _operacao_global_ativa is not None
             and _operacao_global_ativa.get("symbol") == symbol
