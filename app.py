@@ -100,7 +100,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "R42-OTC-FIM-M5-M15-SCAN-ATIVOS-OTC-DIRETO"
+BULLEX_DIAGNOSTIC_VERSION = "R43-OTC-FIM-M5-M15-RELOGIO-APOS-ATIVOS"
 
 _bullex_diag = {
     "messages": 0,
@@ -4130,6 +4130,8 @@ def _atualizar_dashboard_intravela(symbol, resultado):
 
 _relogio_m5_lock = threading.Lock()
 _relogio_m5_ultima_janela = None
+_fim_m5_clock_thread = None
+_fim_m5_clock_thread_lock = threading.Lock()
 
 
 def _ativos_para_scan_m5():
@@ -5011,6 +5013,33 @@ def esperar_ate_proxima_leitura():
 # LOOP
 # ============================================================
 
+def _garantir_relogio_m5_iniciado():
+    """Inicia exatamente um thread do relógio M5 neste processo."""
+    global _fim_m5_clock_thread
+
+    with _fim_m5_clock_thread_lock:
+        if _fim_m5_clock_thread is not None and _fim_m5_clock_thread.is_alive():
+            return
+
+        with _bullex_assets_lock:
+            qtd_ativos = len(ATIVO_BULLEX)
+
+        if qtd_ativos <= 0:
+            log("[FIM-M5][RELOGIO] Thread não iniciado: ativos OTC ainda não carregados.")
+            return
+
+        _fim_m5_clock_thread = threading.Thread(
+            target=_loop_gatilho_relogio_m5,
+            daemon=True,
+            name="fim-m5-clock",
+        )
+        _fim_m5_clock_thread.start()
+        log(
+            f"[FIM-M5][RELOGIO] Thread iniciado após carga OTC | "
+            f"ativos={qtd_ativos}"
+        )
+
+
 def loop_robo():
     log(
         "Loop do robo iniciado."
@@ -5034,6 +5063,7 @@ def loop_robo():
             with _bullex_assets_lock:
                 ativos_prontos = ", ".join(ATIVO_BULLEX.keys())
             log(f"[OTC AUTO] Pronto para leitura: {ativos_prontos}")
+            _garantir_relogio_m5_iniciado()
         else:
             log(
                 "[OTC AUTO] Inicialização ainda incompleta; "
@@ -5699,13 +5729,6 @@ log(
 )
 
 
-# Gatilho independente da FIM M5 pela virada do relógio do servidor.
-_fim_m5_clock_thread = threading.Thread(
-    target=_loop_gatilho_relogio_m5,
-    daemon=True,
-    name="fim-m5-clock",
-)
-_fim_m5_clock_thread.start()
 
 if __name__ == "__main__":
     garantir_robo_iniciado()
