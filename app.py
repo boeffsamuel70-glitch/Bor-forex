@@ -100,7 +100,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "R21-OTC-M5-FORCA-M1-PULLBACK-EMA9-21-6-9-COOLDOWN40"
+BULLEX_DIAGNOSTIC_VERSION = "R22-OTC-M5-FORCA-M1-PULLBACK-EMA9-21-6-9-LUCRO-COOLDOWN40"
 
 _bullex_diag = {
     "messages": 0,
@@ -239,6 +239,7 @@ estado = {
         "losses": 0,
         "dojis": 0,
         "taxa": 0.0,
+        "lucro_total": 0.0,
     },
 }
 
@@ -260,12 +261,17 @@ _robo_started = False
 _ultimos_sinais_telegram = {}
 _operacoes_pendentes = {}
 _ultimas_operacoes_registradas = {}
-# Base histórica consolidada antes da estratégia de retração intravela:
-# 44 operações decididas = 22 WIN / 22 LOSS = 50,00%.
-_historico_resultados = (
-    [{"resultado": "WIN", "origem": "BASE_ANTES_R13", "estrategia": "BASE"} for _ in range(22)]
-    + [{"resultado": "LOSS", "origem": "BASE_ANTES_R13", "estrategia": "BASE"} for _ in range(22)]
+# Nova contagem do dashboard a partir desta versão.
+# WIN/LOSS/DOJI e lucro começam zerados após o deploy.
+_historico_resultados = []
+
+# Percentual líquido considerado em cada WIN.
+# Ex.: entrada de R$6,00 com 50% -> lucro de R$3,00.
+# Pode ser ajustado no Render pela variável PAYOUT_LUCRO_PERCENTUAL.
+PAYOUT_LUCRO_PERCENTUAL = float(
+    os.getenv("PAYOUT_LUCRO_PERCENTUAL", "50").replace(",", ".")
 )
+
 _execucao_lock = threading.RLock()
 _operacao_global_ativa = None
 _nivel_progressao = 0
@@ -641,6 +647,7 @@ def _atualizar_estado_execucao():
         "modo": "DEMO",
         "valor_atual": _valor_entrada_atual(),
         "nivel_progressao": _nivel_progressao,
+        "payout_lucro_percentual": PAYOUT_LUCRO_PERCENTUAL,
         "operacao_ativa": _operacao_global_ativa is not None,
         "balance_id_disponivel": _bullex_balance_id is not None,
         "balance_source": _bullex_balance_source,
@@ -3552,7 +3559,7 @@ def _processar_sinal_intravela(active_id, msg):
 def calcular_estatisticas_por_estrategia():
     wins = losses = dojis = 0
     for item in _historico_resultados:
-        if item.get("estrategia") != "SR_M5_REVERSAO_M1_MESMA_VELA":
+        if item.get("estrategia") != "M5_FORCA_M1_PULLBACK_REJEICAO":
             continue
         r = item.get("resultado")
         if r == "WIN":
@@ -3564,7 +3571,7 @@ def calcular_estatisticas_por_estrategia():
     total = wins + losses + dojis
     decididos = wins + losses
     return {
-        "SR_M5_REVERSAO_M1_MESMA_VELA": {
+        "M5_FORCA_M1_PULLBACK_REJEICAO": {
             "total": total,
             "wins": wins,
             "losses": losses,
@@ -3579,47 +3586,31 @@ def calcular_estatisticas_por_estrategia():
 # ============================================================
 
 def calcular_estatisticas():
-    total = len(
-        _historico_resultados
-    )
+    total = len(_historico_resultados)
 
-    wins = sum(
-        1
-        for x in _historico_resultados
-        if x["resultado"] == "WIN"
-    )
+    wins = sum(1 for x in _historico_resultados if x.get("resultado") == "WIN")
+    losses = sum(1 for x in _historico_resultados if x.get("resultado") == "LOSS")
+    dojis = sum(1 for x in _historico_resultados if x.get("resultado") == "DOJI")
 
-    losses = sum(
-        1
-        for x in _historico_resultados
-        if x["resultado"] == "LOSS"
-    )
+    decididos = wins + losses
+    taxa = wins / decididos * 100 if decididos > 0 else 0.0
 
-    dojis = sum(
-        1
-        for x in _historico_resultados
-        if x["resultado"] == "DOJI"
-    )
-
-    decididos = (
-        wins + losses
-    )
-
-    taxa = (
-        wins / decididos * 100
-        if decididos > 0
-        else 0
-    )
+    lucro_total = 0.0
+    for item in _historico_resultados:
+        resultado = item.get("resultado")
+        valor = float(item.get("valor") or 0.0)
+        if resultado == "WIN":
+            lucro_total += valor * (PAYOUT_LUCRO_PERCENTUAL / 100.0)
+        elif resultado == "LOSS":
+            lucro_total -= valor
 
     return {
         "total": total,
         "wins": wins,
         "losses": losses,
         "dojis": dojis,
-        "taxa": round(
-            taxa,
-            2
-        ),
+        "taxa": round(taxa, 2),
+        "lucro_total": round(lucro_total, 2),
     }
 
 
@@ -3895,6 +3886,17 @@ def avaliar_operacao(symbol, candles):
 
         operacao["resultado"] = resultado
         operacao["finalizado_em"] = agora
+
+        valor_operacao = float(operacao.get("valor") or 0.0)
+        if resultado == "WIN":
+            operacao["lucro"] = round(
+                valor_operacao * (PAYOUT_LUCRO_PERCENTUAL / 100.0), 2
+            )
+        elif resultado == "LOSS":
+            operacao["lucro"] = round(-valor_operacao, 2)
+        else:
+            operacao["lucro"] = 0.0
+
         _historico_resultados.append(operacao.copy())
         del _operacoes_pendentes[symbol]
 
@@ -3917,7 +3919,8 @@ def avaliar_operacao(symbol, candles):
         log(
             f"[RESULTADO INTRAVELA] {symbol} {operacao['sinal']} -> {resultado} | "
             f"entrada={entrada:.5f} | fechamento_mesma_vela={saida:.5f} | "
-            f"taxa_total={estatisticas['taxa']:.2f}%"
+            f"taxa_total={estatisticas['taxa']:.2f}% | "
+            f"lucro_total=R${estatisticas['lucro_total']:.2f}"
         )
 
         enviar_resultado_telegram(operacao, estatisticas)
@@ -3970,7 +3973,8 @@ def enviar_resultado_telegram(
         f"Wins: {estatisticas['wins']}\n"
         f"Losses: {estatisticas['losses']}\n"
         f"Dojis: {estatisticas['dojis']}\n"
-        f"Taxa: {estatisticas['taxa']:.2f}%"
+        f"Taxa: {estatisticas['taxa']:.2f}%\n"
+        f"Lucro acumulado: R${estatisticas['lucro_total']:.2f}"
     )
 
     enviar_telegram(texto)
@@ -4666,6 +4670,13 @@ DOJI
 </div>
 </div>
 
+<div class="box">
+LUCRO TOTAL
+<div class="numero">
+R$ {{ '%.2f'|format(estado.estatisticas.lucro_total) }}
+</div>
+</div>
+
 </div>
 
 <br>
@@ -4832,9 +4843,9 @@ def health():
             telegram_configurado(),
         "operacoes_pendentes":
             len(_operacoes_pendentes),
-        "entrada_fixa": 5.00,
-        "progressao_ativa": False,
-        "mercado": "ABERTO",
+        "entradas": VALORES_ENTRADA,
+        "gestao_6_9_ativa": True,
+        "mercado": "OTC",
         "ativos_mercado_aberto": {
             "detectado": _bullex_assets_detected,
             "quantidade": len(ATIVO_BULLEX),
