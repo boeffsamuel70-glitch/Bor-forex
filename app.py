@@ -100,7 +100,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "R19-OTC-AUTO-SR-M5-REVERSAO-M1-REALTIME-COOLDOWN40"
+BULLEX_DIAGNOSTIC_VERSION = "R20-OTC-AUTO-EMA9-21-PULLBACK-M1-6-9-COOLDOWN40"
 
 _bullex_diag = {
     "messages": 0,
@@ -151,7 +151,7 @@ BULLEX_USER_BALANCE_ID = os.getenv(
     ""
 ).strip()
 
-VALORES_ENTRADA = [5.00]
+VALORES_ENTRADA = [6.00, 9.00]
 EXPIRACAO_MINUTOS = 1
 # A antiga janela de 3 segundos foi removida.
 # Esta estratégia entra DURANTE a vela M1 atual e expira no fechamento da MESMA vela.
@@ -926,14 +926,16 @@ def executar_ordem_intravela(symbol, sinal, resultado):
 
 
 def _atualizar_progressao(resultado):
+    """Gestão 6/9: R$6 WIN -> uma entrada de R$9; depois volta a R$6.
+
+    LOSS em qualquer nível volta/permanece em R$6. A entrada de R$9 nunca
+    se repete em sequência, mesmo quando ela própria termina em WIN.
+    """
     global _nivel_progressao
-    if resultado == "WIN":
+    if _nivel_progressao == 0 and resultado == "WIN":
+        _nivel_progressao = 1
+    else:
         _nivel_progressao = 0
-    elif resultado == "LOSS":
-        if _nivel_progressao < len(VALORES_ENTRADA) - 1:
-            _nivel_progressao += 1
-        else:
-            _nivel_progressao = 0
     _atualizar_estado_execucao()
 
 
@@ -3212,15 +3214,13 @@ def _nivel_mais_proximo(niveis, preco, lado):
 
 
 def _resultado_retracao_intravela(msg, active_id):
-    """Sinal somente quando há S/R forte no M5 e rejeição na mesma vela M1.
+    """Estratégia M1: EMA9/EMA21 + impulso + pullback + rejeição.
 
-    CALL:
-      vela M1 vem de cima, toca suporte M5 e rejeita para cima.
-    PUT:
-      vela M1 vem de baixo, toca resistência M5 e rejeita para baixo.
+    CALL: EMA9 acima da EMA21, tendência com inclinação e separação mínimas,
+    preço recua até a zona das EMAs e rejeita para cima.
+    PUT: regras espelhadas.
 
-    Se a vela M1 abrir perto demais do nível, NÃO opera.
-    A expiração continua sendo o fechamento da própria vela M1.
+    A entrada ocorre dentro da vela M1 e expira no fechamento da mesma vela.
     """
     if not isinstance(msg, dict):
         return None
@@ -3238,198 +3238,102 @@ def _resultado_retracao_intravela(msg, active_id):
     server_ts, _ = _horario_servidor_atual()
     decorridos = max(0.0, server_ts - candle_from)
     restantes = max(0.0, candle_to - server_ts)
-
-    if decorridos < INTRAVELA_MIN_SEGUNDOS_DECORRIDOS:
-        return None
-    if restantes < INTRAVELA_MIN_SEGUNDOS_RESTANTES:
+    if decorridos < 8 or restantes < 15:
         return None
 
-    atr1 = _atr_cache_1m(active_id)
-    if atr1 is None or atr1 <= 0:
+    candles = somente_velas_fechadas(_candles_cache(active_id, 60), 1)
+    if len(candles) < 35:
+        return None
+    candles = candles[-60:]
+    valores = [float(c["close"]) for c in candles]
+    ema9s = ema_series(valores, 9)
+    ema21s = ema_series(valores, 21)
+    ema9 = ema9s[-1]
+    ema21 = ema21s[-1]
+    ema9_prev = ema9s[-4] if len(ema9s) >= 4 else None
+    ema21_prev = ema21s[-4] if len(ema21s) >= 4 else None
+    atr1 = atr(candles, 14)
+    if None in (ema9, ema21, ema9_prev, ema21_prev) or not atr1 or atr1 <= 0:
         return None
 
-    suportes, resistencias, atr5 = _niveis_sr_m5(active_id)
-    if atr5 is None:
+    # Filtros de qualidade: evita lateralização e tendências já esticadas.
+    separacao = abs(ema9 - ema21)
+    if separacao < atr1 * 0.10:
         return None
-
-    tolerancia_nivel = atr5 * SR_M5_TOLERANCIA_ATR
-    distancia_minima_abertura = atr1 * SR_M1_DISTANCIA_ABERTURA_ATR_MIN
+    range_atual = max(maxima - minima, 1e-12)
+    if range_atual > atr1 * 1.80:
+        return None
 
     candle_key = (int(active_id), candle_from)
-
     with _intravela_lock:
-        st = _intravela_estado.setdefault(
-            candle_key,
-            {
-                "ultimo_close": fechamento,
-                "eventos": 0,
-                "maxima": maxima,
-                "minima": minima,
-            }
-        )
+        st = _intravela_estado.setdefault(candle_key, {"ultimo_close": fechamento, "eventos": 0})
         ultimo_close = float(st.get("ultimo_close", fechamento))
-        st["eventos"] = int(st.get("eventos", 0)) + 1
-        st["maxima"] = max(float(st.get("maxima", maxima)), maxima)
-        st["minima"] = min(float(st.get("minima", minima)), minima)
         st["ultimo_close"] = fechamento
+        st["eventos"] = int(st.get("eventos", 0)) + 1
         eventos = st["eventos"]
-
     if eventos < 2:
         return None
 
-    # --------------------------------------------------------
-    # CALL: suporte M5
-    # --------------------------------------------------------
-    suporte = _nivel_mais_proximo(suportes, minima, "SUPORTE")
-    if suporte is not None:
-        nivel = float(suporte["nivel"])
-        distancia_abertura = abertura - nivel
-        tocou = minima <= nivel + tolerancia_nivel
+    zona_min = min(ema9, ema21) - atr1 * 0.08
+    zona_max = max(ema9, ema21) + atr1 * 0.08
+    ultimos3 = candles[-3:]
+    altas = sum(float(c["close"]) > float(c["open"]) for c in ultimos3)
+    baixas = sum(float(c["close"]) < float(c["open"]) for c in ultimos3)
 
-        # Regra pedida pelo usuário:
-        # se a vela abriu perto demais do suporte, não entra.
-        veio_de_longe = distancia_abertura >= distancia_minima_abertura
-
-        movimento_ate_nivel = max(0.0, abertura - minima)
+    # CALL: tendência de alta + pullback na zona + rejeição compradora.
+    if ema9 > ema21 and ema9 > ema9_prev and ema21 > ema21_prev and altas >= 2:
+        tocou = minima <= zona_max and maxima >= zona_min
         rejeicao = fechamento - minima
-        ratio = rejeicao / max(movimento_ate_nivel, 1e-12)
-        pavio_inf = min(abertura, fechamento) - minima
-
+        pavio = min(abertura, fechamento) - minima
         confirmou = (
-            tocou
-            and veio_de_longe
-            and fechamento > ultimo_close
-            and INTRAVELA_RETRACAO_MIN <= ratio <= INTRAVELA_RETRACAO_MAX
-            and rejeicao >= atr1 * INTRAVELA_REJEICAO_ATR_MIN
-            and pavio_inf >= max(
-                movimento_ate_nivel * INTRAVELA_PAVIO_MIN_FRACAO_MOVIMENTO,
-                atr1 * 0.04,
-            )
+            tocou and fechamento > ema9 and fechamento > ultimo_close
+            and rejeicao >= atr1 * 0.12
+            and pavio >= atr1 * 0.04
+            and fechamento > abertura
         )
-
         if confirmou:
-            score = 10
-            if suporte["toques"] >= 3:
-                score += 1
-            if distancia_abertura >= atr5 * 0.90:
-                score += 1
-
+            score = 10 + (1 if separacao >= atr1 * 0.20 else 0) + (1 if altas == 3 else 0)
             return {
-                "sinal": "CALL",
-                "score": score,
-                "score_call": score,
-                "score_put": 1,
-                "preco": fechamento,
-                "vela": datetime.fromtimestamp(candle_from, TZ),
-                "estrategia": "SR_M5_REVERSAO_M1_MESMA_VELA",
-                "regime": "INTRAVELA",
-                "pullback": f"REJEICAO SUPORTE M5 | retração={ratio*100:.1f}%",
-                "rejeicao": "CONFIRMADA",
-                "lateral": "N/A",
-                "atr": atr1,
-                "rsi": None,
-                "ema5": None,
-                "ema13": None,
-                "ema21": None,
-                "tendencia_5m": "N/A",
-                "tendencia_15m": "S/R M5",
-                "zona_fibonacci": f"SUPORTE M5 {nivel:.5f} ({suporte['toques']} toques)",
-                "bloqueio": "SINAL",
-                "mensagem": (
-                    f"CALL | suporte M5={nivel:.5f} | "
-                    f"toques={suporte['toques']} | "
-                    f"dist_abertura={distancia_abertura:.6f} | "
-                    f"retração={ratio*100:.1f}% | restam={restantes:.1f}s"
-                ),
-                "candle_from": candle_from,
-                "candle_to": candle_to,
-                "segundos_decorridos": decorridos,
-                "segundos_restantes": restantes,
-                "impulso": movimento_ate_nivel,
-                "retracao_ratio": ratio,
-                "nivel_m5": nivel,
-                "tipo_nivel": "SUPORTE",
-                "toques_nivel": suporte["toques"],
-                "distancia_abertura_nivel": distancia_abertura,
+                "sinal": "CALL", "score": score, "score_call": score, "score_put": 1,
+                "preco": fechamento, "vela": datetime.fromtimestamp(candle_from, TZ),
+                "estrategia": "EMA9_21_PULLBACK_REJEICAO_M1", "regime": "TENDENCIA_M1",
+                "pullback": "PULLBACK EMA9/21 + REJEICAO CALL", "rejeicao": "CONFIRMADA",
+                "lateral": "NAO", "atr": atr1, "rsi": None,
+                "ema5": None, "ema13": ema9, "ema21": ema21,
+                "tendencia_5m": "N/A", "tendencia_15m": "ALTA M1",
+                "zona_fibonacci": "EMA9/EMA21 M1", "bloqueio": "SINAL",
+                "mensagem": f"CALL | EMA9>{ema21:.5f} | pullback/rejeicao M1 | restam={restantes:.1f}s",
+                "candle_from": candle_from, "candle_to": candle_to,
+                "segundos_decorridos": decorridos, "segundos_restantes": restantes,
             }
 
-    # --------------------------------------------------------
-    # PUT: resistência M5
-    # --------------------------------------------------------
-    resistencia = _nivel_mais_proximo(resistencias, maxima, "RESISTENCIA")
-    if resistencia is not None:
-        nivel = float(resistencia["nivel"])
-        distancia_abertura = nivel - abertura
-        tocou = maxima >= nivel - tolerancia_nivel
-
-        # Se abriu colada na resistência, não entra.
-        veio_de_longe = distancia_abertura >= distancia_minima_abertura
-
-        movimento_ate_nivel = max(0.0, maxima - abertura)
+    # PUT: tendência de baixa + pullback na zona + rejeição vendedora.
+    if ema9 < ema21 and ema9 < ema9_prev and ema21 < ema21_prev and baixas >= 2:
+        tocou = minima <= zona_max and maxima >= zona_min
         rejeicao = maxima - fechamento
-        ratio = rejeicao / max(movimento_ate_nivel, 1e-12)
-        pavio_sup = maxima - max(abertura, fechamento)
-
+        pavio = maxima - max(abertura, fechamento)
         confirmou = (
-            tocou
-            and veio_de_longe
-            and fechamento < ultimo_close
-            and INTRAVELA_RETRACAO_MIN <= ratio <= INTRAVELA_RETRACAO_MAX
-            and rejeicao >= atr1 * INTRAVELA_REJEICAO_ATR_MIN
-            and pavio_sup >= max(
-                movimento_ate_nivel * INTRAVELA_PAVIO_MIN_FRACAO_MOVIMENTO,
-                atr1 * 0.04,
-            )
+            tocou and fechamento < ema9 and fechamento < ultimo_close
+            and rejeicao >= atr1 * 0.12
+            and pavio >= atr1 * 0.04
+            and fechamento < abertura
         )
-
         if confirmou:
-            score = 10
-            if resistencia["toques"] >= 3:
-                score += 1
-            if distancia_abertura >= atr5 * 0.90:
-                score += 1
-
+            score = 10 + (1 if separacao >= atr1 * 0.20 else 0) + (1 if baixas == 3 else 0)
             return {
-                "sinal": "PUT",
-                "score": score,
-                "score_call": 1,
-                "score_put": score,
-                "preco": fechamento,
-                "vela": datetime.fromtimestamp(candle_from, TZ),
-                "estrategia": "SR_M5_REVERSAO_M1_MESMA_VELA",
-                "regime": "INTRAVELA",
-                "pullback": f"REJEICAO RESISTENCIA M5 | retração={ratio*100:.1f}%",
-                "rejeicao": "CONFIRMADA",
-                "lateral": "N/A",
-                "atr": atr1,
-                "rsi": None,
-                "ema5": None,
-                "ema13": None,
-                "ema21": None,
-                "tendencia_5m": "N/A",
-                "tendencia_15m": "S/R M5",
-                "zona_fibonacci": f"RESISTENCIA M5 {nivel:.5f} ({resistencia['toques']} toques)",
-                "bloqueio": "SINAL",
-                "mensagem": (
-                    f"PUT | resistência M5={nivel:.5f} | "
-                    f"toques={resistencia['toques']} | "
-                    f"dist_abertura={distancia_abertura:.6f} | "
-                    f"retração={ratio*100:.1f}% | restam={restantes:.1f}s"
-                ),
-                "candle_from": candle_from,
-                "candle_to": candle_to,
-                "segundos_decorridos": decorridos,
-                "segundos_restantes": restantes,
-                "impulso": movimento_ate_nivel,
-                "retracao_ratio": ratio,
-                "nivel_m5": nivel,
-                "tipo_nivel": "RESISTENCIA",
-                "toques_nivel": resistencia["toques"],
-                "distancia_abertura_nivel": distancia_abertura,
+                "sinal": "PUT", "score": score, "score_call": 1, "score_put": score,
+                "preco": fechamento, "vela": datetime.fromtimestamp(candle_from, TZ),
+                "estrategia": "EMA9_21_PULLBACK_REJEICAO_M1", "regime": "TENDENCIA_M1",
+                "pullback": "PULLBACK EMA9/21 + REJEICAO PUT", "rejeicao": "CONFIRMADA",
+                "lateral": "NAO", "atr": atr1, "rsi": None,
+                "ema5": None, "ema13": ema9, "ema21": ema21,
+                "tendencia_5m": "N/A", "tendencia_15m": "BAIXA M1",
+                "zona_fibonacci": "EMA9/EMA21 M1", "bloqueio": "SINAL",
+                "mensagem": f"PUT | EMA9<{ema21:.5f} | pullback/rejeicao M1 | restam={restantes:.1f}s",
+                "candle_from": candle_from, "candle_to": candle_to,
+                "segundos_decorridos": decorridos, "segundos_restantes": restantes,
             }
-
     return None
-
 
 def _atualizar_dashboard_intravela(symbol, resultado):
     estado["ativo"] = symbol
@@ -3462,7 +3366,7 @@ def _atualizar_dashboard_intravela(symbol, resultado):
         ),
         "bloqueio": resultado.get("bloqueio", "-"),
         "regime": "INTRAVELA",
-        "estrategia": "SR_M5_REVERSAO_M1_MESMA_VELA",
+        "estrategia": "EMA9_21_PULLBACK_REJEICAO_M1",
         "zona_fibonacci": "-",
     }
 
@@ -3496,10 +3400,7 @@ def _processar_sinal_intravela(active_id, msg):
     log(
         f"[INTRAVELA] {symbol} -> {resultado['sinal']} | "
         f"score={resultado['score']} | "
-        f"nivel={resultado.get('tipo_nivel')} "
-        f"{resultado.get('nivel_m5', 0):.5f} | "
-        f"toques={resultado.get('toques_nivel')} | "
-        f"dist_abertura={resultado.get('distancia_abertura_nivel', 0):.6f} | "
+        f"estrategia={resultado.get('estrategia')} | "
         f"{resultado['pullback']} | "
         f"decorridos={resultado['segundos_decorridos']:.1f}s | "
         f"restantes={resultado['segundos_restantes']:.1f}s | "
@@ -3783,7 +3684,7 @@ def registrar_operacao_intravela(symbol, resultado):
         "symbol": symbol,
         "sinal": sinal,
         "score": resultado.get("score", 0),
-        "estrategia": "SR_M5_REVERSAO_M1_MESMA_VELA",
+        "estrategia": "EMA9_21_PULLBACK_REJEICAO_M1",
         "regime": "INTRAVELA",
         "preco_sinal": float(resultado["preco"]),
         "vela_sinal": candle_dt,
@@ -4149,7 +4050,7 @@ def esperar_ate_proxima_leitura():
     )
 
     log(
-        "[R19][M1] Proxima leitura M1: "
+        "[R20][M1] Proxima leitura M1: "
         f"{proxima.strftime('%H:%M:%S BRT')}"
     )
 
@@ -4165,7 +4066,7 @@ def loop_robo():
         "Loop do robo iniciado."
     )
     log(
-        f"[R19][M1] Scheduler ativo: leitura/manutencao a cada 1 minuto | "
+        f"[R20][M1] Scheduler ativo: leitura/manutencao a cada 1 minuto | "
         f"expiracao={EXPIRACAO_MINUTOS} minuto(s) | cooldown_loss={BLOQUEIO_LOSS_MINUTOS} min"
     )
 
@@ -4830,7 +4731,7 @@ def health():
 
 _atualizar_estado_execucao()
 
-log(f"AUTO TRADE DEMO={'ATIVO' if BULLEX_AUTO_TRADE else 'DESATIVADO'} | entrada fixa=R${_valor_entrada_atual():.2f} | progressao=DESATIVADA")
+log(f"AUTO TRADE DEMO={'ATIVO' if BULLEX_AUTO_TRADE else 'DESATIVADO'} | gestao=R$6 -> WIN -> R$9 -> volta R$6 | LOSS -> R$6")
 log(f"BULLEX_USER_BALANCE_ID={'CONFIGURADO' if BULLEX_USER_BALANCE_ID else 'AUSENTE'}")
 
 log(
