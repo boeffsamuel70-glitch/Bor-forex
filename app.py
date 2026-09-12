@@ -100,7 +100,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "R35-OTC-FIM-M5-M15-RELOGIO-ATE3S-EXPIRACAO-M5"
+BULLEX_DIAGNOSTIC_VERSION = "R36-OTC-FIM-M5-M15-RELOGIO-ATE3S-EXPIRACAO5MIN-FINAL"
 
 _bullex_diag = {
     "messages": 0,
@@ -177,7 +177,7 @@ DEGRAU_LUCRO_PARA_AUMENTO = float(
     os.getenv("DEGRAU_LUCRO_PARA_AUMENTO", "15").replace(",", ".")
 )
 
-EXPIRACAO_MINUTOS = 1
+EXPIRACAO_MINUTOS = 5
 # A antiga janela de 3 segundos foi removida.
 # Esta estratégia entra DURANTE a vela M1 atual e expira no fechamento da MESMA vela.
 INTRAVELA_MIN_SEGUNDOS_DECORRIDOS = 2
