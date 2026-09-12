@@ -100,7 +100,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "R43-OTC-FIM-M5-M15-RELOGIO-APOS-ATIVOS"
+BULLEX_DIAGNOSTIC_VERSION = "R44-OTC-FIM-M5-M15-ULTIMO-M5-FECHADO-CORRIGIDO"
 
 _bullex_diag = {
     "messages": 0,
@@ -4182,30 +4182,67 @@ def _ativos_para_scan_m5():
 
 
 def _ultimo_candle_fechado_m5(active_id, abertura_nova_m5):
-    """Busca no cache o último candle M5 cujo 'to' já terminou."""
-    try:
-        with _candles_lock:
-            candles = list(_candles_cache(int(active_id), 300) or [])
-    except Exception:
-        candles = []
+    """
+    Retorna a vela M5 fechada mais recente antes da abertura da nova M5.
 
-    candidatos = []
+    Importante:
+    _candles_cache() já faz sua própria sincronização usando _bullex_cv.
+    Portanto NÃO usamos um lock externo inexistente.
+    """
+    try:
+        candles = list(_candles_cache(int(active_id), 300) or [])
+    except Exception as exc:
+        log(
+            f"[FIM-M5][RELOGIO] active_id={active_id} "
+            f"erro ao ler cache M5: {exc}"
+        )
+        return None
+
+    abertura_nova_m5 = int(abertura_nova_m5)
+    melhor = None
+    melhor_to = -1
+
     for c in candles:
         if not isinstance(c, dict):
             continue
-        try:
-            c_from = int(float(c.get("from")))
-            c_to = int(float(c.get("to") or (c_from + 300)))
-        except Exception:
-            continue
-        if c_to <= int(abertura_nova_m5):
-            candidatos.append((c_to, c))
 
-    if not candidatos:
+        try:
+            c_from_raw = c.get("from")
+            if c_from_raw is None:
+                continue
+
+            c_from = int(float(c_from_raw))
+
+            c_to_raw = c.get("to")
+            if c_to_raw is None:
+                c_to = c_from + 300
+            else:
+                c_to = int(float(c_to_raw))
+        except (TypeError, ValueError):
+            continue
+
+        # A vela já está fechada se terminou na abertura da nova M5
+        # ou em qualquer instante anterior.
+        if c_to <= abertura_nova_m5 and c_to > melhor_to:
+            melhor_to = c_to
+            melhor = c
+
+    if melhor is None:
+        # Log compacto para diagnosticar apenas quando necessário.
+        if candles:
+            try:
+                ult = candles[-1]
+                log(
+                    f"[FIM-M5][RELOGIO] active_id={active_id} "
+                    f"cache_m5={len(candles)} | ultimo_from={ult.get('from')} "
+                    f"| ultimo_to={ult.get('to')} | abertura={abertura_nova_m5}"
+                )
+            except Exception:
+                pass
         return None
 
-    candidatos.sort(key=lambda x: x[0])
-    return dict(candidatos[-1][1])
+    return dict(melhor)
+
 
 
 def _disparar_fim_m5_pelo_relogio():
