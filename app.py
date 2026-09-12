@@ -100,7 +100,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "R41-OTC-FIM-M5-M15-CACHE-RELOGIO-CORRIGIDO"
+BULLEX_DIAGNOSTIC_VERSION = "R42-OTC-FIM-M5-M15-SCAN-ATIVOS-OTC-DIRETO"
 
 _bullex_diag = {
     "messages": 0,
@@ -4133,46 +4133,50 @@ _relogio_m5_ultima_janela = None
 
 
 def _ativos_para_scan_m5():
-    """Retorna os active_ids conhecidos pelo robô."""
-    ativos = set()
+    """Retorna os active_ids dos ativos OTC realmente inicializados no ATIVO_BULLEX."""
+    candidatos = set()
 
-    # Preferência: ativos realmente presentes no cache de candles M5.
     try:
-        with _candles_lock:
-            for chave in _candles_cache.keys():
-                if isinstance(chave, tuple) and len(chave) >= 2:
-                    aid, size = chave[0], chave[1]
-                    try:
-                        if int(size) == 300:
-                            ativos.add(int(aid))
-                    except (TypeError, ValueError):
-                        pass
+        with _bullex_assets_lock:
+            mapa_bullex = dict(ATIVO_BULLEX)
     except Exception:
-        pass
+        mapa_bullex = dict(globals().get("ATIVO_BULLEX") or {})
 
-    # Fallback: tenta extrair IDs dos mapas existentes.
-    if not ativos:
-        for nome in ("ATIVOS_OTC", "ATIVOS", "OTC_ATIVOS", "BULLEX_ATIVOS", "ACTIVE_IDS"):
-            mapa = globals().get(nome)
-            if not isinstance(mapa, dict):
+    for cfg in mapa_bullex.values():
+        if not isinstance(cfg, dict):
+            continue
+        try:
+            active_id = cfg.get("active_id")
+            if active_id is not None:
+                candidatos.add(int(active_id))
+        except Exception:
+            continue
+
+    prontos = []
+    sem_m5 = 0
+    sem_m15 = 0
+
+    for active_id in sorted(candidatos):
+        try:
+            candles_m5 = list(_candles_cache(int(active_id), 300) or [])
+            if not candles_m5:
+                sem_m5 += 1
                 continue
-            for chave, valor in mapa.items():
-                try:
-                    if isinstance(valor, dict):
-                        aid = valor.get("active_id") or valor.get("id") or valor.get("activeId")
-                        if aid is not None:
-                            ativos.add(int(aid))
-                    else:
-                        # mapa id->nome
-                        try:
-                            ativos.add(int(chave))
-                        except Exception:
-                            # mapa nome->id
-                            ativos.add(int(valor))
-                except Exception:
-                    pass
 
-    return sorted(ativos)
+            candles_m15 = list(_candles_cache(int(active_id), 900) or [])
+            if not candles_m15:
+                sem_m15 += 1
+                continue
+
+            prontos.append(int(active_id))
+        except Exception:
+            sem_m5 += 1
+
+    log(
+        f"[FIM-M5][RELOGIO] OTC inicializados={len(candidatos)} | "
+        f"prontos M5+M15={len(prontos)} | sem_m5={sem_m5} | sem_m15={sem_m15}"
+    )
+    return prontos
 
 
 def _ultimo_candle_fechado_m5(active_id, abertura_nova_m5):
@@ -4225,12 +4229,16 @@ def _disparar_fim_m5_pelo_relogio():
     with _relogio_m5_lock:
         if _relogio_m5_ultima_janela == abertura_m5:
             return
-        _relogio_m5_ultima_janela = abertura_m5
 
     ativos = _ativos_para_scan_m5()
     if not ativos:
-        log("[FIM-M5][RELOGIO] Nenhum ativo M5 disponível no cache.")
+        log("[FIM-M5][RELOGIO] Nenhum ativo pronto com M5+M15 disponível.")
         return
+
+    with _relogio_m5_lock:
+        if _relogio_m5_ultima_janela == abertura_m5:
+            return
+        _relogio_m5_ultima_janela = abertura_m5
 
     log(
         f"[FIM-M5][RELOGIO] Nova M5 detectada | "
@@ -4265,52 +4273,6 @@ def _disparar_fim_m5_pelo_relogio():
             daemon=True,
             name=f"fim-m5-clock-{active_id}",
         ).start()
-
-
-def _ativos_para_scan_m5():
-    """Retorna active_ids conhecidos que já possuem histórico M5 utilizável."""
-    candidatos = set()
-
-    # Mapas conhecidos de ativos do app.
-    for nome in (
-        "ACTIVE_ID_TO_SYMBOL",
-        "ACTIVE_ID_TO_TICKER",
-        "ATIVOS_POR_ID",
-        "BULLEX_ACTIVE_ID_TO_SYMBOL",
-    ):
-        mapa = globals().get(nome)
-        if isinstance(mapa, dict):
-            for chave in mapa.keys():
-                try:
-                    candidatos.add(int(chave))
-                except Exception:
-                    pass
-
-    # Alguns mapas podem ser symbol -> active_id.
-    for nome in (
-        "SYMBOL_TO_ACTIVE_ID",
-        "TICKER_TO_ACTIVE_ID",
-        "ATIVOS",
-        "BULLEX_SYMBOL_TO_ACTIVE_ID",
-    ):
-        mapa = globals().get(nome)
-        if isinstance(mapa, dict):
-            for valor in mapa.values():
-                try:
-                    candidatos.add(int(valor))
-                except Exception:
-                    pass
-
-    prontos = []
-    for active_id in sorted(candidatos):
-        try:
-            candles = list(_candles_cache(int(active_id), 300) or [])
-            if candles:
-                prontos.append(int(active_id))
-        except Exception:
-            continue
-
-    return prontos
 
 
 def _loop_gatilho_relogio_m5():
