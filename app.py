@@ -160,7 +160,7 @@ VALORES_ENTRADA = [6.00, 7.00, 8.00, 9.00]
 # Valores padrão podem ser alterados no Render sem editar o código.
 ENTRADA_BASE = float(os.getenv("ENTRADA_BASE", "6").replace(",", "."))
 ENTRADA_MAXIMA = float(os.getenv("ENTRADA_MAXIMA", "9").replace(",", "."))
-META_LUCRO_DIA = float(os.getenv("META_LUCRO_DIA", "60").replace(",", "."))
+META_LUCRO_DIA = float(os.getenv("META_LUCRO_DIA", "50").replace(",", "."))
 STOP_LOSS_DIA = float(os.getenv("STOP_LOSS_DIA", "24").replace(",", "."))
 TRAVA_LUCRO_ATIVA_APOS = float(
     os.getenv("TRAVA_LUCRO_ATIVA_APOS", "30").replace(",", ".")
