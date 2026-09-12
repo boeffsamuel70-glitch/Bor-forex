@@ -100,7 +100,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "R22-OTC-M5-FORCA-M1-PULLBACK-EMA9-21-6-9-LUCRO-COOLDOWN40"
+BULLEX_DIAGNOSTIC_VERSION = "R23-OTC-M5-FORCA-M1-PULLBACK-EMA9-21-6-9-LUCRO-REAL-COOLDOWN40"
 
 _bullex_diag = {
     "messages": 0,
@@ -265,12 +265,19 @@ _ultimas_operacoes_registradas = {}
 # WIN/LOSS/DOJI e lucro começam zerados após o deploy.
 _historico_resultados = []
 
-# Percentual líquido considerado em cada WIN.
-# Ex.: entrada de R$6,00 com 50% -> lucro de R$3,00.
+# Fallback de payout líquido usado SOMENTE quando a Bullex não informar
+# o valor financeiro real da liquidação da operação.
+# Ex.: entrada de R$6,00 com 87% -> lucro líquido de R$5,22.
 # Pode ser ajustado no Render pela variável PAYOUT_LUCRO_PERCENTUAL.
 PAYOUT_LUCRO_PERCENTUAL = float(
-    os.getenv("PAYOUT_LUCRO_PERCENTUAL", "50").replace(",", ".")
+    os.getenv("PAYOUT_LUCRO_PERCENTUAL", "87").replace(",", ".")
 )
+
+# Liquidações financeiras recebidas da Bullex, indexadas por option_id.
+# O objetivo é usar o valor REAL devolvido pela corretora quando disponível,
+# em vez de presumir um payout fixo para todos os ativos/operações.
+_bullex_settlement_lock = threading.RLock()
+_bullex_settlements = {}
 
 _execucao_lock = threading.RLock()
 _operacao_global_ativa = None
@@ -405,6 +412,160 @@ def _mensagem_erro_ordem(resposta):
             return str(value)
 
     return ""
+
+
+def _float_seguro(valor):
+    try:
+        if valor in (None, ""):
+            return None
+        if isinstance(valor, str):
+            valor = valor.strip().replace(",", ".")
+        return float(valor)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalizar_resultado_bullex(valor):
+    if valor is None:
+        return None
+    txt = str(valor).strip().lower()
+    if txt in ("win", "won", "winner", "success", "profit"):
+        return "WIN"
+    if txt in ("loss", "lose", "loose", "lost", "losses", "fail", "failed"):
+        return "LOSS"
+    if txt in ("equal", "draw", "doji", "refund", "tie"):
+        return "DOJI"
+    return None
+
+
+def _iter_dicts_liquidacao(obj):
+    if isinstance(obj, dict):
+        yield obj
+        for valor in obj.values():
+            yield from _iter_dicts_liquidacao(valor)
+    elif isinstance(obj, list):
+        for valor in obj:
+            yield from _iter_dicts_liquidacao(valor)
+
+
+def _ids_opcoes_conhecidas():
+    ids = {}
+    for op in list(_operacoes_pendentes.values()):
+        oid = op.get("option_id")
+        if oid not in (None, "", 0):
+            ids[str(oid)] = float(op.get("valor") or 0.0)
+    for op in list(_historico_resultados):
+        oid = op.get("option_id")
+        if oid not in (None, "", 0):
+            ids[str(oid)] = float(op.get("valor") or 0.0)
+    return ids
+
+
+def _extrair_liquidacao_do_item(item, valor_operacao):
+    if not isinstance(item, dict):
+        return None
+
+    resultado = None
+    for chave in ("win", "result", "resultado", "outcome"):
+        resultado = _normalizar_resultado_bullex(item.get(chave))
+        if resultado:
+            break
+
+    valor_ref = _float_seguro(
+        item.get("amount", item.get("price", item.get("invest", valor_operacao)))
+    )
+    if valor_ref is None or valor_ref <= 0:
+        valor_ref = float(valor_operacao or 0.0)
+
+    # Campos que normalmente representam lucro/prejuízo LÍQUIDO.
+    for chave in ("net_profit", "profit_net", "netProfit", "profit_value"):
+        valor = _float_seguro(item.get(chave))
+        if valor is not None:
+            return {"lucro": round(valor, 2), "resultado": resultado, "campo": chave}
+
+    # Em mensagens do ecossistema IQ/Bullex, profit_amount costuma representar
+    # o TOTAL devolvido (entrada + lucro). Por isso subtraímos a entrada.
+    for chave in ("profit_amount", "return_amount", "payout_amount", "win_amount"):
+        valor = _float_seguro(item.get(chave))
+        if valor is not None:
+            lucro = valor - valor_ref
+            if resultado == "LOSS" and valor <= 0:
+                lucro = -valor_ref
+            elif resultado == "DOJI":
+                lucro = 0.0
+            return {"lucro": round(lucro, 2), "resultado": resultado, "campo": chave}
+
+    # Mesmo sem valor financeiro explícito, LOSS e DOJI têm resultado líquido
+    # conhecido. Para WIN sem valor, aguardamos o fallback da avaliação.
+    if resultado == "LOSS":
+        return {"lucro": round(-valor_ref, 2), "resultado": resultado, "campo": "resultado"}
+    if resultado == "DOJI":
+        return {"lucro": 0.0, "resultado": resultado, "campo": "resultado"}
+
+    return None
+
+
+def _aplicar_liquidacao_real(option_id, liquidacao, payload=None):
+    oid = str(option_id)
+    lucro = float(liquidacao["lucro"])
+    resultado = liquidacao.get("resultado")
+
+    registro = {
+        "option_id": oid,
+        "lucro": round(lucro, 2),
+        "resultado": resultado,
+        "campo": liquidacao.get("campo"),
+        "recebido_em": agora_brt().isoformat(),
+    }
+    with _bullex_settlement_lock:
+        _bullex_settlements[oid] = registro
+
+    # Atualiza operação pendente para que a finalização use o valor real.
+    for op in list(_operacoes_pendentes.values()):
+        if str(op.get("option_id")) == oid:
+            op["lucro_real"] = round(lucro, 2)
+            op["fonte_lucro"] = "BULLEX_REAL"
+            if resultado:
+                op["resultado_bullex"] = resultado
+
+    # Se a mensagem chegar depois de a operação já ter sido colocada no
+    # histórico, corrige o lucro acumulado sem criar uma segunda operação.
+    for op in _historico_resultados:
+        if str(op.get("option_id")) == oid:
+            op["lucro"] = round(lucro, 2)
+            op["lucro_real"] = round(lucro, 2)
+            op["fonte_lucro"] = "BULLEX_REAL"
+            if resultado:
+                op["resultado"] = resultado
+                op["resultado_bullex"] = resultado
+
+    log(
+        f"[LIQUIDACAO REAL] option_id={oid} | "
+        f"resultado={resultado or '-'} | lucro_liquido=R${lucro:.2f} | "
+        f"campo={liquidacao.get('campo')}"
+    )
+
+
+def _capturar_liquidacao_bullex(data):
+    conhecidos = _ids_opcoes_conhecidas()
+    if not conhecidos:
+        return
+
+    for item in _iter_dicts_liquidacao(data):
+        candidatos = []
+        for chave in ("option_id", "optionId", "id", "position_id", "positionId"):
+            valor = item.get(chave)
+            if valor not in (None, "", 0):
+                candidatos.append(str(valor))
+
+        for oid in candidatos:
+            if oid not in conhecidos:
+                continue
+            liquidacao = _extrair_liquidacao_do_item(item, conhecidos[oid])
+            if liquidacao is None:
+                continue
+            _aplicar_liquidacao_real(oid, liquidacao, item)
+            return
 
 
 def _ordem_option_confirmada(resposta):
@@ -1316,6 +1477,13 @@ def _on_bullex_message(ws, raw_message):
     nome = data.get("name")
     request_id = data.get("request_id")
     msg = data.get("msg")
+
+    # Tenta capturar liquidação financeira real de qualquer evento/resposta
+    # da Bullex antes dos returns específicos de autenticação/candles.
+    try:
+        _capturar_liquidacao_bullex(data)
+    except Exception as e:
+        log(f"[LIQUIDACAO REAL] Falha ao interpretar evento: {e}")
 
     active_id = None
     size = None
@@ -3595,8 +3763,16 @@ def calcular_estatisticas():
     decididos = wins + losses
     taxa = wins / decididos * 100 if decididos > 0 else 0.0
 
+    # Soma o lucro/prejuízo já registrado em cada operação. Isso permite
+    # combinar payouts diferentes e usar a liquidação REAL recebida da Bullex.
     lucro_total = 0.0
     for item in _historico_resultados:
+        lucro_item = _float_seguro(item.get("lucro"))
+        if lucro_item is not None:
+            lucro_total += lucro_item
+            continue
+
+        # Compatibilidade com registros antigos que ainda não tenham "lucro".
         resultado = item.get("resultado")
         valor = float(item.get("valor") or 0.0)
         if resultado == "WIN":
@@ -3880,22 +4056,33 @@ def avaliar_operacao(symbol, candles):
         operacao["saida"] = saida
 
         if operacao["sinal"] == "CALL":
-            resultado = "WIN" if saida > entrada else "LOSS" if saida < entrada else "DOJI"
+            resultado_candle = "WIN" if saida > entrada else "LOSS" if saida < entrada else "DOJI"
         else:
-            resultado = "WIN" if saida < entrada else "LOSS" if saida > entrada else "DOJI"
+            resultado_candle = "WIN" if saida < entrada else "LOSS" if saida > entrada else "DOJI"
 
+        # Se a Bullex já informou o resultado oficial da liquidação, ele tem
+        # prioridade. Caso contrário, mantém a classificação técnica pelo candle.
+        resultado = operacao.get("resultado_bullex") or resultado_candle
         operacao["resultado"] = resultado
+        operacao["resultado_candle"] = resultado_candle
         operacao["finalizado_em"] = agora
 
         valor_operacao = float(operacao.get("valor") or 0.0)
-        if resultado == "WIN":
+        lucro_real = _float_seguro(operacao.get("lucro_real"))
+        if lucro_real is not None:
+            operacao["lucro"] = round(lucro_real, 2)
+            operacao["fonte_lucro"] = "BULLEX_REAL"
+        elif resultado == "WIN":
             operacao["lucro"] = round(
                 valor_operacao * (PAYOUT_LUCRO_PERCENTUAL / 100.0), 2
             )
+            operacao["fonte_lucro"] = f"FALLBACK_{PAYOUT_LUCRO_PERCENTUAL:.2f}%"
         elif resultado == "LOSS":
             operacao["lucro"] = round(-valor_operacao, 2)
+            operacao["fonte_lucro"] = "VALOR_ENTRADA"
         else:
             operacao["lucro"] = 0.0
+            operacao["fonte_lucro"] = "DOJI"
 
         _historico_resultados.append(operacao.copy())
         del _operacoes_pendentes[symbol]
@@ -3974,6 +4161,8 @@ def enviar_resultado_telegram(
         f"Losses: {estatisticas['losses']}\n"
         f"Dojis: {estatisticas['dojis']}\n"
         f"Taxa: {estatisticas['taxa']:.2f}%\n"
+        f"Resultado financeiro: R${float(operacao.get('lucro') or 0.0):.2f}\n"
+        f"Fonte do lucro: {operacao.get('fonte_lucro', '-')}\n"
         f"Lucro acumulado: R${estatisticas['lucro_total']:.2f}"
     )
 
