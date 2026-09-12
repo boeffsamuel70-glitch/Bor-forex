@@ -77,7 +77,7 @@ _bullex_assets_source = None
 _bullex_assets_ready_event = threading.Event()
 _bullex_assets_init_lock = threading.Lock()
 
-_BULLEX_CANDLE_SIZES = {"1min": 60, "5min": 300}
+_BULLEX_CANDLE_SIZES = {"5min": 300, "5min": 300}
 
 _bullex_ws = None
 _bullex_ws_lock = threading.RLock()
@@ -100,7 +100,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "R36-OTC-FIM-M5-M15-RELOGIO-ATE3S-EXPIRACAO5MIN-FINAL"
+BULLEX_DIAGNOSTIC_VERSION = "R38-OTC-FIM-M5-M15-DASHBOARD-LIMPO-FINAL"
 
 _bullex_diag = {
     "messages": 0,
@@ -123,8 +123,8 @@ TELEGRAM_CHAT_ID = os.getenv(
     "TELEGRAM_CHAT_ID", ""
 ).strip()
 
-TIMEFRAME = "1min"
-TIMEFRAME_TREND = "5min"
+TIMEFRAME = "5min"
+TIMEFRAME_TREND = "15min"
 
 TIMEZONE = "America/Sao_Paulo"
 TZ = ZoneInfo(TIMEZONE)
@@ -179,7 +179,7 @@ DEGRAU_LUCRO_PARA_AUMENTO = float(
 
 EXPIRACAO_MINUTOS = 5
 # A antiga janela de 3 segundos foi removida.
-# Esta estratégia entra DURANTE a vela M1 atual e expira no fechamento da MESMA vela.
+# Esta estratégia entra DURANTE a vela M5 atual e expira no fechamento da MESMA vela.
 INTRAVELA_MIN_SEGUNDOS_DECORRIDOS = 2
 INTRAVELA_MIN_SEGUNDOS_RESTANTES = 50
 
@@ -206,9 +206,9 @@ SR_M5_PIVOT_JANELA = 2
 SR_M5_MIN_TOQUES = 2
 SR_M5_TOLERANCIA_ATR = 0.18
 
-# A vela M1 precisa vir de uma distância mínima até o nível.
+# A vela M5 precisa vir de uma distância mínima até o nível.
 # Se abrir colada no suporte/resistência, não opera.
-SR_M1_DISTANCIA_ABERTURA_ATR_MIN = 0.55
+SR_M5_DISTANCIA_ABERTURA_ATR_MIN = 0.55
 
 # Rejeição/retração depois do toque.
 INTRAVELA_RETRACAO_MIN = 0.20
@@ -331,7 +331,7 @@ _bullex_balance_source = None
 _bullex_instrument_cache = {}
 
 # ============================================================
-# HORÁRIO DO SERVIDOR / JANELA DE ENTRADA M1
+# HORÁRIO DO SERVIDOR / JANELA DE ENTRADA M5
 # ============================================================
 
 _bullex_server_timestamp = None
@@ -417,11 +417,11 @@ def _horario_servidor_atual():
     return time.time(), "LOCAL_FALLBACK"
 
 
-def _janela_execucao_m1():
+def _janela_execucao_m5():
     server_ts, source = _horario_servidor_atual()
 
     current = int(server_ts)
-    candle_open = current - (current % 60)
+    candle_open = current - (current % 300)
     candle_close = candle_open + 300
     atraso = max(0.0, server_ts - candle_open)
 
@@ -3621,7 +3621,7 @@ def _candles_cache(active_id, size):
 
 
 def _atr_cache_1m(active_id):
-    candles = _candles_cache(active_id, 60)
+    candles = _candles_cache(active_id, 300)
     fechadas = somente_velas_fechadas(candles, 1)
     if len(fechadas) < 15:
         return None
@@ -4825,10 +4825,10 @@ def finalizar_operacoes_vencidas_antes_da_leitura():
 # ============================================================
 
 def processar_ativo(chave, symbol, executar_sinal=False):
-    """O ciclo M1 de manutenção não cria sinais por polling.
+    """O ciclo M5 de manutenção não cria sinais por polling.
 
     Ele mantém histórico atualizado, dashboard e finaliza operações.
-    Os sinais surgem exclusivamente do candle-generated M1 em tempo real.
+    Os sinais surgem exclusivamente do candle-generated M5 em tempo real.
     """
     with _bullex_assets_lock:
         config = ATIVO_BULLEX.get(chave)
@@ -4938,7 +4938,7 @@ def executar_leitura():
 
         return
 
-    # No ciclo M1, sinais NÃO são gerados aqui por polling.
+    # No ciclo M5, sinais NÃO são gerados aqui por polling.
     # A retração é detectada em tempo real no candle-generated.
     finalizar_operacoes_vencidas_antes_da_leitura()
 
@@ -5008,7 +5008,7 @@ def loop_robo():
         "Loop do robo iniciado."
     )
     log(
-        f"[R30][M5] Scheduler ativo: leitura/manutencao a cada 1 minuto | "
+        f"[R30][M5] Scheduler ativo: leitura/manutencao a cada 5 minutos | "
         f"expiracao={EXPIRACAO_MINUTOS} minuto(s) | cooldown_loss={BLOQUEIO_LOSS_MINUTOS} min"
     )
 
@@ -5519,7 +5519,7 @@ Entrada: FIM M5 em tempo real
 <br>
 
 <strong>
-Expiração: 1 minuto
+Expiração: 5 minutos
 </strong>
 
 <br><br>
@@ -5622,7 +5622,7 @@ def health():
             ),
         "estrategia":
             (
-                "Retracao intravela na mesma vela de 1 minuto"
+                "Retracao intravela na mesma vela de 5 minutos"
             ),
         "fonte_candles": "Bullex",
         "execucao_automatica": BULLEX_AUTO_TRADE,
