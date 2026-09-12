@@ -100,7 +100,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "R25-OTC-MHI-CONTINUACAO-M1-FILTRADAS-M5-FORCA-6-9-LUCRO-REAL-COOLDOWN40"
+BULLEX_DIAGNOSTIC_VERSION = "R25-OTC-MHI-M1-RAPIDA-M5-FORCA-6-9-LUCRO-REAL-COOLDOWN40"
 
 _bullex_diag = {
     "messages": 0,
@@ -155,8 +155,8 @@ VALORES_ENTRADA = [6.00, 9.00]
 EXPIRACAO_MINUTOS = 1
 # A antiga janela de 3 segundos foi removida.
 # Esta estratégia entra DURANTE a vela M1 atual e expira no fechamento da MESMA vela.
-INTRAVELA_MIN_SEGUNDOS_DECORRIDOS = 8
-INTRAVELA_MIN_SEGUNDOS_RESTANTES = 15
+INTRAVELA_MIN_SEGUNDOS_DECORRIDOS = 2
+INTRAVELA_MIN_SEGUNDOS_RESTANTES = 50
 
 # Filtro de contexto/força no M5. O M5 não executa a entrada; ele apenas
 # autoriza operações na direção de uma tendência suficientemente forte.
@@ -1086,7 +1086,7 @@ def executar_ordem_intravela(symbol, sinal, resultado):
         with _execucao_lock:
             if _operacao_global_ativa is not None:
                 _operacao_global_ativa["preco_entrada_estimado"] = float(resultado["preco"])
-                _operacao_global_ativa["estrategia"] = resultado.get("estrategia", "INTRAVELA_M1")
+                _operacao_global_ativa["estrategia"] = "RETRACAO_MESMA_VELA"
                 _operacao_global_ativa["regime"] = "INTRAVELA"
 
         return status
@@ -3547,6 +3547,7 @@ def _resultado_retracao_intravela(msg, active_id):
     restantes = max(0.0, candle_to - server_ts)
     if (
         decorridos < INTRAVELA_MIN_SEGUNDOS_DECORRIDOS
+        or decorridos > 8
         or restantes < INTRAVELA_MIN_SEGUNDOS_RESTANTES
     ):
         return None
@@ -3619,7 +3620,7 @@ def _resultado_retracao_intravela(msg, active_id):
         return None
 
     corpo_atual = abs(fechamento - abertura)
-    confirmacao_min = atr1 * 0.04
+    confirmacao_min = atr1 * 0.015
 
     # CALL: maioria das 3 velas anteriores foi vermelha (pullback),
     # M5 está forte em alta e a vela atual começa a reagir para cima.
@@ -3717,210 +3718,6 @@ def _resultado_retracao_intravela(msg, active_id):
 
     return None
 
-
-def _resultado_continuacao_intravela(msg, active_id):
-    """Continuação M1 filtrada por força, formato da vela anterior e tendência M5.
-
-    Regra:
-    - última vela M1 forte de alta + M5 forte em alta -> possível CALL;
-    - última vela M1 forte de baixa + M5 forte em baixa -> possível PUT;
-    - a vela M1 atual precisa confirmar a continuação antes da entrada.
-    """
-    if not isinstance(msg, dict):
-        return None
-
-    try:
-        abertura = float(msg["open"])
-        fechamento = float(msg["close"])
-        maxima = float(msg.get("max", msg.get("high")))
-        minima = float(msg.get("min", msg.get("low")))
-        candle_from = int(float(msg["from"]))
-        candle_to = int(float(msg.get("to") or (candle_from + 60)))
-    except Exception:
-        return None
-
-    server_ts, _ = _horario_servidor_atual()
-    decorridos = max(0.0, server_ts - candle_from)
-    restantes = max(0.0, candle_to - server_ts)
-    if (
-        decorridos < INTRAVELA_MIN_SEGUNDOS_DECORRIDOS
-        or restantes < INTRAVELA_MIN_SEGUNDOS_RESTANTES
-    ):
-        return None
-
-    contexto_m5 = _contexto_forca_m5(active_id)
-    if not contexto_m5:
-        return None
-
-    candles = somente_velas_fechadas(_candles_cache(active_id, 60), 1)
-    if len(candles) < 35:
-        return None
-    candles = candles[-60:]
-
-    ultima = candle_info(candles[-1])
-    valores = [float(c["close"]) for c in candles]
-    ema9s = ema_series(valores, 9)
-    ema21s = ema_series(valores, 21)
-    ema9 = ema9s[-1]
-    ema21 = ema21s[-1]
-    atr1 = atr(candles, 14)
-    if None in (ema9, ema21) or not atr1 or atr1 <= 0:
-        return None
-
-    # A vela anterior precisa ter corpo consistente e pavio contra o movimento pequeno.
-    corpo = abs(ultima["close"] - ultima["open"])
-    amplitude = max(ultima["range"], 1e-12)
-    body_ratio = corpo / amplitude
-    if body_ratio < 0.62:
-        return None
-
-    # Evita seguir vela exageradamente esticada.
-    if amplitude > atr1 * 1.60:
-        return None
-
-    direcao = None
-    pavio_contra = 1.0
-
-    if ultima["close"] > ultima["open"]:
-        direcao = "CALL"
-        pavio_contra = max(ultima["open"] - ultima["low"], 0.0) / amplitude
-    elif ultima["close"] < ultima["open"]:
-        direcao = "PUT"
-        pavio_contra = max(ultima["high"] - ultima["open"], 0.0) / amplitude
-    else:
-        return None
-
-    if pavio_contra > 0.22:
-        return None
-
-    # A continuação só é válida a favor da tendência forte do M5.
-    if direcao != contexto_m5["direcao"]:
-        return None
-
-    # M1 também precisa estar minimamente alinhado.
-    if direcao == "CALL" and not (ema9 >= ema21 and ultima["close"] >= ema9):
-        return None
-    if direcao == "PUT" and not (ema9 <= ema21 and ultima["close"] <= ema9):
-        return None
-
-    range_atual = max(maxima - minima, 1e-12)
-    if range_atual > atr1 * 1.70:
-        return None
-
-    candle_key = (int(active_id), candle_from)
-    with _intravela_lock:
-        st = _intravela_estado.setdefault(
-            candle_key,
-            {"ultimo_close": fechamento, "eventos": 0},
-        )
-        ultimo_close = float(st.get("ultimo_close", fechamento))
-        st["ultimo_close"] = fechamento
-        st["eventos"] = int(st.get("eventos", 0)) + 1
-        eventos = st["eventos"]
-
-    if eventos < 2:
-        return None
-
-    corpo_atual = abs(fechamento - abertura)
-    confirmacao_min = atr1 * 0.035
-
-    if direcao == "CALL":
-        confirmou = (
-            fechamento > abertura
-            and fechamento > ultimo_close
-            and corpo_atual >= confirmacao_min
-            and fechamento >= ema9
-        )
-    else:
-        confirmou = (
-            fechamento < abertura
-            and fechamento < ultimo_close
-            and corpo_atual >= confirmacao_min
-            and fechamento <= ema9
-        )
-
-    if not confirmou:
-        return None
-
-    score = 10
-    if body_ratio >= 0.72:
-        score += 1
-    if contexto_m5["adx"] >= 25:
-        score += 1
-
-    return {
-        "sinal": direcao,
-        "score": score,
-        "score_call": score if direcao == "CALL" else 1,
-        "score_put": score if direcao == "PUT" else 1,
-        "preco": fechamento,
-        "vela": datetime.fromtimestamp(candle_from, TZ),
-        "estrategia": "CONTINUACAO_M1_FILTRADA_M5",
-        "regime": "CONTINUACAO_A_FAVOR_M5",
-        "pullback": (
-            "CONTINUAÇÃO: última M1 forte de ALTA"
-            if direcao == "CALL"
-            else "CONTINUAÇÃO: última M1 forte de BAIXA"
-        ),
-        "rejeicao": f"VELA ATUAL CONFIRMANDO {direcao}",
-        "lateral": "NAO",
-        "atr": atr1,
-        "rsi": None,
-        "ema5": None,
-        "ema13": ema9,
-        "ema21": ema21,
-        "tendencia_5m": (
-            f"{'ALTA' if direcao == 'CALL' else 'BAIXA'} FORTE | "
-            f"ADX {contexto_m5['adx']:.1f}"
-        ),
-        "tendencia_15m": "N/A",
-        "zona_fibonacci": "CONTINUAÇÃO M1",
-        "bloqueio": "SINAL",
-        "mensagem": (
-            f"{direcao} CONTINUAÇÃO | corpo anterior={body_ratio:.0%} | "
-            f"M5 {'ALTA' if direcao == 'CALL' else 'BAIXA'} "
-            f"ADX={contexto_m5['adx']:.1f} | restam={restantes:.1f}s"
-        ),
-        "candle_from": candle_from,
-        "candle_to": candle_to,
-        "segundos_decorridos": decorridos,
-        "segundos_restantes": restantes,
-    }
-
-
-def _combinar_sinais_intravela(msg, active_id):
-    """Roda MHI e Continuação ao mesmo tempo e resolve possíveis conflitos."""
-    mhi = _resultado_retracao_intravela(msg, active_id)
-    cont = _resultado_continuacao_intravela(msg, active_id)
-
-    if mhi is None and cont is None:
-        return None
-
-    if mhi is not None and cont is not None:
-        # Sinais opostos na mesma vela: não opera.
-        if mhi.get("sinal") != cont.get("sinal"):
-            return None
-
-        # Mesma direção: confluência das duas estratégias.
-        direcao = mhi["sinal"]
-        combinado = dict(mhi)
-        combinado["estrategia"] = "CONFLUENCIA_MHI_CONTINUACAO"
-        combinado["regime"] = "CONFLUENCIA_MHI_CONTINUACAO"
-        combinado["score"] = min(15, max(mhi.get("score", 0), cont.get("score", 0)) + 2)
-        combinado["score_call"] = combinado["score"] if direcao == "CALL" else 1
-        combinado["score_put"] = combinado["score"] if direcao == "PUT" else 1
-        combinado["pullback"] = (
-            f"MHI + CONTINUAÇÃO concordam em {direcao}"
-        )
-        combinado["rejeicao"] = "DUPLA CONFIRMAÇÃO"
-        combinado["mensagem"] = (
-            f"{direcao} CONFLUÊNCIA | MHI + CONTINUAÇÃO | "
-            f"{combinado.get('tendencia_5m', '-')}"
-        )
-        return combinado
-
-    return mhi if mhi is not None else cont
-
 def _atualizar_dashboard_intravela(symbol, resultado):
     estado["ativo"] = symbol
     estado["sinal"] = resultado.get("sinal", "AGUARDAR")
@@ -3952,7 +3749,7 @@ def _atualizar_dashboard_intravela(symbol, resultado):
         ),
         "bloqueio": resultado.get("bloqueio", "-"),
         "regime": "INTRAVELA",
-        "estrategia": resultado.get("estrategia", "-"),
+        "estrategia": "MHI_M1_FILTRADA_M5",
         "zona_fibonacci": "-",
     }
 
@@ -3970,7 +3767,7 @@ def _processar_sinal_intravela(active_id, msg):
         # LOSS recente: este ativo fica fora por 40 minutos; os demais seguem normais.
         return
 
-    resultado = _combinar_sinais_intravela(msg, active_id)
+    resultado = _resultado_retracao_intravela(msg, active_id)
     if resultado is None:
         return
 
@@ -4003,45 +3800,28 @@ def _processar_sinal_intravela(active_id, msg):
 
 
 def calcular_estatisticas_por_estrategia():
-    nomes = {
-        "MHI_M1_FILTRADA_M5": "MHI",
-        "CONTINUACAO_M1_FILTRADA_M5": "CONTINUACAO",
-    }
-
-    base = {
-        "MHI_M1_FILTRADA_M5": {"total": 0, "wins": 0, "losses": 0, "dojis": 0},
-        "CONTINUACAO_M1_FILTRADA_M5": {"total": 0, "wins": 0, "losses": 0, "dojis": 0},
-    }
-
+    wins = losses = dojis = 0
     for item in _historico_resultados:
-        estrategia = item.get("estrategia")
-        resultado = item.get("resultado")
-
-        creditos = []
-        if estrategia == "CONFLUENCIA_MHI_CONTINUACAO":
-            creditos = ["MHI_M1_FILTRADA_M5", "CONTINUACAO_M1_FILTRADA_M5"]
-        elif estrategia in base:
-            creditos = [estrategia]
-
-        for chave in creditos:
-            base[chave]["total"] += 1
-            if resultado == "WIN":
-                base[chave]["wins"] += 1
-            elif resultado == "LOSS":
-                base[chave]["losses"] += 1
-            elif resultado == "DOJI":
-                base[chave]["dojis"] += 1
-
-    saida = {}
-    for chave, dados in base.items():
-        decididos = dados["wins"] + dados["losses"]
-        saida[chave] = {
-            **dados,
-            "nome": nomes[chave],
-            "taxa": round(dados["wins"] / decididos * 100 if decididos else 0.0, 2),
+        if item.get("estrategia") != "MHI_M1_FILTRADA_M5":
+            continue
+        r = item.get("resultado")
+        if r == "WIN":
+            wins += 1
+        elif r == "LOSS":
+            losses += 1
+        elif r == "DOJI":
+            dojis += 1
+    total = wins + losses + dojis
+    decididos = wins + losses
+    return {
+        "MHI_M1_FILTRADA_M5": {
+            "total": total,
+            "wins": wins,
+            "losses": losses,
+            "dojis": dojis,
+            "taxa": round(wins / decididos * 100 if decididos else 0.0, 2),
         }
-
-    return saida
+    }
 
 
 # ============================================================
@@ -4279,8 +4059,8 @@ def registrar_operacao_intravela(symbol, resultado):
         "symbol": symbol,
         "sinal": sinal,
         "score": resultado.get("score", 0),
-        "estrategia": resultado.get("estrategia", "INTRAVELA_M1"),
-        "regime": resultado.get("regime", "INTRAVELA"),
+        "estrategia": "MHI_M1_FILTRADA_M5",
+        "regime": "INTRAVELA",
         "preco_sinal": float(resultado["preco"]),
         "vela_sinal": candle_dt,
         "vela_entrada": candle_dt,
@@ -4527,7 +4307,7 @@ def processar_ativo(chave, symbol, executar_sinal=False):
             estado["atualidade_min"] = f"{idade:.1f} min" if idade is not None else "-"
             if estado.get("sinal") not in ("CALL", "PUT"):
                 estado["sinal"] = "AGUARDAR"
-                estado["mensagem"] = "Monitorando MHI filtrada e Continuação filtrada em M1, ambas com força/tendência M5."
+                estado["mensagem"] = "Monitorando MHI M1 rápida: sinal preparado pelas 3 velas fechadas + filtro M5 e confirmação nos primeiros segundos."
         return None
 
     except Exception as e:
@@ -5177,30 +4957,6 @@ Taxa de acerto
 
 </div>
 
-<br>
-
-<div class="estatisticas">
-
-<div class="box">
-MHI
-<div class="numero">
-{{ estrategia_stats.MHI_M1_FILTRADA_M5.wins }}W /
-{{ estrategia_stats.MHI_M1_FILTRADA_M5.losses }}L
-</div>
-<div>{{ estrategia_stats.MHI_M1_FILTRADA_M5.taxa }}%</div>
-</div>
-
-<div class="box">
-CONTINUAÇÃO
-<div class="numero">
-{{ estrategia_stats.CONTINUACAO_M1_FILTRADA_M5.wins }}W /
-{{ estrategia_stats.CONTINUACAO_M1_FILTRADA_M5.losses }}L
-</div>
-<div>{{ estrategia_stats.CONTINUACAO_M1_FILTRADA_M5.taxa }}%</div>
-</div>
-
-</div>
-
 </div>
 
 <div class="card">
@@ -5216,7 +4972,7 @@ Quando houver sinal:
 <br>
 
 <strong>
-Entrada: MHI ou Continuação M1 filtradas em tempo real
+Entrada: reversão intravela M1 em tempo real
 </strong>
 
 <br>
@@ -5297,8 +5053,7 @@ def index():
 
     return render_template_string(
         HTML,
-        estado=estado,
-        estrategia_stats=calcular_estatisticas_por_estrategia(),
+        estado=estado
     )
 
 
