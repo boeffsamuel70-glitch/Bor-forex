@@ -100,7 +100,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "R44-OTC-FIM-M5-M15-ULTIMO-M5-FECHADO-CORRIGIDO"
+BULLEX_DIAGNOSTIC_VERSION = "R45-OTC-FIM-M5-PRESERVA-FROM-TO"
 
 _bullex_diag = {
     "messages": 0,
@@ -1294,8 +1294,24 @@ def _normalizar_candle_ws(item):
         high = item.get("max", item.get("high"))
         low = item.get("min", item.get("low"))
 
+        # Preserve também os limites epoch da vela. A rotina FIM-M5 usa
+        # esses campos para localizar a última vela realmente fechada.
+        candle_from = int(timestamp)
+        to_raw = item.get("to")
+        if to_raw is None:
+            candle_to = None
+        else:
+            candle_to = float(to_raw)
+            if candle_to > 10_000_000_000_000:
+                candle_to /= 1_000_000_000
+            elif candle_to > 10_000_000_000:
+                candle_to /= 1_000
+            candle_to = int(candle_to)
+
         return {
             "id": item.get("id"),
+            "from": candle_from,
+            "to": candle_to,
             "datetime": dt.isoformat(),
             "open": float(item["open"]),
             "high": float(high),
