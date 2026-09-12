@@ -100,7 +100,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "R31-OTC-FIM-M5-M15-ATE1S-MAX2-DIAG-CORRIGIDO"
+BULLEX_DIAGNOSTIC_VERSION = "R32-OTC-FIM-M5-M15-ENTRADA-M5-REAL-MAX2-DIAG"
 
 _bullex_diag = {
     "messages": 0,
@@ -191,6 +191,14 @@ M5_SEPARACAO_EMAS_ATR_MIN = 0.12
 M5_INCLINACAO_ATR_MIN = 0.03
 M5_IMPULSO_CANDLES = 3
 M5_IMPULSO_MIN_DIRECIONAIS = 2
+
+# Parâmetros do contexto de tendência M15.
+M15_ADX_PERIODO = 14
+M15_ADX_MINIMO = 20.0
+M15_SEPARACAO_EMAS_ATR_MIN = 0.12
+M15_INCLINACAO_ATR_MIN = 0.03
+M15_IMPULSO_CANDLES = 3
+M15_IMPULSO_MIN_DIRECIONAIS = 2
 
 # Parâmetros antigos de S/R mantidos apenas por compatibilidade com helpers legados.
 SR_M5_LOOKBACK = 100
@@ -1716,8 +1724,8 @@ def _on_bullex_message(ws, raw_message):
                 with _bullex_diag_lock:
                     _bullex_diag["stored"] += 1
 
-                # Estratégia de reversão: observa a vela de M1 ainda aberta.
-                if int(size) == 60:
+                # Estratégia FIM M5: dispara somente na abertura/atualização da vela M5.
+                if int(size) == 300:
                     threading.Thread(
                         target=_processar_sinal_intravela,
                         args=(active_id, dict(msg)),
@@ -2341,12 +2349,12 @@ def _aguardar_ativos_mercado_aberto(timeout=30):
     return False
 
 def _assinar_candles_mercado_aberto():
-    """Assina M1 e M5 dos ativos usados pelo robô."""
+    """Assina M5 e M15 dos ativos usados pela estratégia FIM."""
     assinaturas = set()
 
     for config in ATIVO_BULLEX.values():
         active_id = int(config["active_id"])
-        for size in (60, 300):
+        for size in (300, 900):
             chave = (active_id, size)
             if chave in assinaturas:
                 continue
@@ -3567,7 +3575,7 @@ def analisar_pullback(
 
 
 # ============================================================
-# ESTRATÉGIA ÚNICA - S/R M5 + REVERSÃO NA MESMA VELA M1
+# ESTRATÉGIA ÚNICA - S/R M5 + REVERSÃO NA MESMA VELA M5
 # ============================================================
 
 def _bloqueio_loss_restante(symbol):
@@ -3821,7 +3829,7 @@ def _resultado_retracao_intravela(msg, active_id):
         maxima = float(msg.get("max", msg.get("high")))
         minima = float(msg.get("min", msg.get("low")))
         candle_from = int(float(msg["from"]))
-        candle_to = int(float(msg.get("to") or (candle_from + 60)))
+        candle_to = int(float(msg.get("to") or (candle_from + 300)))
     except Exception:
         return None
 
@@ -3854,13 +3862,13 @@ def _resultado_retracao_intravela(msg, active_id):
 
     contexto_m15 = _contexto_forca_m15(active_id)
     if not contexto_m15:
-        _log_fim_diagnostico(active_id, symbol, "BLOQUEADA_SEM_CONTEXTO_M55")
+        _log_fim_diagnostico(active_id, symbol, "BLOQUEADA_SEM_CONTEXTO_M15")
         return None
 
     direcao = contexto_m15.get("direcao")
     adx15 = float(contexto_m15.get("adx") or 0.0)
     if direcao not in ("CALL", "PUT"):
-        _log_fim_diagnostico(active_id, symbol, "BLOQUEADA_SEM_DIRECAO_M55", adx=adx15)
+        _log_fim_diagnostico(active_id, symbol, "BLOQUEADA_SEM_DIRECAO_M15", adx=adx15)
         return None
     if adx15 < 20:
         _log_fim_diagnostico(
@@ -3896,17 +3904,17 @@ def _resultado_retracao_intravela(msg, active_id):
     motivos = []
 
     # --------------------------------------------------------
-    # 1. FLUXO M5
+    # 1. FLUXO M15
     # --------------------------------------------------------
     if adx15 >= 28:
         score += 3
-        motivos.append("M5 muito forte")
+        motivos.append("M15 muito forte")
     elif adx15 >= 23:
         score += 2
-        motivos.append("M5 forte")
+        motivos.append("M15 forte")
     else:
         score += 1
-        motivos.append("M5 válido")
+        motivos.append("M15 válido")
 
     # --------------------------------------------------------
     # 2. ESTRUTURA M5 — EMA + inclinação
@@ -4380,8 +4388,8 @@ def enviar_sinal_telegram(
         f"{fmt(resultado.get('ema21'))}\n"
         f"ATR 14: "
         f"{fmt(resultado.get('atr'), 6)}\n\n"
-        f"➡️ ENTRADA: MESMA VELA M1\n"
-        f"⏱️ EXPIRACAO: 1 MINUTO (fechamento da vela)\n\n"
+        f"➡️ ENTRADA: MESMA VELA M5\n"
+        f"⏱️ EXPIRACAO: 5 MINUTOS (fechamento da vela M5)\n\n"
         f"⚠️ Sinal tecnico experimental."
     )
 
@@ -4815,21 +4823,19 @@ def executar_leitura():
 # ============================================================
 
 def esperar_ate_proxima_leitura():
-    """Sincroniza a manutenção do robô com cada nova vela M1.
+    """Sincroniza a manutenção do robô com a próxima abertura de vela M5.
 
-    O gatilho intravela continua vindo em tempo real pelo candle-generated.
-    Esta rotina apenas garante que histórico, resultados pendentes, dashboard
-    e descoberta/manutenção dos ativos sejam atualizados a cada minuto.
+    O sinal continua vindo em tempo real pelo candle-generated M5.
+    Esta rotina mantém histórico, resultados pendentes, dashboard
+    e descoberta/manutenção dos ativos alinhados ao ciclo de 5 minutos.
     """
     agora = agora_brt()
 
-    # Próximo fechamento/abertura de vela M1. Pequena folga de 100 ms
-    # evita consultar exatamente antes da virada do minuto.
+    minuto_atual = agora.minute
+    minutos_ate_proxima = 5 - (minuto_atual % 5)
     proxima = (
-        agora + timedelta(minutes=1)
-    ).replace(
-        second=0,
-        microsecond=100000,
+        agora.replace(second=0, microsecond=100000)
+        + timedelta(minutes=minutos_ate_proxima)
     )
 
     segundos = max(
@@ -4838,7 +4844,7 @@ def esperar_ate_proxima_leitura():
     )
 
     log(
-        "[R30][M5] Proxima leitura M1: "
+        "[R32][M5] Proxima leitura M5: "
         f"{proxima.strftime('%H:%M:%S BRT')}"
     )
 
@@ -5196,7 +5202,7 @@ Filtros da entrada
 
 <div class="linha">
 <span>Nível M5</span>
-<span class="valor">MESMA VELA M1</span>
+<span class="valor">MESMA VELA M5</span>
 </div>
 
 <div class="linha">
@@ -5359,7 +5365,7 @@ Quando houver sinal:
 <br>
 
 <strong>
-Entrada: reversão intravela M1 em tempo real
+Entrada: FIM M5 em tempo real
 </strong>
 
 <br>
