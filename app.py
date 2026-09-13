@@ -160,13 +160,13 @@ VALORES_ENTRADA = [6.00, 7.00, 8.00, 9.00]
 # Valores padrão podem ser alterados no Render sem editar o código.
 ENTRADA_BASE = 5.0  # R50: mão fixa de R$5
 ENTRADA_MAXIMA = 5.0  # R50: sem progressão; mão fixa de R$5
-META_LUCRO_DIA = float(os.getenv("META_LUCRO_DIA", "50").replace(",", "."))
-STOP_LOSS_DIA = float(os.getenv("STOP_LOSS_DIA", "24").replace(",", "."))
+META_LUCRO_DIA = float(os.getenv("META_LUCRO_DIA", "100").replace(",", "."))
+STOP_LOSS_DIA = float(os.getenv("STOP_LOSS_DIA", "60").replace(",", "."))
 TRAVA_LUCRO_ATIVA_APOS = float(
-    os.getenv("TRAVA_LUCRO_ATIVA_APOS", "30").replace(",", ".")
+    os.getenv("TRAVA_LUCRO_ATIVA_APOS", "80").replace(",", ".")
 )
 TRAVA_LUCRO_RECUO = float(
-    os.getenv("TRAVA_LUCRO_RECUO", "10").replace(",", ".")
+    os.getenv("TRAVA_LUCRO_RECUO", "30").replace(",", ".")
 )
 
 # A mão cresce somente com lucro já conquistado:
