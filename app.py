@@ -101,7 +101,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "R50-OTC-MAO-FIXA-5-TOP3"
+BULLEX_DIAGNOSTIC_VERSION = "R51-SR-M5-REJEICAO-ROMPIMENTO-RETESTE"
 
 _bullex_diag = {
     "messages": 0,
@@ -228,6 +228,14 @@ _bloqueio_loss_ate = {}
 _intravela_lock = threading.RLock()
 _intravela_estado = {}
 _intravela_velas_tentadas = set()
+
+_sr_retry_lock = threading.RLock()
+_sr_retry = {}
+SR_MAX_TENTATIVAS_NIVEL = 2
+SR_RETESTE_TOLERANCIA_ATR = 0.24
+SR_ROMPIMENTO_ATR_MIN = 0.16
+SR_REJEICAO_PAVIO_MIN = 0.28
+SR_FECHAMENTO_FORTE_MIN = 0.62
 
 # ============================================================
 # ATIVOS
@@ -3763,360 +3771,84 @@ def _log_fim_diagnostico(active_id, symbol, status, **dados):
 
 
 def _resultado_retracao_intravela(msg, active_id):
-    """FIM EXPERIMENTAL — Fluxo, Impulso e Momento.
-
-    Estratégia autoral para M5:
-    1. Fluxo M5: direção + força (ADX).
-    2. Estrutura M5: EMA9/EMA21 e inclinação.
-    3. Impulso: corpos e fechamentos recentes.
-    4. Retração: procura perda de força contra o fluxo.
-    5. Rejeição: pavios/posição do fechamento.
-    6. Volatilidade: ATR evita mercado morto e vela esticada.
-    7. Timing: só entra no começo da nova M5.
-    8. Score: exige várias evidências simultâneas.
-    """
+    """R51: S/R M5, rejeição, rompimento+reteste e 2ª tentativa técnica."""
     if not isinstance(msg, dict):
         return None
-
-    # Resolve o nome do ativo sem depender de ACTIVE_ID_TO_SYMBOL,
-    # que não existe nesta base do robô.
-    symbol = str(active_id)
+    _, symbol = _symbol_por_active_id(active_id)
+    symbol = symbol or str(active_id)
     try:
-        aid = int(active_id)
-
-        # Procura primeiro nos cadastros/dicionários já existentes.
-        for _nome_mapa in (
-            "ATIVOS_OTC",
-            "ATIVOS",
-            "OTC_ATIVOS",
-            "BULLEX_ATIVOS",
-            "ACTIVE_IDS",
-        ):
-            _mapa = globals().get(_nome_mapa)
-            if not isinstance(_mapa, dict):
-                continue
-
-            # Formato active_id -> nome
-            if aid in _mapa:
-                _valor = _mapa[aid]
-                if isinstance(_valor, dict):
-                    symbol = str(
-                        _valor.get("symbol")
-                        or _valor.get("ticker")
-                        or _valor.get("codigo")
-                        or _valor.get("name")
-                        or aid
-                    )
-                else:
-                    symbol = str(_valor)
-                break
-
-            # Formato nome -> active_id / dados
-            for _chave, _valor in _mapa.items():
-                if isinstance(_valor, dict):
-                    _id = (
-                        _valor.get("active_id")
-                        or _valor.get("id")
-                        or _valor.get("activeId")
-                    )
-                    try:
-                        if _id is not None and int(_id) == aid:
-                            symbol = str(
-                                _valor.get("symbol")
-                                or _valor.get("ticker")
-                                or _valor.get("codigo")
-                                or _valor.get("name")
-                                or _chave
-                            )
-                            break
-                    except (TypeError, ValueError):
-                        pass
-                else:
-                    try:
-                        if int(_valor) == aid:
-                            symbol = str(_chave)
-                            break
-                    except (TypeError, ValueError):
-                        pass
-
-            if symbol != str(active_id):
-                break
-    except (TypeError, ValueError):
-        pass
-
-    try:
-        abertura = float(msg["open"])
-        fechamento = float(msg["close"])
-        maxima = float(msg.get("max", msg.get("high")))
-        minima = float(msg.get("min", msg.get("low")))
-        candle_from = int(float(msg["from"]))
-        candle_to = int(float(msg.get("to") or (candle_from + 300)))
+        abertura=float(msg["open"]); fechamento=float(msg["close"])
+        maxima=float(msg.get("max",msg.get("high"))); minima=float(msg.get("min",msg.get("low")))
+        candle_from=int(float(msg["from"])); candle_to=int(float(msg.get("to") or candle_from+300))
     except Exception:
         return None
 
-    server_ts, _ = _horario_servidor_atual()
-    decorridos = max(0.0, server_ts - candle_from)
-    restantes = max(0.0, candle_to - server_ts)
-
-    _log_fim_diagnostico(
-        active_id,
-        symbol,
-        "M5_RECEBIDA",
-        atraso_s=decorridos,
-        restantes_s=restantes,
-    )
-
-    # Entrada imediata: a análise principal já vem das velas fechadas.
-    # Só aceita a oportunidade até 3 segundos após abrir a nova M5.
-    if decorridos < 0:
-        _log_fim_diagnostico(active_id, symbol, "BLOQUEADA_RELOGIO", atraso_s=decorridos)
-        return None
-    if decorridos > 3.0 or restantes < 297:
-        _log_fim_diagnostico(
-            active_id,
-            symbol,
-            "BLOQUEADA_ATRASO",
-            atraso_s=decorridos,
-            limite_s=3.0,
-        )
+    server_ts,_=_horario_servidor_atual()
+    decorridos=max(0.0,float(server_ts)-candle_from); restantes=max(0.0,candle_to-float(server_ts))
+    gatilho_relogio=str(msg.get("_gatilho","")).startswith("RELOGIO")
+    if not gatilho_relogio and (decorridos < INTRAVELA_MIN_SEGUNDOS_DECORRIDOS or restantes < INTRAVELA_MIN_SEGUNDOS_RESTANTES):
         return None
 
-    contexto_m15 = _contexto_forca_m15(active_id)
-    if not contexto_m15:
-        _log_fim_diagnostico(active_id, symbol, "BLOQUEADA_SEM_CONTEXTO_M15")
+    suportes,resistencias,atr5=_niveis_sr_m5(active_id)
+    if not atr5 or atr5<=0 or (not suportes and not resistencias):
         return None
+    tol=atr5*SR_RETESTE_TOLERANCIA_ATR
+    amp=max(maxima-minima,atr5*0.02)
+    ctx=_contexto_forca_m15(active_id) or {}; dir15=ctx.get("direcao"); adx15=float(ctx.get("adx") or 0)
+    cand=[]
 
-    direcao = contexto_m15.get("direcao")
-    adx15 = float(contexto_m15.get("adx") or 0.0)
-    if direcao not in ("CALL", "PUT"):
-        _log_fim_diagnostico(active_id, symbol, "BLOQUEADA_SEM_DIRECAO_M15", adx=adx15)
-        return None
-    if adx15 < 20:
-        _log_fim_diagnostico(
-            active_id, symbol, "BLOQUEADA_ADX_BAIXO",
-            direcao=direcao, adx=adx15, minimo=20
-        )
-        return None
+    def add(direcao,tipo,g,score,motivo):
+        if adx15>=32 and dir15 in ("CALL","PUT") and dir15!=direcao and "RETESTE" not in tipo:
+            return
+        tentativa=1
+        with _sr_retry_lock:
+            r=_sr_retry.get(symbol)
+            if r and r.get("direcao")==direcao and abs(float(r.get("nivel",0))-float(g["nivel"]))<=tol:
+                tentativa=int(r.get("tentativas",1))+1
+                if tentativa>SR_MAX_TENTATIVAS_NIVEL: return
+                score+=2; motivo+=" + 2ª tentativa técnica"
+        cand.append({"direcao":direcao,"tipo":tipo,"g":g,"score":score,"motivo":motivo,"tentativa":tentativa})
 
-    candles = somente_velas_fechadas(_candles_cache(active_id, 300), 1)
-    if len(candles) < 40:
-        _log_fim_diagnostico(
-            active_id, symbol, "BLOQUEADA_POUCAS_VELAS",
-            candles=len(candles), minimo=40
-        )
-        return None
-    candles = candles[-70:]
+    for g in suportes:
+        n=float(g["nivel"]); tocou=minima<=n+tol and maxima>=n-tol
+        pav=max(min(abertura,fechamento)-minima,0)/amp; pos=(fechamento-minima)/amp
+        if tocou and fechamento>n and (pav>=SR_REJEICAO_PAVIO_MIN or pos>=SR_FECHAMENTO_FORTE_MIN):
+            s=6+min(int(g.get("toques",2)),4)+(1 if fechamento>abertura else 0)+(1 if dir15=="CALL" else 0)
+            add("CALL","SUPORTE_REJEICAO",g,s,"suporte rejeitado")
 
-    infos = [candle_info(c) for c in candles]
-    valores = [float(c["close"]) for c in candles]
-    ema9s = ema_series(valores, 9)
-    ema21s = ema_series(valores, 21)
-    ema9 = ema9s[-1]
-    ema21 = ema21s[-1]
-    atr1 = atr(candles, 14)
+    for g in resistencias:
+        n=float(g["nivel"]); tocou=maxima>=n-tol and minima<=n+tol
+        pav=max(maxima-max(abertura,fechamento),0)/amp; pos=(maxima-fechamento)/amp
+        if tocou and fechamento<n and (pav>=SR_REJEICAO_PAVIO_MIN or pos>=SR_FECHAMENTO_FORTE_MIN):
+            s=6+min(int(g.get("toques",2)),4)+(1 if fechamento<abertura else 0)+(1 if dir15=="PUT" else 0)
+            add("PUT","RESISTENCIA_REJEICAO",g,s,"resistência rejeitada")
 
-    if None in (ema9, ema21) or not atr1 or atr1 <= 0:
-        _log_fim_diagnostico(active_id, symbol, "BLOQUEADA_INDICADORES_INVALIDOS")
-        return None
-
-    ultimas = infos[-5:]
-    ultima = ultimas[-1]
-    score = 0
-    motivos = []
-
-    # --------------------------------------------------------
-    # 1. FLUXO M15
-    # --------------------------------------------------------
-    if adx15 >= 28:
-        score += 3
-        motivos.append("M15 muito forte")
-    elif adx15 >= 23:
-        score += 2
-        motivos.append("M15 forte")
-    else:
-        score += 1
-        motivos.append("M15 válido")
-
-    # --------------------------------------------------------
-    # 2. ESTRUTURA M5 — EMA + inclinação
-    # --------------------------------------------------------
-    sep = abs(ema9 - ema21)
-    if sep < atr1 * 0.06:
-        _log_fim_diagnostico(
-            active_id, symbol, "BLOQUEADA_COMPRESSAO",
-            separacao=sep, atr=atr1
-        )
-        return None  # mercado excessivamente comprimido/lateral
-
-    if direcao == "CALL":
-        if ema9 >= ema21:
-            score += 2
-            motivos.append("EMA M5 alta")
-        else:
-            score -= 2
-        inclinacao = ema9s[-1] - ema9s[-4]
-        if inclinacao > 0:
-            score += 1
-            motivos.append("EMA9 inclinada")
-    else:
-        if ema9 <= ema21:
-            score += 2
-            motivos.append("EMA M5 baixa")
-        else:
-            score -= 2
-        inclinacao = ema9s[-1] - ema9s[-4]
-        if inclinacao < 0:
-            score += 1
-            motivos.append("EMA9 inclinada")
-
-    # --------------------------------------------------------
-    # 3. IMPULSO RECENTE
-    # --------------------------------------------------------
-    favor = 0
-    contra = 0
-    for inf in ultimas[-4:]:
-        if inf["close"] > inf["open"]:
-            if direcao == "CALL":
-                favor += 1
-            else:
-                contra += 1
-        elif inf["close"] < inf["open"]:
-            if direcao == "PUT":
-                favor += 1
-            else:
-                contra += 1
-
-    if favor >= 2:
-        score += 1
-        motivos.append("impulso presente")
-
-    # --------------------------------------------------------
-    # 4. RETRAÇÃO / PERDA DE FORÇA
-    # Aceita 1-2 velas contra o fluxo, desde que não sejam violentas.
-    # --------------------------------------------------------
-    retracao = False
-    duas = ultimas[-2:]
-    if direcao == "CALL":
-        retracao = any(i["close"] < i["open"] for i in duas)
-    else:
-        retracao = any(i["close"] > i["open"] for i in duas)
-
-    if retracao:
-        amplitude_retracao = max(i["range"] for i in duas)
-        if amplitude_retracao <= atr1 * 1.25:
-            score += 2
-            motivos.append("retração controlada")
-        else:
-            score -= 2
-
-    # --------------------------------------------------------
-    # 5. REJEIÇÃO NA ÚLTIMA VELA FECHADA
-    # --------------------------------------------------------
-    amp_u = max(ultima["range"], 1e-12)
-    if direcao == "CALL":
-        pavio_rejeicao = max(ultima["open"] - ultima["low"], 0.0) / amp_u
-        fechamento_pos = (ultima["close"] - ultima["low"]) / amp_u
-        if pavio_rejeicao >= 0.22 or fechamento_pos >= 0.65:
-            score += 2
-            motivos.append("rejeição inferior")
-    else:
-        pavio_rejeicao = max(ultima["high"] - ultima["open"], 0.0) / amp_u
-        fechamento_pos = (ultima["high"] - ultima["close"]) / amp_u
-        if pavio_rejeicao >= 0.22 or fechamento_pos >= 0.65:
-            score += 2
-            motivos.append("rejeição superior")
-
-    # --------------------------------------------------------
-    # 6. NÃO PERSEGUE MOVIMENTO ESTICADO
-    # --------------------------------------------------------
-    distancia_ema = abs(ultima["close"] - ema9)
-    if distancia_ema > atr1 * 1.15:
-        _log_fim_diagnostico(
-            active_id, symbol, "BLOQUEADA_ESTICADA_EMA",
-            distancia_ema=distancia_ema, atr=atr1
-        )
-        return None
-
-    if ultima["range"] > atr1 * 1.65:
-        _log_fim_diagnostico(
-            active_id, symbol, "BLOQUEADA_VELA_ANOMALA",
-            range_ultima=ultima["range"], atr=atr1
-        )
-        return None
-
-    # --------------------------------------------------------
-    # 7. TIMING IMEDIATO
-    # --------------------------------------------------------
-    # Para entrar em até 3 segundos, não aguardamos a formação do corpo
-    # da nova vela. A decisão é baseada nas velas M5 já fechadas + M15.
-    motivos.append("entrada imediata <=1s")
-
-    # --------------------------------------------------------
-    # 8. SCORE FINAL
-    # --------------------------------------------------------
-    # Exige múltiplas evidências; não existe entrada por um único indicador.
-    SCORE_MINIMO_FIM = 6
-    if score < SCORE_MINIMO_FIM:
-        _log_fim_diagnostico(
-            active_id, symbol, "BLOQUEADA_SCORE",
-            direcao=direcao,
-            score=score,
-            minimo=SCORE_MINIMO_FIM,
-            adx=adx15,
-            motivos=";".join(motivos),
-        )
-        return None
-
-    qualidade = "FORTE" if score >= 10 else "NORMAL"
-
-    _log_fim_diagnostico(
-        active_id,
-        symbol,
-        "SINAL_APROVADO",
-        direcao=direcao,
-        score=score,
-        qualidade=qualidade,
-        atraso_s=decorridos,
-        adx=adx15,
-    )
-
+    fechadas=somente_velas_fechadas(_candles_cache(active_id,300),5)
+    if len(fechadas)>=3:
+        ult=[candle_info(c) for c in fechadas[-3:]]
+        for g in resistencias:
+            n=float(g["nivel"])
+            rompeu=any(i["close"]>n+atr5*SR_ROMPIMENTO_ATR_MIN and i["close"]>i["open"] for i in ult)
+            if rompeu and minima<=n+tol and fechamento>=n:
+                add("CALL","RESISTENCIA_ROMPIDA_RETESTE",g,8+min(int(g.get("toques",2)),3)+(1 if dir15=="CALL" else 0),"resistência rompida virou suporte")
+        for g in suportes:
+            n=float(g["nivel"])
+            rompeu=any(i["close"]<n-atr5*SR_ROMPIMENTO_ATR_MIN and i["close"]<i["open"] for i in ult)
+            if rompeu and maxima>=n-tol and fechamento<=n:
+                add("PUT","SUPORTE_ROMPIDO_RETESTE",g,8+min(int(g.get("toques",2)),3)+(1 if dir15=="PUT" else 0),"suporte rompido virou resistência")
+    if not cand: return None
+    cand.sort(key=lambda c:(c["score"],int(c["g"].get("toques",0)),-abs(fechamento-float(c["g"]["nivel"]))/atr5),reverse=True)
+    m=cand[0]; direcao=m["direcao"]; nivel=float(m["g"]["nivel"]); toques=int(m["g"].get("toques",0)); score=int(m["score"])
+    _log_fim_diagnostico(active_id,symbol,"SR_SINAL_APROVADO",direcao=direcao,tipo=m["tipo"],score=score,nivel=nivel,toques=toques,tentativa=m["tentativa"])
     return {
-        "sinal": direcao,
-        "score": score,
-        "score_call": score if direcao == "CALL" else 1,
-        "score_put": score if direcao == "PUT" else 1,
-        "preco": fechamento,
-        "vela": datetime.fromtimestamp(candle_from, TZ),
-        "estrategia": "FIM_M5_FLUXO_IMPULSO_MOMENTO",
-        "regime": qualidade,
-        "pullback": "RETRAÇÃO CONTROLADA" if retracao else "IMPULSO DIRETO",
-        "rejeicao": " + ".join(motivos[-3:]),
-        "lateral": "NAO",
-        "atr": atr1,
-        "rsi": None,
-        "ema5": None,
-        "ema13": ema9,
-        "ema21": ema21,
-        "tendencia_5m": (
-            f"{'ALTA' if direcao == 'CALL' else 'BAIXA'} | ADX {adx15:.1f}"
-        ),
-        "tendencia_15m": "N/A",
-        "zona_fibonacci": f"FIM SCORE {score}",
-        "bloqueio": "SINAL",
-        "mensagem": (
-            f"{direcao} FIM {qualidade} | score={score} | "
-            f"M5 ADX={adx15:.1f} | entrada={decorridos:.1f}s | "
-            f"{', '.join(motivos)}"
-        ),
-        "candle_from": candle_from,
-        "candle_to": candle_to,
-        "segundos_decorridos": decorridos,
-        "segundos_restantes": restantes,
-        # Métricas extras usadas apenas para ranquear sinais concorrentes.
-        # Não alteram a regra que aprova/reprova o sinal.
-        "adx_m15": float(adx15),
-        "distancia_ema_atr": float(distancia_ema / max(atr1, 1e-12)),
-        "range_ultima_atr": float(ultima["range"] / max(atr1, 1e-12)),
+      "sinal":direcao,"score":score,"score_call":score if direcao=="CALL" else 0,"score_put":score if direcao=="PUT" else 0,
+      "preco":fechamento,"vela":datetime.fromtimestamp(candle_from,TZ),"estrategia":"SR_M5_REJEICAO_ROMPIMENTO_RETESTE",
+      "regime":m["tipo"],"pullback":m["tipo"],"rejeicao":m["motivo"],"lateral":"N/A","atr":atr5,"rsi":None,"ema5":None,"ema13":None,"ema21":None,
+      "tendencia_5m":m["tipo"],"tendencia_15m":f"{dir15 or 'NEUTRO'} | ADX {adx15:.1f}","zona_fibonacci":f"{m['tipo']} @ {nivel:.6f}",
+      "bloqueio":"SINAL","mensagem":f"{direcao} S/R | {m['tipo']} | score={score} | nível={nivel:.6f} | toques={toques} | tentativa={m['tentativa']}/2",
+      "candle_from":candle_from,"candle_to":candle_to,"segundos_decorridos":decorridos,"segundos_restantes":restantes,
+      "nivel_m5":nivel,"tipo_nivel":m["tipo"],"toques_nivel":toques,"distancia_abertura_nivel":abs(abertura-nivel)/atr5,"tentativa_nivel":m["tentativa"],
+      "adx_m15":adx15,"distancia_ema_atr":abs(fechamento-nivel)/atr5,"range_ultima_atr":amp/atr5
     }
 
 def _atualizar_dashboard_intravela(symbol, resultado):
@@ -4150,7 +3882,7 @@ def _atualizar_dashboard_intravela(symbol, resultado):
         ),
         "bloqueio": resultado.get("bloqueio", "-"),
         "regime": "INTRAVELA",
-        "estrategia": "FIM_M5_FLUXO_IMPULSO_MOMENTO",
+        "estrategia": "SR_M5_REJEICAO_ROMPIMENTO_RETESTE",
         "zona_fibonacci": "-",
     }
 
@@ -4440,7 +4172,7 @@ def _disparar_fim_m5_pelo_relogio():
 
         _atualizar_dashboard_intravela(symbol, resultado)
         log(
-            f"[INTRAVELA][TOP2] {symbol} -> {resultado['sinal']} | "
+            f"[INTRAVELA][TOP3-SR] {symbol} -> {resultado['sinal']} | "
             f"score={resultado['score']} | ADX={resultado.get('adx_m15', 0):.1f} | "
             f"distEMA={resultado.get('distancia_ema_atr', 0):.2f}ATR | "
             f"{resultado['pullback']} | preco={resultado['preco']:.5f}"
@@ -4450,7 +4182,7 @@ def _disparar_fim_m5_pelo_relogio():
             target=registrar_operacao_intravela,
             args=(symbol, resultado),
             daemon=True,
-            name=f"intravela-top2-{codigo}-{resultado['candle_from']}",
+            name=f"intravela-top3-sr-{codigo}-{resultado['candle_from']}",
         ).start()
 
 def _loop_gatilho_relogio_m5():
@@ -4506,7 +4238,7 @@ def _processar_sinal_intravela(active_id, msg):
 def calcular_estatisticas_por_estrategia():
     wins = losses = dojis = 0
     for item in _historico_resultados:
-        if item.get("estrategia") != "FIM_M5_FLUXO_IMPULSO_MOMENTO":
+        if item.get("estrategia") != "SR_M5_REJEICAO_ROMPIMENTO_RETESTE":
             continue
         r = item.get("resultado")
         if r == "WIN":
@@ -4518,7 +4250,7 @@ def calcular_estatisticas_por_estrategia():
     total = wins + losses + dojis
     decididos = wins + losses
     return {
-        "FIM_M5_FLUXO_IMPULSO_MOMENTO": {
+        "SR_M5_REJEICAO_ROMPIMENTO_RETESTE": {
             "total": total,
             "wins": wins,
             "losses": losses,
@@ -4769,7 +4501,7 @@ def registrar_operacao_intravela(symbol, resultado):
         "symbol": symbol,
         "sinal": sinal,
         "score": resultado.get("score", 0),
-        "estrategia": "FIM_M5_FLUXO_IMPULSO_MOMENTO",
+        "estrategia": "SR_M5_REJEICAO_ROMPIMENTO_RETESTE",
         "regime": "INTRAVELA",
         "preco_sinal": float(resultado["preco"]),
         "vela_sinal": candle_dt,
@@ -4806,6 +4538,15 @@ def registrar_operacao_intravela(symbol, resultado):
             and _operacao_global_ativa.get("symbol") == symbol
         ):
             _operacao_global_ativa = None
+
+    if resultado.get("nivel_m5") is not None:
+        with _sr_retry_lock:
+            _sr_retry[symbol] = {
+                "nivel": float(resultado["nivel_m5"]), "direcao": sinal,
+                "tipo_nivel": resultado.get("tipo_nivel"),
+                "tentativas": int(resultado.get("tentativa_nivel", 1)),
+                "atr": float(resultado.get("atr") or 0.0),
+            }
 
     log(
         f"[INTRAVELA] {symbol}: operação registrada {sinal} | "
@@ -4883,6 +4624,13 @@ def avaliar_operacao(symbol, candles):
 
         _historico_resultados.append(operacao.copy())
         del _operacoes_pendentes[symbol]
+
+        with _sr_retry_lock:
+            retry = _sr_retry.get(symbol)
+            if resultado != "LOSS":
+                _sr_retry.pop(symbol, None)
+            elif retry and int(retry.get("tentativas", 1)) >= SR_MAX_TENTATIVAS_NIVEL:
+                _sr_retry.pop(symbol, None)
 
         with _execucao_lock:
             if (
