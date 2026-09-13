@@ -101,7 +101,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "R48-OTC-TOP2-RANQUEADO"
+BULLEX_DIAGNOSTIC_VERSION = "R50-OTC-MAO-FIXA-5-TOP3"
 
 _bullex_diag = {
     "messages": 0,
@@ -133,8 +133,8 @@ TZ = ZoneInfo(TIMEZONE)
 OUTPUTSIZE = 150
 OUTPUTSIZE_5M = 100
 
-HORA_INICIO = 3
-HORA_FIM = 1
+HORA_INICIO = 22
+HORA_FIM = 21
 
 MAX_ATRASO_MINUTOS = 8
 
@@ -158,8 +158,8 @@ VALORES_ENTRADA = [6.00, 7.00, 8.00, 9.00]
 # GERENCIAMENTO AUTÔNOMO DE BANCA
 # ============================================================
 # Valores padrão podem ser alterados no Render sem editar o código.
-ENTRADA_BASE = float(os.getenv("ENTRADA_BASE", "6").replace(",", "."))
-ENTRADA_MAXIMA = float(os.getenv("ENTRADA_MAXIMA", "9").replace(",", "."))
+ENTRADA_BASE = 5.0  # R50: mão fixa de R$5
+ENTRADA_MAXIMA = 5.0  # R50: sem progressão; mão fixa de R$5
 META_LUCRO_DIA = float(os.getenv("META_LUCRO_DIA", "50").replace(",", "."))
 STOP_LOSS_DIA = float(os.getenv("STOP_LOSS_DIA", "24").replace(",", "."))
 TRAVA_LUCRO_ATIVA_APOS = float(
@@ -218,7 +218,7 @@ INTRAVELA_REJEICAO_ATR_MIN = 0.10
 INTRAVELA_PAVIO_MIN_FRACAO_MOVIMENTO = 0.10
 
 UMA_OPERACAO_GLOBAL = False
-MAX_OPERACOES_SIMULTANEAS = 2
+MAX_OPERACOES_SIMULTANEAS = 3
 
 # Bloqueio após LOSS desativado nesta versão.
 BLOQUEIO_LOSS_MINUTOS = 0
@@ -923,24 +923,11 @@ def _gerenciamento_permite_operar():
 
 
 def _valor_entrada_atual():
-    """Define a mão usando apenas lucro já conquistado.
+    """R50: mão fixa de R$5 em todas as operações.
 
-    Qualquer LOSS na última operação do dia força a próxima mão para a base.
-    Fora isso, sobe R$1 a cada R$15 de lucro acumulado, limitado a R$9.
+    Não aumenta após WIN e não altera após LOSS.
     """
-    itens = _historico_hoje()
-    if itens and itens[-1].get("resultado") == "LOSS":
-        return round(float(ENTRADA_BASE), 2)
-
-    lucro = max(0.0, float(_resumo_gerenciamento()["lucro_dia"]))
-    if DEGRAU_LUCRO_PARA_AUMENTO <= 0:
-        nivel = 0
-    else:
-        nivel = int(lucro // DEGRAU_LUCRO_PARA_AUMENTO)
-
-    valor = ENTRADA_BASE + nivel
-    valor = max(ENTRADA_BASE, min(ENTRADA_MAXIMA, valor))
-    return round(float(valor), 2)
+    return 5.0
 
 
 def _atualizar_estado_execucao():
