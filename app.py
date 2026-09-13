@@ -101,7 +101,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "R55-SEQUENCIA-ABERTURA-CORRETA-2OPS"
+BULLEX_DIAGNOSTIC_VERSION = "R57-SEQUENCIA-CONTAGEM-EXATA-3E5-2OPS"
 
 _bullex_diag = {
     "messages": 0,
@@ -3863,27 +3863,39 @@ def _resultado_retracao_intravela(msg, active_id):
 
     cores = [cor(i) for i in infos]
 
-    # Prioridade para QUINTA_VELA. A sequência é medida nas velas fechadas
-    # imediatamente ANTERIORES à vela que acabou de abrir.
+    # R57: conta a sequência consecutiva REAL a partir da última vela fechada.
+    #
+    # Isso impede a "janela deslizante" das versões anteriores:
+    #   2 velas iguais -> entra SOMENTE na abertura da 3ª;
+    #   3 velas iguais -> NÃO entra na 4ª;
+    #   4 velas iguais -> entra SOMENTE na abertura da 5ª;
+    #   5 ou mais iguais -> NÃO entra na 6ª, 7ª, etc.
+    #
+    # Um DOJI encerra a sequência.
+    ultima_cor = cores[-1]
+    if ultima_cor not in ("VERDE", "VERMELHA"):
+        return None
+
+    quantidade_consecutiva = 0
+    for cor_atual in reversed(cores):
+        if cor_atual != ultima_cor:
+            break
+        quantidade_consecutiva += 1
+
     padrao = None
     direcao = None
-    if cores[-4:] == ["VERDE"] * 4:
+
+    if quantidade_consecutiva == 4:
         padrao = "QUINTA_VELA"
-        direcao = "CALL"
+        direcao = "CALL" if ultima_cor == "VERDE" else "PUT"
         seq_infos = infos[-4:]
-    elif cores[-4:] == ["VERMELHA"] * 4:
-        padrao = "QUINTA_VELA"
-        direcao = "PUT"
-        seq_infos = infos[-4:]
-    elif cores[-2:] == ["VERDE"] * 2:
+    elif quantidade_consecutiva == 2:
         padrao = "TERCEIRA_VELA"
-        direcao = "CALL"
-        seq_infos = infos[-2:]
-    elif cores[-2:] == ["VERMELHA"] * 2:
-        padrao = "TERCEIRA_VELA"
-        direcao = "PUT"
+        direcao = "CALL" if ultima_cor == "VERDE" else "PUT"
         seq_infos = infos[-2:]
     else:
+        # Exatamente 3 impede entrada na 4ª.
+        # 5 ou mais impede entrada na 6ª e seguintes.
         return None
 
     # Evita sequências formadas por doji/corpos muito fracos.
@@ -3960,6 +3972,7 @@ def _resultado_retracao_intravela(msg, active_id):
         "segundos_decorridos": decorridos,
         "segundos_restantes": restantes,
         "padrao_sequencia": padrao,
+        "quantidade_velas_sequencia": quantidade_consecutiva,
         "adx_m15": adx15,
         "distancia_ema_atr": abs(ultimo_close - ema9) / max(abs(ultimo_close), 1e-12),
         "range_ultima_atr": 0.0,
