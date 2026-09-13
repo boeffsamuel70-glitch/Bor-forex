@@ -101,7 +101,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "R54-SEQUENCIA-3E5-MAX2-CORRIGE-INDICADORES"
+BULLEX_DIAGNOSTIC_VERSION = "R55-SEQUENCIA-ABERTURA-CORRETA-2OPS"
 
 _bullex_diag = {
     "messages": 0,
@@ -3818,8 +3818,37 @@ def _resultado_retracao_intravela(msg, active_id):
     if decorridos > 12.0:
         return None
 
-    # Usa SOMENTE velas fechadas anteriores à vela atual.
-    fechadas = somente_velas_fechadas(_candles_cache(active_id, 300), 8)
+    # Usa SOMENTE velas cujo fechamento ocorreu até a abertura da vela atual.
+    # IMPORTANTE: não usa "agora + minutos" aqui, porque isso causava atraso
+    # de uma vela. Ex.: na abertura das 09:05, a vela 09:00-09:05 já está
+    # fechada e DEVE entrar na sequência imediatamente.
+    cache_m5 = ordenar_candles(_candles_cache(active_id, 300))
+    fechadas = []
+
+    for c in cache_m5:
+        try:
+            c_from = int(float(c.get("from")))
+        except Exception:
+            c_from = None
+
+        try:
+            c_to = int(float(c.get("to")))
+        except Exception:
+            c_to = None
+
+        if c_to is None and c_from is not None:
+            c_to = c_from + 300
+
+        if c_to is None:
+            dt = c.get("_dt")
+            if isinstance(dt, datetime):
+                c_to = int(dt.timestamp()) + 300
+
+        # A vela é considerada fechada se terminou ANTES OU EXATAMENTE
+        # na abertura da vela-alvo atual.
+        if c_to is not None and c_to <= candle_from:
+            fechadas.append(c)
+
     if len(fechadas) < 6:
         return None
 
