@@ -101,7 +101,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "R51-SR-M5-REJEICAO-ROMPIMENTO-RETESTE"
+BULLEX_DIAGNOSTIC_VERSION = "R52-SEQUENCIA-M5-3A-5A-VELA"
 
 _bullex_diag = {
     "messages": 0,
@@ -219,6 +219,22 @@ INTRAVELA_PAVIO_MIN_FRACAO_MOVIMENTO = 0.10
 
 UMA_OPERACAO_GLOBAL = False
 MAX_OPERACOES_SIMULTANEAS = 3
+
+# ============================================================
+# R52 - CONTINUAÇÃO DE SEQUÊNCIA M5
+# ============================================================
+# 2 velas fechadas iguais -> prevê a 3ª na mesma direção.
+# 4 velas fechadas iguais -> prevê a 5ª na mesma direção.
+# A 5ª vela tem prioridade quando as duas condições coexistirem.
+SEQUENCIA_RSI_CALL_MIN = 52.0
+SEQUENCIA_RSI_CALL_MAX = 70.0
+SEQUENCIA_RSI_PUT_MIN = 30.0
+SEQUENCIA_RSI_PUT_MAX = 48.0
+SEQUENCIA_BODY_RATIO_MIN = 0.45
+SEQUENCIA_RANGE_ATR_MAX_3 = 1.60
+SEQUENCIA_RANGE_ATR_MAX_5 = 1.35
+SEQUENCIA_ADX_M15_MIN = 20.0
+SEQUENCIA_ADX_M5_MIN = 20.0
 
 # Bloqueio após LOSS desativado nesta versão.
 BLOQUEIO_LOSS_MINUTOS = 0
@@ -3771,84 +3787,173 @@ def _log_fim_diagnostico(active_id, symbol, status, **dados):
 
 
 def _resultado_retracao_intravela(msg, active_id):
-    """R51: S/R M5, rejeição, rompimento+reteste e 2ª tentativa técnica."""
+    """R52 — continuação de sequência M5 para prever a 3ª ou a 5ª vela.
+
+    Regras principais:
+      • 2 velas M5 verdes fechadas -> CALL na abertura da 3ª vela.
+      • 2 velas M5 vermelhas fechadas -> PUT na abertura da 3ª vela.
+      • 4 velas M5 verdes fechadas -> CALL na abertura da 5ª vela.
+      • 4 velas M5 vermelhas fechadas -> PUT na abertura da 5ª vela.
+      • M5 e M15 precisam apontar para a mesma direção.
+      • EMA 9/21 + ADX confirmam a tendência.
+      • RSI confirma momento e bloqueia entradas já excessivamente esticadas.
+      • A sequência é rejeitada se as velas tiverem corpo fraco/doji ou
+        amplitude excessiva em relação ao ATR.
+    """
     if not isinstance(msg, dict):
         return None
+
     _, symbol = _symbol_por_active_id(active_id)
     symbol = symbol or str(active_id)
+
     try:
-        abertura=float(msg["open"]); fechamento=float(msg["close"])
-        maxima=float(msg.get("max",msg.get("high"))); minima=float(msg.get("min",msg.get("low")))
-        candle_from=int(float(msg["from"])); candle_to=int(float(msg.get("to") or candle_from+300))
+        candle_from = int(float(msg["from"]))
+        candle_to = int(float(msg.get("to") or (candle_from + 300)))
+        preco_atual = float(msg.get("close", msg.get("open")))
     except Exception:
         return None
 
-    server_ts,_=_horario_servidor_atual()
-    decorridos=max(0.0,float(server_ts)-candle_from); restantes=max(0.0,candle_to-float(server_ts))
-    gatilho_relogio=str(msg.get("_gatilho","")).startswith("RELOGIO")
-    if not gatilho_relogio and (decorridos < INTRAVELA_MIN_SEGUNDOS_DECORRIDOS or restantes < INTRAVELA_MIN_SEGUNDOS_RESTANTES):
+    # Esta estratégia é de abertura da vela prevista. O relógio M5 já dispara
+    # nos primeiros segundos da nova vela; callbacks atrasados não devem criar
+    # uma entrada tardia.
+    server_ts, _ = _horario_servidor_atual()
+    decorridos = max(0.0, float(server_ts) - candle_from)
+    restantes = max(0.0, candle_to - float(server_ts))
+    if decorridos > 8.0 or restantes < 285.0:
         return None
 
-    suportes,resistencias,atr5=_niveis_sr_m5(active_id)
-    if not atr5 or atr5<=0 or (not suportes and not resistencias):
+    fechadas = somente_velas_fechadas(_candles_cache(active_id, 300), 5)
+    if len(fechadas) < 40:
         return None
-    tol=atr5*SR_RETESTE_TOLERANCIA_ATR
-    amp=max(maxima-minima,atr5*0.02)
-    ctx=_contexto_forca_m15(active_id) or {}; dir15=ctx.get("direcao"); adx15=float(ctx.get("adx") or 0)
-    cand=[]
+    fechadas = fechadas[-80:]
 
-    def add(direcao,tipo,g,score,motivo):
-        if adx15>=32 and dir15 in ("CALL","PUT") and dir15!=direcao and "RETESTE" not in tipo:
-            return
-        tentativa=1
-        with _sr_retry_lock:
-            r=_sr_retry.get(symbol)
-            if r and r.get("direcao")==direcao and abs(float(r.get("nivel",0))-float(g["nivel"]))<=tol:
-                tentativa=int(r.get("tentativas",1))+1
-                if tentativa>SR_MAX_TENTATIVAS_NIVEL: return
-                score+=2; motivo+=" + 2ª tentativa técnica"
-        cand.append({"direcao":direcao,"tipo":tipo,"g":g,"score":score,"motivo":motivo,"tentativa":tentativa})
+    infos = [candle_info(c) for c in fechadas]
+    closes = [float(c["close"]) for c in fechadas]
+    atr5 = atr(fechadas, 14)
+    rsi14 = rsi(closes, 14)
+    ctx5 = _contexto_forca_m5(active_id)
+    ctx15 = _contexto_forca_m15(active_id)
 
-    for g in suportes:
-        n=float(g["nivel"]); tocou=minima<=n+tol and maxima>=n-tol
-        pav=max(min(abertura,fechamento)-minima,0)/amp; pos=(fechamento-minima)/amp
-        if tocou and fechamento>n and (pav>=SR_REJEICAO_PAVIO_MIN or pos>=SR_FECHAMENTO_FORTE_MIN):
-            s=6+min(int(g.get("toques",2)),4)+(1 if fechamento>abertura else 0)+(1 if dir15=="CALL" else 0)
-            add("CALL","SUPORTE_REJEICAO",g,s,"suporte rejeitado")
+    if not atr5 or atr5 <= 0 or rsi14 is None or not ctx5 or not ctx15:
+        return None
 
-    for g in resistencias:
-        n=float(g["nivel"]); tocou=maxima>=n-tol and minima<=n+tol
-        pav=max(maxima-max(abertura,fechamento),0)/amp; pos=(maxima-fechamento)/amp
-        if tocou and fechamento<n and (pav>=SR_REJEICAO_PAVIO_MIN or pos>=SR_FECHAMENTO_FORTE_MIN):
-            s=6+min(int(g.get("toques",2)),4)+(1 if fechamento<abertura else 0)+(1 if dir15=="PUT" else 0)
-            add("PUT","RESISTENCIA_REJEICAO",g,s,"resistência rejeitada")
+    dir5 = ctx5.get("direcao")
+    dir15 = ctx15.get("direcao")
+    adx5 = float(ctx5.get("adx") or 0.0)
+    adx15 = float(ctx15.get("adx") or 0.0)
 
-    fechadas=somente_velas_fechadas(_candles_cache(active_id,300),5)
-    if len(fechadas)>=3:
-        ult=[candle_info(c) for c in fechadas[-3:]]
-        for g in resistencias:
-            n=float(g["nivel"])
-            rompeu=any(i["close"]>n+atr5*SR_ROMPIMENTO_ATR_MIN and i["close"]>i["open"] for i in ult)
-            if rompeu and minima<=n+tol and fechamento>=n:
-                add("CALL","RESISTENCIA_ROMPIDA_RETESTE",g,8+min(int(g.get("toques",2)),3)+(1 if dir15=="CALL" else 0),"resistência rompida virou suporte")
-        for g in suportes:
-            n=float(g["nivel"])
-            rompeu=any(i["close"]<n-atr5*SR_ROMPIMENTO_ATR_MIN and i["close"]<i["open"] for i in ult)
-            if rompeu and maxima>=n-tol and fechamento<=n:
-                add("PUT","SUPORTE_ROMPIDO_RETESTE",g,8+min(int(g.get("toques",2)),3)+(1 if dir15=="PUT" else 0),"suporte rompido virou resistência")
-    if not cand: return None
-    cand.sort(key=lambda c:(c["score"],int(c["g"].get("toques",0)),-abs(fechamento-float(c["g"]["nivel"]))/atr5),reverse=True)
-    m=cand[0]; direcao=m["direcao"]; nivel=float(m["g"]["nivel"]); toques=int(m["g"].get("toques",0)); score=int(m["score"])
-    _log_fim_diagnostico(active_id,symbol,"SR_SINAL_APROVADO",direcao=direcao,tipo=m["tipo"],score=score,nivel=nivel,toques=toques,tentativa=m["tentativa"])
+    if dir5 not in ("CALL", "PUT") or dir5 != dir15:
+        return None
+    if adx5 < SEQUENCIA_ADX_M5_MIN or adx15 < SEQUENCIA_ADX_M15_MIN:
+        return None
+
+    def cor(info):
+        if info["close"] > info["open"]:
+            return "CALL"
+        if info["close"] < info["open"]:
+            return "PUT"
+        return "DOJI"
+
+    def bloco_valido(bloco, direcao, range_atr_max):
+        if not bloco or any(cor(i) != direcao for i in bloco):
+            return False
+        if any(float(i.get("body_ratio") or 0.0) < SEQUENCIA_BODY_RATIO_MIN for i in bloco):
+            return False
+        if any((float(i.get("range") or 0.0) / atr5) > range_atr_max for i in bloco):
+            return False
+        return True
+
+    # A quinta vela tem prioridade. Se existem 4 velas iguais, não queremos
+    # classificá-la também como uma simples entrada de terceira vela.
+    tipo_entrada = None
+    qtd_sequencia = 0
+    bloco = None
+    if len(infos) >= 4 and bloco_valido(infos[-4:], dir5, SEQUENCIA_RANGE_ATR_MAX_5):
+        tipo_entrada = "QUINTA_VELA"
+        qtd_sequencia = 4
+        bloco = infos[-4:]
+    elif len(infos) >= 2 and bloco_valido(infos[-2:], dir5, SEQUENCIA_RANGE_ATR_MAX_3):
+        tipo_entrada = "TERCEIRA_VELA"
+        qtd_sequencia = 2
+        bloco = infos[-2:]
+    else:
+        return None
+
+    # RSI: confirma o lado, mas evita comprar/vender quando o movimento já
+    # está excessivamente esticado.
+    if dir5 == "CALL":
+        if not (SEQUENCIA_RSI_CALL_MIN <= rsi14 <= SEQUENCIA_RSI_CALL_MAX):
+            return None
+    else:
+        if not (SEQUENCIA_RSI_PUT_MIN <= rsi14 <= SEQUENCIA_RSI_PUT_MAX):
+            return None
+
+    ema9 = float(ctx5.get("ema9") or 0.0)
+    ema21 = float(ctx5.get("ema21") or 0.0)
+    if dir5 == "CALL" and not (preco_atual >= ema9 > ema21):
+        return None
+    if dir5 == "PUT" and not (preco_atual <= ema9 < ema21):
+        return None
+
+    # Qualidade da sequência: corpos consistentes sem aceleração exagerada.
+    corpos = [float(i["body"]) for i in bloco]
+    ranges = [float(i["range"]) for i in bloco]
+    corpo_medio = sum(corpos) / len(corpos)
+    body_ratio_medio = sum(float(i["body_ratio"]) for i in bloco) / len(bloco)
+    range_medio_atr = (sum(ranges) / len(ranges)) / atr5
+
+    score = 8 if tipo_entrada == "TERCEIRA_VELA" else 9
+    if adx15 >= 25:
+        score += 1
+    if adx5 >= 25:
+        score += 1
+    if body_ratio_medio >= 0.60:
+        score += 1
+
+    # Na quinta vela penalizamos um pouco a exaustão: a última vela da
+    # sequência não pode ter explodido em tamanho em relação à média anterior.
+    if tipo_entrada == "QUINTA_VELA" and len(corpos) >= 4:
+        media_anteriores = sum(corpos[:-1]) / max(1, len(corpos) - 1)
+        if media_anteriores > 0 and corpos[-1] > media_anteriores * 1.65:
+            return None
+
     return {
-      "sinal":direcao,"score":score,"score_call":score if direcao=="CALL" else 0,"score_put":score if direcao=="PUT" else 0,
-      "preco":fechamento,"vela":datetime.fromtimestamp(candle_from,TZ),"estrategia":"SR_M5_REJEICAO_ROMPIMENTO_RETESTE",
-      "regime":m["tipo"],"pullback":m["tipo"],"rejeicao":m["motivo"],"lateral":"N/A","atr":atr5,"rsi":None,"ema5":None,"ema13":None,"ema21":None,
-      "tendencia_5m":m["tipo"],"tendencia_15m":f"{dir15 or 'NEUTRO'} | ADX {adx15:.1f}","zona_fibonacci":f"{m['tipo']} @ {nivel:.6f}",
-      "bloqueio":"SINAL","mensagem":f"{direcao} S/R | {m['tipo']} | score={score} | nível={nivel:.6f} | toques={toques} | tentativa={m['tentativa']}/2",
-      "candle_from":candle_from,"candle_to":candle_to,"segundos_decorridos":decorridos,"segundos_restantes":restantes,
-      "nivel_m5":nivel,"tipo_nivel":m["tipo"],"toques_nivel":toques,"distancia_abertura_nivel":abs(abertura-nivel)/atr5,"tentativa_nivel":m["tentativa"],
-      "adx_m15":adx15,"distancia_ema_atr":abs(fechamento-nivel)/atr5,"range_ultima_atr":amp/atr5
+        "sinal": dir5,
+        "score": score,
+        "score_call": score if dir5 == "CALL" else 0,
+        "score_put": score if dir5 == "PUT" else 0,
+        "preco": preco_atual,
+        "vela": datetime.fromtimestamp(candle_from, TZ),
+        "estrategia": "SEQUENCIA_M5_TENDENCIA",
+        "regime": tipo_entrada,
+        "padrao_sequencia": tipo_entrada,
+        "quantidade_velas_sequencia": qtd_sequencia,
+        "pullback": tipo_entrada,
+        "rejeicao": f"{qtd_sequencia} velas consecutivas {dir5}",
+        "lateral": "NAO",
+        "atr": atr5,
+        "rsi": rsi14,
+        "ema5": None,
+        "ema13": ema9,
+        "ema21": ema21,
+        "tendencia_5m": f"{dir5} | ADX {adx5:.1f}",
+        "tendencia_15m": f"{dir15} | ADX {adx15:.1f}",
+        "zona_fibonacci": tipo_entrada,
+        "bloqueio": "SINAL",
+        "mensagem": (
+            f"{dir5} {tipo_entrada} | sequência={qtd_sequencia} | "
+            f"RSI={rsi14:.1f} | ADX5={adx5:.1f} | ADX15={adx15:.1f}"
+        ),
+        "candle_from": candle_from,
+        "candle_to": candle_to,
+        "segundos_decorridos": decorridos,
+        "segundos_restantes": restantes,
+        "adx_m15": adx15,
+        "adx_m5": adx5,
+        "distancia_ema_atr": abs(preco_atual - ema9) / atr5,
+        "range_ultima_atr": float(bloco[-1]["range"]) / atr5,
+        "body_ratio_medio": body_ratio_medio,
+        "range_medio_atr": range_medio_atr,
     }
 
 def _atualizar_dashboard_intravela(symbol, resultado):
@@ -3867,12 +3972,12 @@ def _atualizar_dashboard_intravela(symbol, resultado):
     estado["detalhes"] = {
         "score_call": resultado.get("score_call", "-"),
         "score_put": resultado.get("score_put", "-"),
-        "rsi": "-",
+        "rsi": (f"{resultado['rsi']:.2f}" if isinstance(resultado.get("rsi"), (int, float)) else "-"),
         "ema5": "-",
-        "ema13": "-",
-        "ema21": "-",
+        "ema13": (f"{resultado['ema13']:.6f}" if isinstance(resultado.get("ema13"), (int, float)) else "-"),
+        "ema21": (f"{resultado['ema21']:.6f}" if isinstance(resultado.get("ema21"), (int, float)) else "-"),
         "tendencia_5m": resultado.get("tendencia_5m", "-"),
-        "tendencia_15m": "N/A",
+        "tendencia_15m": resultado.get("tendencia_15m", "-"),
         "pullback": resultado.get("pullback", "-"),
         "confirmacao": resultado.get("rejeicao", "-"),
         "lateral": "N/A",
@@ -3882,7 +3987,7 @@ def _atualizar_dashboard_intravela(symbol, resultado):
         ),
         "bloqueio": resultado.get("bloqueio", "-"),
         "regime": "INTRAVELA",
-        "estrategia": "SR_M5_REJEICAO_ROMPIMENTO_RETESTE",
+        "estrategia": "SEQUENCIA_M5_TENDENCIA",
         "zona_fibonacci": "-",
     }
 
@@ -4172,7 +4277,7 @@ def _disparar_fim_m5_pelo_relogio():
 
         _atualizar_dashboard_intravela(symbol, resultado)
         log(
-            f"[INTRAVELA][TOP3-SR] {symbol} -> {resultado['sinal']} | "
+            f"[INTRAVELA][TOP3-SEQUENCIA] {symbol} -> {resultado['sinal']} | "
             f"score={resultado['score']} | ADX={resultado.get('adx_m15', 0):.1f} | "
             f"distEMA={resultado.get('distancia_ema_atr', 0):.2f}ATR | "
             f"{resultado['pullback']} | preco={resultado['preco']:.5f}"
@@ -4182,7 +4287,7 @@ def _disparar_fim_m5_pelo_relogio():
             target=registrar_operacao_intravela,
             args=(symbol, resultado),
             daemon=True,
-            name=f"intravela-top3-sr-{codigo}-{resultado['candle_from']}",
+            name=f"intravela-top3-sequencia-{codigo}-{resultado['candle_from']}",
         ).start()
 
 def _loop_gatilho_relogio_m5():
@@ -4236,28 +4341,28 @@ def _processar_sinal_intravela(active_id, msg):
 
 
 def calcular_estatisticas_por_estrategia():
-    wins = losses = dojis = 0
-    for item in _historico_resultados:
-        if item.get("estrategia") != "SR_M5_REJEICAO_ROMPIMENTO_RETESTE":
-            continue
-        r = item.get("resultado")
-        if r == "WIN":
-            wins += 1
-        elif r == "LOSS":
-            losses += 1
-        elif r == "DOJI":
-            dojis += 1
-    total = wins + losses + dojis
-    decididos = wins + losses
-    return {
-        "SR_M5_REJEICAO_ROMPIMENTO_RETESTE": {
-            "total": total,
-            "wins": wins,
-            "losses": losses,
-            "dojis": dojis,
-            "taxa": round(wins / decididos * 100 if decididos else 0.0, 2),
-        }
+    """Estatísticas separadas: entradas para a 3ª e para a 5ª vela."""
+    grupos = {
+        "TERCEIRA_VELA": {"total": 0, "wins": 0, "losses": 0, "dojis": 0, "taxa": 0.0},
+        "QUINTA_VELA": {"total": 0, "wins": 0, "losses": 0, "dojis": 0, "taxa": 0.0},
     }
+    for item in _historico_resultados:
+        if item.get("estrategia") != "SEQUENCIA_M5_TENDENCIA":
+            continue
+        padrao = item.get("padrao_sequencia") or item.get("regime")
+        if padrao not in grupos:
+            continue
+        g = grupos[padrao]
+        r = item.get("resultado")
+        g["total"] += 1
+        if r == "WIN": g["wins"] += 1
+        elif r == "LOSS": g["losses"] += 1
+        elif r == "DOJI": g["dojis"] += 1
+
+    for g in grupos.values():
+        decididos = g["wins"] + g["losses"]
+        g["taxa"] = round(g["wins"] / decididos * 100 if decididos else 0.0, 2)
+    return grupos
 
 
 # ============================================================
@@ -4427,6 +4532,7 @@ def enviar_sinal_telegram(
         f"Direcao: {sinal}\n"
         f"Score: {resultado.get('score', 0)}\n"
         f"Estrategia: {resultado.get('estrategia', '-')}\n"
+        f"Padrao: {resultado.get('padrao_sequencia', '-')}\n"
         f"Regime: {resultado.get('regime', '-')}\n"
         f"Preco: {fmt(resultado.get('preco'))}\n"
         f"Vela analisada: "
@@ -4501,7 +4607,7 @@ def registrar_operacao_intravela(symbol, resultado):
         "symbol": symbol,
         "sinal": sinal,
         "score": resultado.get("score", 0),
-        "estrategia": "SR_M5_REJEICAO_ROMPIMENTO_RETESTE",
+        "estrategia": "SEQUENCIA_M5_TENDENCIA",
         "regime": "INTRAVELA",
         "preco_sinal": float(resultado["preco"]),
         "vela_sinal": candle_dt,
@@ -4522,6 +4628,11 @@ def registrar_operacao_intravela(symbol, resultado):
         "tipo_nivel": resultado.get("tipo_nivel"),
         "toques_nivel": resultado.get("toques_nivel"),
         "distancia_abertura_nivel": resultado.get("distancia_abertura_nivel"),
+        "padrao_sequencia": resultado.get("padrao_sequencia"),
+        "quantidade_velas_sequencia": resultado.get("quantidade_velas_sequencia"),
+        "rsi_entrada": resultado.get("rsi"),
+        "adx_m5": resultado.get("adx_m5"),
+        "adx_m15": resultado.get("adx_m15"),
     }
 
     # Registro e liberação da reserva acontecem sob o mesmo lock: não existe
@@ -4539,14 +4650,6 @@ def registrar_operacao_intravela(symbol, resultado):
         ):
             _operacao_global_ativa = None
 
-    if resultado.get("nivel_m5") is not None:
-        with _sr_retry_lock:
-            _sr_retry[symbol] = {
-                "nivel": float(resultado["nivel_m5"]), "direcao": sinal,
-                "tipo_nivel": resultado.get("tipo_nivel"),
-                "tentativas": int(resultado.get("tentativa_nivel", 1)),
-                "atr": float(resultado.get("atr") or 0.0),
-            }
 
     log(
         f"[INTRAVELA] {symbol}: operação registrada {sinal} | "
@@ -4625,12 +4728,6 @@ def avaliar_operacao(symbol, candles):
         _historico_resultados.append(operacao.copy())
         del _operacoes_pendentes[symbol]
 
-        with _sr_retry_lock:
-            retry = _sr_retry.get(symbol)
-            if resultado != "LOSS":
-                _sr_retry.pop(symbol, None)
-            elif retry and int(retry.get("tentativas", 1)) >= SR_MAX_TENTATIVAS_NIVEL:
-                _sr_retry.pop(symbol, None)
 
         with _execucao_lock:
             if (
@@ -4699,7 +4796,7 @@ def enviar_resultado_telegram(
         f"Ativo: {operacao['symbol']}\n"
         f"Direcao: {operacao['sinal']}\n"
         f"Estrategia: {operacao.get('estrategia', '-')}\n"
-        f"Regime: {operacao.get('regime', '-')}\n"
+        f"Padrao: {operacao.get('padrao_sequencia') or operacao.get('regime', '-')}\n"
         f"Resultado: {resultado}\n"
         + f"\nEntrada: {fmt(operacao.get('entrada'))}\n"
         f"Saida: {fmt(operacao.get('saida'))}\n"
