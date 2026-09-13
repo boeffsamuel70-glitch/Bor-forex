@@ -101,7 +101,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "R53-SEQUENCIA-ENTRA-NA-ABERTURA-3E5"
+BULLEX_DIAGNOSTIC_VERSION = "R54-SEQUENCIA-3E5-MAX2-CORRIGE-INDICADORES"
 
 _bullex_diag = {
     "messages": 0,
@@ -218,7 +218,7 @@ INTRAVELA_REJEICAO_ATR_MIN = 0.10
 INTRAVELA_PAVIO_MIN_FRACAO_MOVIMENTO = 0.10
 
 UMA_OPERACAO_GLOBAL = False
-MAX_OPERACOES_SIMULTANEAS = 3
+MAX_OPERACOES_SIMULTANEAS = 2
 
 # ============================================================
 # R52 - CONTINUAÇÃO DE SEQUÊNCIA M5
@@ -3878,9 +3878,11 @@ def _resultado_retracao_intravela(msg, active_id):
     if len(closes) < 21:
         return None
 
-    ema9 = ema(closes, 9)[-1]
-    ema21 = ema(closes, 21)[-1]
-    rsi14 = rsi(closes, 14)[-1] if len(closes) >= 15 else 50.0
+    ema9 = ema(closes, 9)
+    ema21 = ema(closes, 21)
+    rsi14 = rsi(closes, 14) if len(closes) >= 15 else 50.0
+    if ema9 is None or ema21 is None or rsi14 is None:
+        return None
     ultimo_close = closes[-1]
 
     if direcao == "CALL":
