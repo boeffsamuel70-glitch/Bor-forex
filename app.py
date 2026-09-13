@@ -101,7 +101,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "R57-SEQUENCIA-CONTAGEM-EXATA-3E5-2OPS"
+BULLEX_DIAGNOSTIC_VERSION = "R58-PULLBACK-TENDENCIA-EMA-ADX-RSI-2OPS"
 
 _bullex_diag = {
     "messages": 0,
@@ -221,7 +221,7 @@ UMA_OPERACAO_GLOBAL = False
 MAX_OPERACOES_SIMULTANEAS = 2
 
 # ============================================================
-# R52 - CONTINUAÇÃO DE SEQUÊNCIA M5
+# R58 - PARÂMETROS LEGADOS (mantidos por compatibilidade)
 # ============================================================
 # 2 velas fechadas iguais -> prevê a 3ª na mesma direção.
 # 4 velas fechadas iguais -> prevê a 5ª na mesma direção.
@@ -3787,16 +3787,23 @@ def _log_fim_diagnostico(active_id, symbol, status, **dados):
 
 
 def _resultado_retracao_intravela(msg, active_id):
-    """R53 — sequência 3ª/5ª vela entrando NA ABERTURA da vela-alvo.
+    """R58 — estratégia nova: pullback de tendência confirmado.
 
-    Regra correta:
-      • 2 velas fechadas verdes -> CALL assim que abre a 3ª vela.
-      • 2 velas fechadas vermelhas -> PUT assim que abre a 3ª vela.
-      • 4 velas fechadas verdes -> CALL assim que abre a 5ª vela.
-      • 4 velas fechadas vermelhas -> PUT assim que abre a 5ª vela.
+    Entrada sempre na ABERTURA de uma nova vela M5, usando apenas velas
+    anteriores já fechadas.
 
-    A vela-alvo NÃO precisa fechar. O sinal é decidido usando apenas velas
-    anteriores já fechadas + contexto EMA/ADX/RSI/tendência.
+    CALL:
+      1) M15 em tendência de alta: EMA20 > EMA50, EMA20 subindo e ADX >= 22.
+      2) M5 alinhado: EMA9 > EMA20 > EMA50 e ADX >= 18.
+      3) Penúltima vela faz retração contra a tendência e toca/procura a EMA20.
+      4) Última vela confirma a retomada: verde, corpo forte e fecha acima da
+         máxima da vela de retração.
+      5) RSI entre 52 e 68 para evitar entrada já excessivamente esticada.
+
+    PUT é o espelho da regra acima.
+
+    A ideia é operar CONTINUAÇÃO depois de um pullback real, em vez de prever
+    apenas pela cor/sequência das velas.
     """
     if not isinstance(msg, dict):
         return None
@@ -3811,136 +3818,205 @@ def _resultado_retracao_intravela(msg, active_id):
     except Exception:
         return None
 
-    # Só queremos uma decisão logo no começo da vela-alvo.
     server_ts, _ = _horario_servidor_atual()
     decorridos = max(0.0, float(server_ts) - candle_from)
     restantes = max(0.0, candle_to - float(server_ts))
+
+    # Só entra perto da abertura da nova vela M5.
     if decorridos > 12.0:
         return None
 
-    # Usa SOMENTE velas cujo fechamento ocorreu até a abertura da vela atual.
-    # IMPORTANTE: não usa "agora + minutos" aqui, porque isso causava atraso
-    # de uma vela. Ex.: na abertura das 09:05, a vela 09:00-09:05 já está
-    # fechada e DEVE entrar na sequência imediatamente.
-    cache_m5 = ordenar_candles(_candles_cache(active_id, 300))
-    fechadas = []
+    def fechadas_ate_abertura(size, duracao):
+        """Retorna somente candles encerrados até candle_from."""
+        resultado = []
+        for c in ordenar_candles(_candles_cache(active_id, size)):
+            try:
+                c_from = int(float(c.get("from")))
+            except Exception:
+                c_from = None
 
-    for c in cache_m5:
-        try:
-            c_from = int(float(c.get("from")))
-        except Exception:
-            c_from = None
+            try:
+                c_to = int(float(c.get("to")))
+            except Exception:
+                c_to = None
 
-        try:
-            c_to = int(float(c.get("to")))
-        except Exception:
-            c_to = None
+            if c_to is None and c_from is not None:
+                c_to = c_from + duracao
 
-        if c_to is None and c_from is not None:
-            c_to = c_from + 300
+            if c_to is None:
+                dt = c.get("_dt")
+                if isinstance(dt, datetime):
+                    c_to = int(dt.timestamp()) + duracao
 
-        if c_to is None:
-            dt = c.get("_dt")
-            if isinstance(dt, datetime):
-                c_to = int(dt.timestamp()) + 300
+            if c_to is not None and c_to <= candle_from:
+                resultado.append(c)
 
-        # A vela é considerada fechada se terminou ANTES OU EXATAMENTE
-        # na abertura da vela-alvo atual.
-        if c_to is not None and c_to <= candle_from:
-            fechadas.append(c)
+        return resultado
 
-    if len(fechadas) < 6:
+    m5 = fechadas_ate_abertura(300, 300)
+    m15 = fechadas_ate_abertura(900, 900)
+
+    if len(m5) < 60 or len(m15) < 55:
         return None
 
-    infos = [candle_info(c) for c in fechadas[-6:]]
+    m5 = m5[-90:]
+    m15 = m15[-80:]
 
-    def cor(info):
-        if info["close"] > info["open"]:
-            return "VERDE"
-        if info["close"] < info["open"]:
-            return "VERMELHA"
-        return "DOJI"
+    closes5 = [float(c["close"]) for c in m5]
+    closes15 = [float(c["close"]) for c in m15]
 
-    cores = [cor(i) for i in infos]
+    # -----------------------------
+    # CONTEXTO M15
+    # -----------------------------
+    ema20_15 = ema(closes15, 20)
+    ema50_15 = ema(closes15, 50)
+    ema20_15_prev = ema(closes15[:-3], 20) if len(closes15) >= 53 else None
+    adx15 = adx(m15, 14)
 
-    # R57: conta a sequência consecutiva REAL a partir da última vela fechada.
-    #
-    # Isso impede a "janela deslizante" das versões anteriores:
-    #   2 velas iguais -> entra SOMENTE na abertura da 3ª;
-    #   3 velas iguais -> NÃO entra na 4ª;
-    #   4 velas iguais -> entra SOMENTE na abertura da 5ª;
-    #   5 ou mais iguais -> NÃO entra na 6ª, 7ª, etc.
-    #
-    # Um DOJI encerra a sequência.
-    ultima_cor = cores[-1]
-    if ultima_cor not in ("VERDE", "VERMELHA"):
+    # -----------------------------
+    # CONTEXTO M5
+    # -----------------------------
+    ema9_5 = ema(closes5, 9)
+    ema20_5 = ema(closes5, 20)
+    ema50_5 = ema(closes5, 50)
+    ema20_series_5 = ema_series(closes5, 20)
+    ema50_series_5 = ema_series(closes5, 50)
+
+    rsi14 = rsi(closes5, 14)
+    atr14 = atr(m5, 14)
+    adx5 = adx(m5, 14)
+
+    if any(v is None for v in (
+        ema20_15, ema50_15, ema20_15_prev, adx15,
+        ema9_5, ema20_5, ema50_5, rsi14, atr14, adx5
+    )):
         return None
 
-    quantidade_consecutiva = 0
-    for cor_atual in reversed(cores):
-        if cor_atual != ultima_cor:
-            break
-        quantidade_consecutiva += 1
+    if atr14 <= 0:
+        return None
 
-    padrao = None
+    # Tendência precisa ter força mínima.
+    if adx15 < 22.0 or adx5 < 18.0:
+        return None
+
+    retracao = candle_info(m5[-2])
+    confirmacao = candle_info(m5[-1])
+
+    ema20_retracao = ema20_series_5[-2]
+    ema50_retracao = ema50_series_5[-2]
+    if ema20_retracao is None or ema50_retracao is None:
+        return None
+
+    # Qualidade estrutural da vela de confirmação.
+    corpo_confirmacao_atr = confirmacao["body"] / atr14
+    range_confirmacao_atr = confirmacao["range"] / atr14
+    range_retracao_atr = retracao["range"] / atr14
+
+    if not (0.25 <= corpo_confirmacao_atr <= 1.20):
+        return None
+    if range_confirmacao_atr > 1.55 or range_retracao_atr > 1.70:
+        return None
+    if confirmacao["body_ratio"] < 0.50:
+        return None
+
     direcao = None
 
-    if quantidade_consecutiva == 4:
-        padrao = "QUINTA_VELA"
-        direcao = "CALL" if ultima_cor == "VERDE" else "PUT"
-        seq_infos = infos[-4:]
-    elif quantidade_consecutiva == 2:
-        padrao = "TERCEIRA_VELA"
-        direcao = "CALL" if ultima_cor == "VERDE" else "PUT"
-        seq_infos = infos[-2:]
-    else:
-        # Exatamente 3 impede entrada na 4ª.
-        # 5 ou mais impede entrada na 6ª e seguintes.
+    # ==========================================================
+    # CALL
+    # ==========================================================
+    tendencia15_call = (
+        ema20_15 > ema50_15
+        and ema20_15 > ema20_15_prev
+        and closes15[-1] > ema20_15
+    )
+
+    alinhamento5_call = (
+        ema9_5 > ema20_5 > ema50_5
+    )
+
+    # Retração real: vela contra a tendência, procurando a EMA20,
+    # mas sem perder completamente a estrutura da EMA50.
+    toque_ema20_call = (
+        retracao["low"] <= ema20_retracao + (0.15 * atr14)
+        and retracao["close"] >= ema50_retracao - (0.10 * atr14)
+    )
+
+    confirmacao_call = (
+        confirmacao["close"] > confirmacao["open"]
+        and confirmacao["close"] > retracao["high"]
+        and confirmacao["close"] > ema9_5
+        and (
+            (confirmacao["close"] - confirmacao["low"])
+            / max(confirmacao["range"], 1e-12)
+        ) >= 0.70
+    )
+
+    retracao_call = retracao["close"] < retracao["open"]
+
+    if (
+        tendencia15_call
+        and alinhamento5_call
+        and retracao_call
+        and toque_ema20_call
+        and confirmacao_call
+        and 52.0 <= rsi14 <= 68.0
+    ):
+        direcao = "CALL"
+
+    # ==========================================================
+    # PUT
+    # ==========================================================
+    tendencia15_put = (
+        ema20_15 < ema50_15
+        and ema20_15 < ema20_15_prev
+        and closes15[-1] < ema20_15
+    )
+
+    alinhamento5_put = (
+        ema9_5 < ema20_5 < ema50_5
+    )
+
+    toque_ema20_put = (
+        retracao["high"] >= ema20_retracao - (0.15 * atr14)
+        and retracao["close"] <= ema50_retracao + (0.10 * atr14)
+    )
+
+    confirmacao_put = (
+        confirmacao["close"] < confirmacao["open"]
+        and confirmacao["close"] < retracao["low"]
+        and confirmacao["close"] < ema9_5
+        and (
+            (confirmacao["high"] - confirmacao["close"])
+            / max(confirmacao["range"], 1e-12)
+        ) >= 0.70
+    )
+
+    retracao_put = retracao["close"] > retracao["open"]
+
+    if (
+        direcao is None
+        and tendencia15_put
+        and alinhamento5_put
+        and retracao_put
+        and toque_ema20_put
+        and confirmacao_put
+        and 32.0 <= rsi14 <= 48.0
+    ):
+        direcao = "PUT"
+
+    if direcao is None:
         return None
 
-    # Evita sequências formadas por doji/corpos muito fracos.
-    for i in seq_infos:
-        amplitude = max(i["high"] - i["low"], 1e-12)
-        corpo_ratio = abs(i["close"] - i["open"]) / amplitude
-        if corpo_ratio < 0.42:
-            return None
-
-    # Tendência e força M15.
-    ctx15 = _contexto_forca_m15(active_id)
-    dir15 = (ctx15 or {}).get("direcao")
-    adx15 = float((ctx15 or {}).get("adx") or 0.0)
-    if dir15 not in ("CALL", "PUT") or dir15 != direcao:
-        return None
-    if adx15 < 18.0:
-        return None
-
-    # EMA 9/21 e RSI no M5.
-    closes = [float(c["close"]) for c in fechadas[-30:]]
-    if len(closes) < 21:
-        return None
-
-    ema9 = ema(closes, 9)
-    ema21 = ema(closes, 21)
-    rsi14 = rsi(closes, 14) if len(closes) >= 15 else 50.0
-    if ema9 is None or ema21 is None or rsi14 is None:
-        return None
-    ultimo_close = closes[-1]
-
-    if direcao == "CALL":
-        if not (ema9 > ema21 and ultimo_close > ema9):
-            return None
-        # Confirma força sem entrar já extremamente esticado.
-        if not (52.0 <= rsi14 <= 72.0):
-            return None
-    else:
-        if not (ema9 < ema21 and ultimo_close < ema9):
-            return None
-        if not (28.0 <= rsi14 <= 48.0):
-            return None
-
-    # Score separado por padrão para facilitar análise.
-    score = 10 if padrao == "QUINTA_VELA" else 9
-    score += 1 if adx15 >= 24 else 0
+    # Score serve apenas para ranquear os sinais simultâneos.
+    score = 10
+    if adx15 >= 28.0:
+        score += 1
+    if adx5 >= 24.0:
+        score += 1
+    if direcao == "CALL" and 55.0 <= rsi14 <= 64.0:
+        score += 1
+    if direcao == "PUT" and 36.0 <= rsi14 <= 45.0:
+        score += 1
 
     return {
         "sinal": direcao,
@@ -3949,33 +4025,38 @@ def _resultado_retracao_intravela(msg, active_id):
         "score_put": score if direcao == "PUT" else 0,
         "preco": preco_atual,
         "vela": datetime.fromtimestamp(candle_from, TZ),
-        "estrategia": "SEQUENCIA_3_5_TENDENCIA",
-        "regime": padrao,
-        "pullback": padrao,
-        "rejeicao": f"{padrao} | entrada na abertura da vela-alvo",
-        "lateral": "N/A",
-        "atr": None,
+        "estrategia": "PULLBACK_TENDENCIA_CONFIRMADO",
+        "regime": "PULLBACK_EMA20",
+        "pullback": "EMA20 + vela de retracao",
+        "rejeicao": "confirmacao rompe extrema da retracao",
+        "lateral": "NAO",
+        "atr": atr14,
         "rsi": rsi14,
-        "ema5": None,
-        "ema13": ema9,
-        "ema21": ema21,
-        "tendencia_5m": f"{direcao} | EMA9/EMA21",
-        "tendencia_15m": f"{dir15} | ADX {adx15:.1f}",
-        "zona_fibonacci": padrao,
+        "ema5": ema9_5,
+        "ema13": ema20_5,
+        "ema21": ema50_5,
+        "tendencia_5m": (
+            f"{direcao} | EMA9/20/50 | ADX {adx5:.1f}"
+        ),
+        "tendencia_15m": (
+            f"{direcao} | EMA20/50 | ADX {adx15:.1f}"
+        ),
+        "zona_fibonacci": "N/A",
         "bloqueio": "SINAL",
         "mensagem": (
-            f"{direcao} {padrao} | entrada na ABERTURA | "
-            f"ADX15={adx15:.1f} | RSI={rsi14:.1f}"
+            f"{direcao} PULLBACK EMA20 CONFIRMADO | "
+            f"ADX5={adx5:.1f} | ADX15={adx15:.1f} | RSI={rsi14:.1f}"
         ),
         "candle_from": candle_from,
         "candle_to": candle_to,
         "segundos_decorridos": decorridos,
         "segundos_restantes": restantes,
-        "padrao_sequencia": padrao,
-        "quantidade_velas_sequencia": quantidade_consecutiva,
+        "padrao_sequencia": "PULLBACK_EMA20",
+        "quantidade_velas_sequencia": 0,
+        "adx_m5": adx5,
         "adx_m15": adx15,
-        "distancia_ema_atr": abs(ultimo_close - ema9) / max(abs(ultimo_close), 1e-12),
-        "range_ultima_atr": 0.0,
+        "distancia_ema_atr": abs(closes5[-1] - ema20_5) / atr14,
+        "range_ultima_atr": range_confirmacao_atr,
     }
 
 def _atualizar_dashboard_intravela(symbol, resultado):
@@ -4363,27 +4444,38 @@ def _processar_sinal_intravela(active_id, msg):
 
 
 def calcular_estatisticas_por_estrategia():
-    """Estatísticas separadas: entradas para a 3ª e para a 5ª vela."""
+    """Estatísticas da estratégia R58 de pullback confirmado."""
     grupos = {
-        "TERCEIRA_VELA": {"total": 0, "wins": 0, "losses": 0, "dojis": 0, "taxa": 0.0},
-        "QUINTA_VELA": {"total": 0, "wins": 0, "losses": 0, "dojis": 0, "taxa": 0.0},
+        "PULLBACK_EMA20": {
+            "total": 0,
+            "wins": 0,
+            "losses": 0,
+            "dojis": 0,
+            "taxa": 0.0,
+        },
     }
-    for item in _historico_resultados:
-        if item.get("estrategia") != "SEQUENCIA_M5_TENDENCIA":
-            continue
-        padrao = item.get("padrao_sequencia") or item.get("regime")
-        if padrao not in grupos:
-            continue
-        g = grupos[padrao]
-        r = item.get("resultado")
-        g["total"] += 1
-        if r == "WIN": g["wins"] += 1
-        elif r == "LOSS": g["losses"] += 1
-        elif r == "DOJI": g["dojis"] += 1
 
-    for g in grupos.values():
-        decididos = g["wins"] + g["losses"]
-        g["taxa"] = round(g["wins"] / decididos * 100 if decididos else 0.0, 2)
+    for item in _historico_resultados:
+        if item.get("estrategia") != "PULLBACK_TENDENCIA_CONFIRMADO":
+            continue
+
+        g = grupos["PULLBACK_EMA20"]
+        resultado = item.get("resultado")
+        g["total"] += 1
+
+        if resultado == "WIN":
+            g["wins"] += 1
+        elif resultado == "LOSS":
+            g["losses"] += 1
+        elif resultado == "DOJI":
+            g["dojis"] += 1
+
+    g = grupos["PULLBACK_EMA20"]
+    decididos = g["wins"] + g["losses"]
+    g["taxa"] = round(
+        g["wins"] / decididos * 100 if decididos else 0.0,
+        2,
+    )
     return grupos
 
 
@@ -5759,7 +5851,7 @@ def health():
 
 _atualizar_estado_execucao()
 
-log(f"AUTO TRADE DEMO={'ATIVO' if BULLEX_AUTO_TRADE else 'DESATIVADO'} | gestao=R$6 -> WIN -> R$9 -> volta R$6 | LOSS -> R$6")
+log(f"AUTO TRADE={'ATIVO' if BULLEX_AUTO_TRADE else 'DESATIVADO'} | estrategia=R58 PULLBACK EMA20 CONFIRMADO | max_ops={MAX_OPERACOES_SIMULTANEAS}")
 log(f"BULLEX_USER_BALANCE_ID={'CONFIGURADO' if BULLEX_USER_BALANCE_ID else 'AUSENTE'}")
 
 log(
