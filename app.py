@@ -101,7 +101,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "R58-PULLBACK-TENDENCIA-EMA-ADX-RSI-2OPS"
+BULLEX_DIAGNOSTIC_VERSION = "R59-PULLBACK-PROGRESSAO-5-6-12-25-MAX1"
 
 _bullex_diag = {
     "messages": 0,
@@ -152,14 +152,14 @@ BULLEX_USER_BALANCE_ID = os.getenv(
     ""
 ).strip()
 
-VALORES_ENTRADA = [6.00, 7.00, 8.00, 9.00]
+VALORES_ENTRADA = [5.00, 6.00, 12.00, 25.00]
 
 # ============================================================
 # GERENCIAMENTO AUTÔNOMO DE BANCA
 # ============================================================
 # Valores padrão podem ser alterados no Render sem editar o código.
-ENTRADA_BASE = 5.0  # R50: mão fixa de R$5
-ENTRADA_MAXIMA = 5.0  # R50: sem progressão; mão fixa de R$5
+ENTRADA_BASE = 5.0  # R59: primeira entrada R$5
+ENTRADA_MAXIMA = 25.0  # R59: teto da progressão após LOSS
 META_LUCRO_DIA = float(os.getenv("META_LUCRO_DIA", "100").replace(",", "."))
 STOP_LOSS_DIA = float(os.getenv("STOP_LOSS_DIA", "60").replace(",", "."))
 TRAVA_LUCRO_ATIVA_APOS = float(
@@ -218,7 +218,7 @@ INTRAVELA_REJEICAO_ATR_MIN = 0.10
 INTRAVELA_PAVIO_MIN_FRACAO_MOVIMENTO = 0.10
 
 UMA_OPERACAO_GLOBAL = False
-MAX_OPERACOES_SIMULTANEAS = 2
+MAX_OPERACOES_SIMULTANEAS = 1
 
 # ============================================================
 # R58 - PARÂMETROS LEGADOS (mantidos por compatibilidade)
@@ -947,17 +947,49 @@ def _gerenciamento_permite_operar():
 
 
 def _valor_entrada_atual():
-    """R50: mão fixa de R$5 em todas as operações.
+    """R59: progressão somente após LOSS.
 
-    Não aumenta após WIN e não altera após LOSS.
+    Início / após WIN: R$5
+    1 LOSS consecutivo: R$6
+    2 LOSS consecutivos: R$12
+    3 ou mais LOSS consecutivos: R$25
+
+    WIN sempre retorna para R$5.
+    DOJI mantém o nível atual.
     """
-    return 5.0
+    perdas_consecutivas = 0
+
+    for item in reversed(_historico_hoje()):
+        resultado = str(item.get("resultado") or "").upper()
+
+        if resultado == "WIN":
+            break
+        if resultado == "LOSS":
+            perdas_consecutivas += 1
+            continue
+        if resultado == "DOJI":
+            continue
+
+    if perdas_consecutivas <= 0:
+        return 5.0
+    if perdas_consecutivas == 1:
+        return 6.0
+    if perdas_consecutivas == 2:
+        return 12.0
+    return 25.0
 
 
 def _atualizar_estado_execucao():
     resumo = _resumo_gerenciamento()
     valor = _valor_entrada_atual()
-    nivel = int(round(max(0.0, valor - ENTRADA_BASE)))
+    if valor <= 5.0:
+        nivel = 0
+    elif valor <= 6.0:
+        nivel = 1
+    elif valor <= 12.0:
+        nivel = 2
+    else:
+        nivel = 3
 
     estado["execucao"].update({
         "automatica": BULLEX_AUTO_TRADE,
@@ -5851,7 +5883,7 @@ def health():
 
 _atualizar_estado_execucao()
 
-log(f"AUTO TRADE={'ATIVO' if BULLEX_AUTO_TRADE else 'DESATIVADO'} | estrategia=R58 PULLBACK EMA20 CONFIRMADO | max_ops={MAX_OPERACOES_SIMULTANEAS}")
+log(f"AUTO TRADE={'ATIVO' if BULLEX_AUTO_TRADE else 'DESATIVADO'} | estrategia=R59 PULLBACK | progressao=5->6->12->25 apos LOSS | WIN->5 | max_ops={MAX_OPERACOES_SIMULTANEAS}")
 log(f"BULLEX_USER_BALANCE_ID={'CONFIGURADO' if BULLEX_USER_BALANCE_ID else 'AUSENTE'}")
 
 log(
