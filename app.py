@@ -101,7 +101,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "R52-SEQUENCIA-M5-3A-5A-VELA"
+BULLEX_DIAGNOSTIC_VERSION = "R53-SEQUENCIA-ENTRA-NA-ABERTURA-3E5"
 
 _bullex_diag = {
     "messages": 0,
@@ -3787,23 +3787,21 @@ def _log_fim_diagnostico(active_id, symbol, status, **dados):
 
 
 def _resultado_retracao_intravela(msg, active_id):
-    """R52 — continuação de sequência M5 para prever a 3ª ou a 5ª vela.
+    """R53 — sequência 3ª/5ª vela entrando NA ABERTURA da vela-alvo.
 
-    Regras principais:
-      • 2 velas M5 verdes fechadas -> CALL na abertura da 3ª vela.
-      • 2 velas M5 vermelhas fechadas -> PUT na abertura da 3ª vela.
-      • 4 velas M5 verdes fechadas -> CALL na abertura da 5ª vela.
-      • 4 velas M5 vermelhas fechadas -> PUT na abertura da 5ª vela.
-      • M5 e M15 precisam apontar para a mesma direção.
-      • EMA 9/21 + ADX confirmam a tendência.
-      • RSI confirma momento e bloqueia entradas já excessivamente esticadas.
-      • A sequência é rejeitada se as velas tiverem corpo fraco/doji ou
-        amplitude excessiva em relação ao ATR.
+    Regra correta:
+      • 2 velas fechadas verdes -> CALL assim que abre a 3ª vela.
+      • 2 velas fechadas vermelhas -> PUT assim que abre a 3ª vela.
+      • 4 velas fechadas verdes -> CALL assim que abre a 5ª vela.
+      • 4 velas fechadas vermelhas -> PUT assim que abre a 5ª vela.
+
+    A vela-alvo NÃO precisa fechar. O sinal é decidido usando apenas velas
+    anteriores já fechadas + contexto EMA/ADX/RSI/tendência.
     """
     if not isinstance(msg, dict):
         return None
 
-    _, symbol = _symbol_por_active_id(active_id)
+    codigo, symbol = _symbol_por_active_id(active_id)
     symbol = symbol or str(active_id)
 
     try:
@@ -3813,147 +3811,127 @@ def _resultado_retracao_intravela(msg, active_id):
     except Exception:
         return None
 
-    # Esta estratégia é de abertura da vela prevista. O relógio M5 já dispara
-    # nos primeiros segundos da nova vela; callbacks atrasados não devem criar
-    # uma entrada tardia.
+    # Só queremos uma decisão logo no começo da vela-alvo.
     server_ts, _ = _horario_servidor_atual()
     decorridos = max(0.0, float(server_ts) - candle_from)
     restantes = max(0.0, candle_to - float(server_ts))
-    if decorridos > 8.0 or restantes < 285.0:
+    if decorridos > 12.0:
         return None
 
-    fechadas = somente_velas_fechadas(_candles_cache(active_id, 300), 5)
-    if len(fechadas) < 40:
-        return None
-    fechadas = fechadas[-80:]
-
-    infos = [candle_info(c) for c in fechadas]
-    closes = [float(c["close"]) for c in fechadas]
-    atr5 = atr(fechadas, 14)
-    rsi14 = rsi(closes, 14)
-    ctx5 = _contexto_forca_m5(active_id)
-    ctx15 = _contexto_forca_m15(active_id)
-
-    if not atr5 or atr5 <= 0 or rsi14 is None or not ctx5 or not ctx15:
+    # Usa SOMENTE velas fechadas anteriores à vela atual.
+    fechadas = somente_velas_fechadas(_candles_cache(active_id, 300), 8)
+    if len(fechadas) < 6:
         return None
 
-    dir5 = ctx5.get("direcao")
-    dir15 = ctx15.get("direcao")
-    adx5 = float(ctx5.get("adx") or 0.0)
-    adx15 = float(ctx15.get("adx") or 0.0)
-
-    if dir5 not in ("CALL", "PUT") or dir5 != dir15:
-        return None
-    if adx5 < SEQUENCIA_ADX_M5_MIN or adx15 < SEQUENCIA_ADX_M15_MIN:
-        return None
+    infos = [candle_info(c) for c in fechadas[-6:]]
 
     def cor(info):
         if info["close"] > info["open"]:
-            return "CALL"
+            return "VERDE"
         if info["close"] < info["open"]:
-            return "PUT"
+            return "VERMELHA"
         return "DOJI"
 
-    def bloco_valido(bloco, direcao, range_atr_max):
-        if not bloco or any(cor(i) != direcao for i in bloco):
-            return False
-        if any(float(i.get("body_ratio") or 0.0) < SEQUENCIA_BODY_RATIO_MIN for i in bloco):
-            return False
-        if any((float(i.get("range") or 0.0) / atr5) > range_atr_max for i in bloco):
-            return False
-        return True
+    cores = [cor(i) for i in infos]
 
-    # A quinta vela tem prioridade. Se existem 4 velas iguais, não queremos
-    # classificá-la também como uma simples entrada de terceira vela.
-    tipo_entrada = None
-    qtd_sequencia = 0
-    bloco = None
-    if len(infos) >= 4 and bloco_valido(infos[-4:], dir5, SEQUENCIA_RANGE_ATR_MAX_5):
-        tipo_entrada = "QUINTA_VELA"
-        qtd_sequencia = 4
-        bloco = infos[-4:]
-    elif len(infos) >= 2 and bloco_valido(infos[-2:], dir5, SEQUENCIA_RANGE_ATR_MAX_3):
-        tipo_entrada = "TERCEIRA_VELA"
-        qtd_sequencia = 2
-        bloco = infos[-2:]
+    # Prioridade para QUINTA_VELA. A sequência é medida nas velas fechadas
+    # imediatamente ANTERIORES à vela que acabou de abrir.
+    padrao = None
+    direcao = None
+    if cores[-4:] == ["VERDE"] * 4:
+        padrao = "QUINTA_VELA"
+        direcao = "CALL"
+        seq_infos = infos[-4:]
+    elif cores[-4:] == ["VERMELHA"] * 4:
+        padrao = "QUINTA_VELA"
+        direcao = "PUT"
+        seq_infos = infos[-4:]
+    elif cores[-2:] == ["VERDE"] * 2:
+        padrao = "TERCEIRA_VELA"
+        direcao = "CALL"
+        seq_infos = infos[-2:]
+    elif cores[-2:] == ["VERMELHA"] * 2:
+        padrao = "TERCEIRA_VELA"
+        direcao = "PUT"
+        seq_infos = infos[-2:]
     else:
         return None
 
-    # RSI: confirma o lado, mas evita comprar/vender quando o movimento já
-    # está excessivamente esticado.
-    if dir5 == "CALL":
-        if not (SEQUENCIA_RSI_CALL_MIN <= rsi14 <= SEQUENCIA_RSI_CALL_MAX):
+    # Evita sequências formadas por doji/corpos muito fracos.
+    for i in seq_infos:
+        amplitude = max(i["high"] - i["low"], 1e-12)
+        corpo_ratio = abs(i["close"] - i["open"]) / amplitude
+        if corpo_ratio < 0.42:
+            return None
+
+    # Tendência e força M15.
+    ctx15 = _contexto_forca_m15(active_id)
+    dir15 = (ctx15 or {}).get("direcao")
+    adx15 = float((ctx15 or {}).get("adx") or 0.0)
+    if dir15 not in ("CALL", "PUT") or dir15 != direcao:
+        return None
+    if adx15 < 18.0:
+        return None
+
+    # EMA 9/21 e RSI no M5.
+    closes = [float(c["close"]) for c in fechadas[-30:]]
+    if len(closes) < 21:
+        return None
+
+    ema9 = ema(closes, 9)[-1]
+    ema21 = ema(closes, 21)[-1]
+    rsi14 = rsi(closes, 14)[-1] if len(closes) >= 15 else 50.0
+    ultimo_close = closes[-1]
+
+    if direcao == "CALL":
+        if not (ema9 > ema21 and ultimo_close > ema9):
+            return None
+        # Confirma força sem entrar já extremamente esticado.
+        if not (52.0 <= rsi14 <= 72.0):
             return None
     else:
-        if not (SEQUENCIA_RSI_PUT_MIN <= rsi14 <= SEQUENCIA_RSI_PUT_MAX):
+        if not (ema9 < ema21 and ultimo_close < ema9):
+            return None
+        if not (28.0 <= rsi14 <= 48.0):
             return None
 
-    ema9 = float(ctx5.get("ema9") or 0.0)
-    ema21 = float(ctx5.get("ema21") or 0.0)
-    if dir5 == "CALL" and not (preco_atual >= ema9 > ema21):
-        return None
-    if dir5 == "PUT" and not (preco_atual <= ema9 < ema21):
-        return None
-
-    # Qualidade da sequência: corpos consistentes sem aceleração exagerada.
-    corpos = [float(i["body"]) for i in bloco]
-    ranges = [float(i["range"]) for i in bloco]
-    corpo_medio = sum(corpos) / len(corpos)
-    body_ratio_medio = sum(float(i["body_ratio"]) for i in bloco) / len(bloco)
-    range_medio_atr = (sum(ranges) / len(ranges)) / atr5
-
-    score = 8 if tipo_entrada == "TERCEIRA_VELA" else 9
-    if adx15 >= 25:
-        score += 1
-    if adx5 >= 25:
-        score += 1
-    if body_ratio_medio >= 0.60:
-        score += 1
-
-    # Na quinta vela penalizamos um pouco a exaustão: a última vela da
-    # sequência não pode ter explodido em tamanho em relação à média anterior.
-    if tipo_entrada == "QUINTA_VELA" and len(corpos) >= 4:
-        media_anteriores = sum(corpos[:-1]) / max(1, len(corpos) - 1)
-        if media_anteriores > 0 and corpos[-1] > media_anteriores * 1.65:
-            return None
+    # Score separado por padrão para facilitar análise.
+    score = 10 if padrao == "QUINTA_VELA" else 9
+    score += 1 if adx15 >= 24 else 0
 
     return {
-        "sinal": dir5,
+        "sinal": direcao,
         "score": score,
-        "score_call": score if dir5 == "CALL" else 0,
-        "score_put": score if dir5 == "PUT" else 0,
+        "score_call": score if direcao == "CALL" else 0,
+        "score_put": score if direcao == "PUT" else 0,
         "preco": preco_atual,
         "vela": datetime.fromtimestamp(candle_from, TZ),
-        "estrategia": "SEQUENCIA_M5_TENDENCIA",
-        "regime": tipo_entrada,
-        "padrao_sequencia": tipo_entrada,
-        "quantidade_velas_sequencia": qtd_sequencia,
-        "pullback": tipo_entrada,
-        "rejeicao": f"{qtd_sequencia} velas consecutivas {dir5}",
-        "lateral": "NAO",
-        "atr": atr5,
+        "estrategia": "SEQUENCIA_3_5_TENDENCIA",
+        "regime": padrao,
+        "pullback": padrao,
+        "rejeicao": f"{padrao} | entrada na abertura da vela-alvo",
+        "lateral": "N/A",
+        "atr": None,
         "rsi": rsi14,
         "ema5": None,
         "ema13": ema9,
         "ema21": ema21,
-        "tendencia_5m": f"{dir5} | ADX {adx5:.1f}",
+        "tendencia_5m": f"{direcao} | EMA9/EMA21",
         "tendencia_15m": f"{dir15} | ADX {adx15:.1f}",
-        "zona_fibonacci": tipo_entrada,
+        "zona_fibonacci": padrao,
         "bloqueio": "SINAL",
         "mensagem": (
-            f"{dir5} {tipo_entrada} | sequência={qtd_sequencia} | "
-            f"RSI={rsi14:.1f} | ADX5={adx5:.1f} | ADX15={adx15:.1f}"
+            f"{direcao} {padrao} | entrada na ABERTURA | "
+            f"ADX15={adx15:.1f} | RSI={rsi14:.1f}"
         ),
         "candle_from": candle_from,
         "candle_to": candle_to,
         "segundos_decorridos": decorridos,
         "segundos_restantes": restantes,
+        "padrao_sequencia": padrao,
         "adx_m15": adx15,
-        "adx_m5": adx5,
-        "distancia_ema_atr": abs(preco_atual - ema9) / atr5,
-        "range_ultima_atr": float(bloco[-1]["range"]) / atr5,
-        "body_ratio_medio": body_ratio_medio,
-        "range_medio_atr": range_medio_atr,
+        "distancia_ema_atr": abs(ultimo_close - ema9) / max(abs(ultimo_close), 1e-12),
+        "range_ultima_atr": 0.0,
     }
 
 def _atualizar_dashboard_intravela(symbol, resultado):
