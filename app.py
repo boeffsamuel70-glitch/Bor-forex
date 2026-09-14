@@ -2,7 +2,6 @@ import os
 import time
 import threading
 import secrets
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import json
@@ -66,9 +65,23 @@ BULLEX_USER_AGENT = os.getenv(
 # ATIVOS BULLEX
 # ============================================================
 
-# OTC automático. Os active_id não ficam fixos no código:
+# Somente mercado aberto. Os active_id não ficam fixos no código:
 # são descobertos automaticamente na lista digital da Traderoom após autenticar.
 ATIVO_BULLEX = {}
+
+PARES_MERCADO_ABERTO = {
+    "EURUSD": "EUR/USD",
+    "GBPUSD": "GBP/USD",
+    "USDJPY": "USD/JPY",
+    "GBPJPY": "GBP/JPY",
+    "AUDUSD": "AUD/USD",
+    "USDCAD": "USD/CAD",
+    "AUDJPY": "AUD/JPY",
+}
+
+# OTC populares. Os active_id NÃO são fixos:
+# são descobertos automaticamente na lista da Traderoom.
+PARES_OTC_ALVO = {}
 
 _bullex_assets_lock = threading.RLock()
 _bullex_assets_detected = False
@@ -78,7 +91,7 @@ _bullex_assets_source = None
 _bullex_assets_ready_event = threading.Event()
 _bullex_assets_init_lock = threading.Lock()
 
-_BULLEX_CANDLE_SIZES = {"5min": 300, "15min": 900, 300: 300, 900: 900}
+_BULLEX_CANDLE_SIZES = {"5min": 300, "15min": 900}
 
 _bullex_ws = None
 _bullex_ws_lock = threading.RLock()
@@ -101,7 +114,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "R59-PULLBACK-PROGRESSAO-5-6-12-25-MAX1"
+BULLEX_DIAGNOSTIC_VERSION = "OPEN-ONLY-BINARY-5-BRL-20260913-R20-TREND-PULLBACK-M5"
 
 _bullex_diag = {
     "messages": 0,
@@ -131,10 +144,10 @@ TIMEZONE = "America/Sao_Paulo"
 TZ = ZoneInfo(TIMEZONE)
 
 OUTPUTSIZE = 150
-OUTPUTSIZE_5M = 100
+OUTPUTSIZE_15M = 100
 
 HORA_INICIO = 22
-HORA_FIM = 21
+HORA_FIM = 15
 
 MAX_ATRASO_MINUTOS = 8
 
@@ -152,63 +165,22 @@ BULLEX_USER_BALANCE_ID = os.getenv(
     ""
 ).strip()
 
-VALORES_ENTRADA = [5.00, 6.00, 12.00, 25.00]
-
-# ============================================================
-# GERENCIAMENTO AUTÔNOMO DE BANCA
-# ============================================================
-# Valores padrão podem ser alterados no Render sem editar o código.
-ENTRADA_BASE = 5.0  # R59: primeira entrada R$5
-ENTRADA_MAXIMA = 25.0  # R59: teto da progressão após LOSS
-META_LUCRO_DIA = float(os.getenv("META_LUCRO_DIA", "100").replace(",", "."))
-STOP_LOSS_DIA = float(os.getenv("STOP_LOSS_DIA", "60").replace(",", "."))
-TRAVA_LUCRO_ATIVA_APOS = float(
-    os.getenv("TRAVA_LUCRO_ATIVA_APOS", "80").replace(",", ".")
-)
-TRAVA_LUCRO_RECUO = float(
-    os.getenv("TRAVA_LUCRO_RECUO", "30").replace(",", ".")
-)
-
-# A mão cresce somente com lucro já conquistado:
-# +0 a +14,99  -> R$6
-# +15 a +29,99 -> R$7
-# +30 a +44,99 -> R$8
-# +45 ou mais  -> R$9
-DEGRAU_LUCRO_PARA_AUMENTO = float(
-    os.getenv("DEGRAU_LUCRO_PARA_AUMENTO", "15").replace(",", ".")
-)
-
+VALORES_ENTRADA = [5.00]
 EXPIRACAO_MINUTOS = 5
 # A antiga janela de 3 segundos foi removida.
-# Esta estratégia entra DURANTE a vela M5 atual e expira no fechamento da MESMA vela.
-INTRAVELA_MIN_SEGUNDOS_DECORRIDOS = 2
-INTRAVELA_MIN_SEGUNDOS_RESTANTES = 50
+# Esta estratégia entra DURANTE a vela atual e expira no fechamento da MESMA vela.
+INTRAVELA_MIN_SEGUNDOS_DECORRIDOS = 20
+INTRAVELA_MIN_SEGUNDOS_RESTANTES = 35
 
-# Filtro de contexto/força no M5. O M5 não executa a entrada; ele apenas
-# autoriza operações na direção de uma tendência suficientemente forte.
-M5_ADX_PERIODO = 14
-M5_ADX_MINIMO = 20.0
-M5_SEPARACAO_EMAS_ATR_MIN = 0.12
-M5_INCLINACAO_ATR_MIN = 0.03
-M5_IMPULSO_CANDLES = 3
-M5_IMPULSO_MIN_DIRECIONAIS = 2
-
-# Parâmetros do contexto de tendência M15.
-M15_ADX_PERIODO = 14
-M15_ADX_MINIMO = 20.0
-M15_SEPARACAO_EMAS_ATR_MIN = 0.12
-M15_INCLINACAO_ATR_MIN = 0.03
-M15_IMPULSO_CANDLES = 3
-M15_IMPULSO_MIN_DIRECIONAIS = 2
-
-# Parâmetros antigos de S/R mantidos apenas por compatibilidade com helpers legados.
+# Estratégia R17: somente suporte/resistência M5.
+# O nível precisa ter pelo menos 3 toques em velas M5 fechadas.
 SR_M5_LOOKBACK = 100
 SR_M5_PIVOT_JANELA = 2
-SR_M5_MIN_TOQUES = 2
-SR_M5_TOLERANCIA_ATR = 0.18
+SR_M5_MIN_TOQUES = 3
+SR_M5_TOLERANCIA_ATR = 0.16
 
-# A vela M5 precisa vir de uma distância mínima até o nível.
-# Se abrir colada no suporte/resistência, não opera.
+# A vela atual precisa nascer longe do nível.
+# Se abrir colada no suporte/resistência, NÃO opera.
 SR_M5_DISTANCIA_ABERTURA_ATR_MIN = 0.55
 
 # Rejeição/retração depois do toque.
@@ -217,47 +189,25 @@ INTRAVELA_RETRACAO_MAX = 0.68
 INTRAVELA_REJEICAO_ATR_MIN = 0.10
 INTRAVELA_PAVIO_MIN_FRACAO_MOVIMENTO = 0.10
 
-UMA_OPERACAO_GLOBAL = False
-MAX_OPERACOES_SIMULTANEAS = 1
-
-# ============================================================
-# R58 - PARÂMETROS LEGADOS (mantidos por compatibilidade)
-# ============================================================
-# 2 velas fechadas iguais -> prevê a 3ª na mesma direção.
-# 4 velas fechadas iguais -> prevê a 5ª na mesma direção.
-# A 5ª vela tem prioridade quando as duas condições coexistirem.
-SEQUENCIA_RSI_CALL_MIN = 52.0
-SEQUENCIA_RSI_CALL_MAX = 70.0
-SEQUENCIA_RSI_PUT_MIN = 30.0
-SEQUENCIA_RSI_PUT_MAX = 48.0
-SEQUENCIA_BODY_RATIO_MIN = 0.45
-SEQUENCIA_RANGE_ATR_MAX_3 = 1.60
-SEQUENCIA_RANGE_ATR_MAX_5 = 1.35
-SEQUENCIA_ADX_M15_MIN = 20.0
-SEQUENCIA_ADX_M5_MIN = 20.0
-
-# Bloqueio após LOSS desativado nesta versão.
-BLOQUEIO_LOSS_MINUTOS = 0
-_bloqueio_loss_lock = threading.RLock()
-_bloqueio_loss_ate = {}
+UMA_OPERACAO_GLOBAL = True
 
 _intravela_lock = threading.RLock()
 _intravela_estado = {}
 _intravela_velas_tentadas = set()
 
-_sr_retry_lock = threading.RLock()
-_sr_retry = {}
-SR_MAX_TENTATIVAS_NIVEL = 2
-SR_RETESTE_TOLERANCIA_ATR = 0.24
-SR_ROMPIMENTO_ATR_MIN = 0.16
-SR_REJEICAO_PAVIO_MIN = 0.28
-SR_FECHAMENTO_FORTE_MIN = 0.62
-
 # ============================================================
 # ATIVOS
 # ============================================================
 
-ATIVOS = {}
+ATIVOS = {
+    "EURUSD": "EUR/USD",
+    "GBPUSD": "GBP/USD",
+    "USDJPY": "USD/JPY",
+    "GBPJPY": "GBP/JPY",
+    "AUDUSD": "AUD/USD",
+    "USDCAD": "USD/CAD",
+    "AUDJPY": "AUD/JPY",
+}
 
 # ============================================================
 # ESTADO
@@ -298,30 +248,19 @@ estado = {
         "losses": 0,
         "dojis": 0,
         "taxa": 0.0,
-        "lucro_total": 0.0,
     },
 }
 
 estado["execucao"] = {
     "automatica": BULLEX_AUTO_TRADE,
     "modo": "DEMO",
-    "valor_atual": ENTRADA_BASE,
+    "valor_atual": VALORES_ENTRADA[0],
     "nivel_progressao": 0,
     "operacao_ativa": False,
     "ultima_ordem": None,
     "ultimo_erro": None,
     "balance_id_disponivel": bool(BULLEX_USER_BALANCE_ID),
     "balance_source": "ENV" if BULLEX_USER_BALANCE_ID else None,
-    "gerenciamento": {
-        "meta_lucro": META_LUCRO_DIA,
-        "stop_loss": STOP_LOSS_DIA,
-        "trava_ativa_apos": TRAVA_LUCRO_ATIVA_APOS,
-        "trava_recuo": TRAVA_LUCRO_RECUO,
-        "lucro_dia": 0.0,
-        "pico_lucro_dia": 0.0,
-        "status": "ATIVO",
-        "motivo_parada": None,
-    },
 }
 
 _robo_lock = threading.Lock()
@@ -330,39 +269,21 @@ _robo_started = False
 _ultimos_sinais_telegram = {}
 _operacoes_pendentes = {}
 _ultimas_operacoes_registradas = {}
-# Nova contagem do dashboard a partir desta versão.
-# WIN/LOSS/DOJI e lucro começam zerados após o deploy.
-_historico_resultados = []
-
-# Fallback de payout líquido usado SOMENTE quando a Bullex não informar
-# o valor financeiro real da liquidação da operação.
-# Ex.: entrada de R$6,00 com 87% -> lucro líquido de R$5,22.
-# Pode ser ajustado no Render pela variável PAYOUT_LUCRO_PERCENTUAL.
-PAYOUT_LUCRO_PERCENTUAL = float(
-    os.getenv("PAYOUT_LUCRO_PERCENTUAL", "87").replace(",", ".")
+# Base histórica consolidada antes da estratégia de retração intravela:
+# 44 operações decididas = 22 WIN / 22 LOSS = 50,00%.
+_historico_resultados = (
+    [{"resultado": "WIN", "origem": "BASE_ANTES_R13", "estrategia": "BASE"} for _ in range(22)]
+    + [{"resultado": "LOSS", "origem": "BASE_ANTES_R13", "estrategia": "BASE"} for _ in range(22)]
 )
-
-# Liquidações financeiras recebidas da Bullex, indexadas por option_id.
-# O objetivo é usar o valor REAL devolvido pela corretora quando disponível,
-# em vez de presumir um payout fixo para todos os ativos/operações.
-_bullex_settlement_lock = threading.RLock()
-_bullex_settlements = {}
-
 _execucao_lock = threading.RLock()
 _operacao_global_ativa = None
-# Reserva atômica de vagas para impedir que várias threads ultrapassem
-# MAX_OPERACOES_SIMULTANEAS antes de as ordens serem confirmadas/registradas.
-_ordens_em_confirmacao = set()
-# Dados da confirmação separados por ativo para evitar sobrescrita entre
-# confirmações simultâneas.
-_ordens_confirmadas_por_symbol = {}
 _nivel_progressao = 0
 _bullex_balance_id = None
 _bullex_balance_source = None
 _bullex_instrument_cache = {}
 
 # ============================================================
-# HORÁRIO DO SERVIDOR / JANELA DE ENTRADA M5
+# HORÁRIO DO SERVIDOR / JANELA DE ENTRADA 5M
 # ============================================================
 
 _bullex_server_timestamp = None
@@ -448,7 +369,7 @@ def _horario_servidor_atual():
     return time.time(), "LOCAL_FALLBACK"
 
 
-def _janela_execucao_m5():
+def _janela_execucao_5m():
     server_ts, source = _horario_servidor_atual()
 
     current = int(server_ts)
@@ -487,160 +408,6 @@ def _mensagem_erro_ordem(resposta):
             return str(value)
 
     return ""
-
-
-def _float_seguro(valor):
-    try:
-        if valor in (None, ""):
-            return None
-        if isinstance(valor, str):
-            valor = valor.strip().replace(",", ".")
-        return float(valor)
-    except (TypeError, ValueError):
-        return None
-
-
-def _normalizar_resultado_bullex(valor):
-    if valor is None:
-        return None
-    txt = str(valor).strip().lower()
-    if txt in ("win", "won", "winner", "success", "profit"):
-        return "WIN"
-    if txt in ("loss", "lose", "loose", "lost", "losses", "fail", "failed"):
-        return "LOSS"
-    if txt in ("equal", "draw", "doji", "refund", "tie"):
-        return "DOJI"
-    return None
-
-
-def _iter_dicts_liquidacao(obj):
-    if isinstance(obj, dict):
-        yield obj
-        for valor in obj.values():
-            yield from _iter_dicts_liquidacao(valor)
-    elif isinstance(obj, list):
-        for valor in obj:
-            yield from _iter_dicts_liquidacao(valor)
-
-
-def _ids_opcoes_conhecidas():
-    ids = {}
-    for op in list(_operacoes_pendentes.values()):
-        oid = op.get("option_id")
-        if oid not in (None, "", 0):
-            ids[str(oid)] = float(op.get("valor") or 0.0)
-    for op in list(_historico_resultados):
-        oid = op.get("option_id")
-        if oid not in (None, "", 0):
-            ids[str(oid)] = float(op.get("valor") or 0.0)
-    return ids
-
-
-def _extrair_liquidacao_do_item(item, valor_operacao):
-    if not isinstance(item, dict):
-        return None
-
-    resultado = None
-    for chave in ("win", "result", "resultado", "outcome"):
-        resultado = _normalizar_resultado_bullex(item.get(chave))
-        if resultado:
-            break
-
-    valor_ref = _float_seguro(
-        item.get("amount", item.get("price", item.get("invest", valor_operacao)))
-    )
-    if valor_ref is None or valor_ref <= 0:
-        valor_ref = float(valor_operacao or 0.0)
-
-    # Campos que normalmente representam lucro/prejuízo LÍQUIDO.
-    for chave in ("net_profit", "profit_net", "netProfit", "profit_value"):
-        valor = _float_seguro(item.get(chave))
-        if valor is not None:
-            return {"lucro": round(valor, 2), "resultado": resultado, "campo": chave}
-
-    # Em mensagens do ecossistema IQ/Bullex, profit_amount costuma representar
-    # o TOTAL devolvido (entrada + lucro). Por isso subtraímos a entrada.
-    for chave in ("profit_amount", "return_amount", "payout_amount", "win_amount"):
-        valor = _float_seguro(item.get(chave))
-        if valor is not None:
-            lucro = valor - valor_ref
-            if resultado == "LOSS" and valor <= 0:
-                lucro = -valor_ref
-            elif resultado == "DOJI":
-                lucro = 0.0
-            return {"lucro": round(lucro, 2), "resultado": resultado, "campo": chave}
-
-    # Mesmo sem valor financeiro explícito, LOSS e DOJI têm resultado líquido
-    # conhecido. Para WIN sem valor, aguardamos o fallback da avaliação.
-    if resultado == "LOSS":
-        return {"lucro": round(-valor_ref, 2), "resultado": resultado, "campo": "resultado"}
-    if resultado == "DOJI":
-        return {"lucro": 0.0, "resultado": resultado, "campo": "resultado"}
-
-    return None
-
-
-def _aplicar_liquidacao_real(option_id, liquidacao, payload=None):
-    oid = str(option_id)
-    lucro = float(liquidacao["lucro"])
-    resultado = liquidacao.get("resultado")
-
-    registro = {
-        "option_id": oid,
-        "lucro": round(lucro, 2),
-        "resultado": resultado,
-        "campo": liquidacao.get("campo"),
-        "recebido_em": agora_brt().isoformat(),
-    }
-    with _bullex_settlement_lock:
-        _bullex_settlements[oid] = registro
-
-    # Atualiza operação pendente para que a finalização use o valor real.
-    for op in list(_operacoes_pendentes.values()):
-        if str(op.get("option_id")) == oid:
-            op["lucro_real"] = round(lucro, 2)
-            op["fonte_lucro"] = "BULLEX_REAL"
-            if resultado:
-                op["resultado_bullex"] = resultado
-
-    # Se a mensagem chegar depois de a operação já ter sido colocada no
-    # histórico, corrige o lucro acumulado sem criar uma segunda operação.
-    for op in _historico_resultados:
-        if str(op.get("option_id")) == oid:
-            op["lucro"] = round(lucro, 2)
-            op["lucro_real"] = round(lucro, 2)
-            op["fonte_lucro"] = "BULLEX_REAL"
-            if resultado:
-                op["resultado"] = resultado
-                op["resultado_bullex"] = resultado
-
-    log(
-        f"[LIQUIDACAO REAL] option_id={oid} | "
-        f"resultado={resultado or '-'} | lucro_liquido=R${lucro:.2f} | "
-        f"campo={liquidacao.get('campo')}"
-    )
-
-
-def _capturar_liquidacao_bullex(data):
-    conhecidos = _ids_opcoes_conhecidas()
-    if not conhecidos:
-        return
-
-    for item in _iter_dicts_liquidacao(data):
-        candidatos = []
-        for chave in ("option_id", "optionId", "id", "position_id", "positionId"):
-            valor = item.get(chave)
-            if valor not in (None, "", 0):
-                candidatos.append(str(valor))
-
-        for oid in candidatos:
-            if oid not in conhecidos:
-                continue
-            liquidacao = _extrair_liquidacao_do_item(item, conhecidos[oid])
-            if liquidacao is None:
-                continue
-            _aplicar_liquidacao_real(oid, liquidacao, item)
-            return
 
 
 def _ordem_option_confirmada(resposta):
@@ -871,140 +638,23 @@ def _montar_send_message(nome, version, body=None):
 # BULLEX - BALANCE DEMO / EXECUÇÃO
 # ============================================================
 
-def _historico_hoje():
-    hoje = agora_brt().date()
-    itens = []
-    for item in _historico_resultados:
-        dt = item.get("finalizado_em")
-        if isinstance(dt, str):
-            try:
-                dt = datetime.fromisoformat(dt)
-            except Exception:
-                dt = None
-        if isinstance(dt, datetime):
-            if dt.astimezone(TZ).date() == hoje:
-                itens.append(item)
-        else:
-            # Registros antigos sem horário pertencem à sessão atual.
-            itens.append(item)
-    return itens
-
-
-def _resumo_gerenciamento():
-    itens = _historico_hoje()
-    acumulado = 0.0
-    pico = 0.0
-
-    for item in itens:
-        lucro = _float_seguro(item.get("lucro"))
-        if lucro is None:
-            resultado = item.get("resultado")
-            valor = float(item.get("valor") or 0.0)
-            if resultado == "WIN":
-                lucro = valor * (PAYOUT_LUCRO_PERCENTUAL / 100.0)
-            elif resultado == "LOSS":
-                lucro = -valor
-            else:
-                lucro = 0.0
-
-        acumulado += lucro
-        pico = max(pico, acumulado)
-
-    acumulado = round(acumulado, 2)
-    pico = round(pico, 2)
-
-    status = "ATIVO"
-    motivo = None
-
-    if acumulado >= META_LUCRO_DIA:
-        status = "PARADO"
-        motivo = "META_LUCRO"
-    elif acumulado <= -abs(STOP_LOSS_DIA):
-        status = "PARADO"
-        motivo = "STOP_LOSS"
-    elif (
-        pico >= TRAVA_LUCRO_ATIVA_APOS
-        and acumulado <= (pico - TRAVA_LUCRO_RECUO)
-    ):
-        status = "PARADO"
-        motivo = "TRAVA_LUCRO"
-
-    return {
-        "lucro_dia": acumulado,
-        "pico_lucro_dia": pico,
-        "status": status,
-        "motivo_parada": motivo,
-        "meta_lucro": META_LUCRO_DIA,
-        "stop_loss": STOP_LOSS_DIA,
-        "trava_ativa_apos": TRAVA_LUCRO_ATIVA_APOS,
-        "trava_recuo": TRAVA_LUCRO_RECUO,
-    }
-
-
-def _gerenciamento_permite_operar():
-    resumo = _resumo_gerenciamento()
-    return resumo["status"] == "ATIVO", resumo
-
-
 def _valor_entrada_atual():
-    """R59: progressão somente após LOSS.
-
-    Início / após WIN: R$5
-    1 LOSS consecutivo: R$6
-    2 LOSS consecutivos: R$12
-    3 ou mais LOSS consecutivos: R$25
-
-    WIN sempre retorna para R$5.
-    DOJI mantém o nível atual.
-    """
-    perdas_consecutivas = 0
-
-    for item in reversed(_historico_hoje()):
-        resultado = str(item.get("resultado") or "").upper()
-
-        if resultado == "WIN":
-            break
-        if resultado == "LOSS":
-            perdas_consecutivas += 1
-            continue
-        if resultado == "DOJI":
-            continue
-
-    if perdas_consecutivas <= 0:
-        return 5.0
-    if perdas_consecutivas == 1:
-        return 6.0
-    if perdas_consecutivas == 2:
-        return 12.0
-    return 25.0
+    global _nivel_progressao
+    _nivel_progressao = max(0, min(_nivel_progressao, len(VALORES_ENTRADA) - 1))
+    return float(VALORES_ENTRADA[_nivel_progressao])
 
 
 def _atualizar_estado_execucao():
-    resumo = _resumo_gerenciamento()
-    valor = _valor_entrada_atual()
-    if valor <= 5.0:
-        nivel = 0
-    elif valor <= 6.0:
-        nivel = 1
-    elif valor <= 12.0:
-        nivel = 2
-    else:
-        nivel = 3
-
     estado["execucao"].update({
         "automatica": BULLEX_AUTO_TRADE,
         "modo": "DEMO",
-        "valor_atual": valor,
-        "nivel_progressao": nivel,
-        "payout_lucro_percentual": PAYOUT_LUCRO_PERCENTUAL,
-        "operacao_ativa": bool(_operacoes_pendentes) or bool(_ordens_em_confirmacao) or _operacao_global_ativa is not None,
-        "operacoes_abertas": len(_operacoes_pendentes),
-        "ordens_em_confirmacao": len(_ordens_em_confirmacao),
-        "max_operacoes_simultaneas": MAX_OPERACOES_SIMULTANEAS,
+        "valor_atual": _valor_entrada_atual(),
+        "nivel_progressao": _nivel_progressao,
+        "operacao_ativa": _operacao_global_ativa is not None,
         "balance_id_disponivel": _bullex_balance_id is not None,
         "balance_source": _bullex_balance_source,
-        "gerenciamento": resumo,
     })
+
 
 def _extrair_balance_id(obj=None):
     """Aceita somente BULLEX_USER_BALANCE_ID. Sem descoberta automática."""
@@ -1038,13 +688,14 @@ def _obter_balance_id():
 
 def _instrument_time():
     agora = agora_brt()
-    return agora.replace(second=0, microsecond=0)
+    minuto = (agora.minute // 5) * 5
+    return agora.replace(minute=minuto, second=0, microsecond=0)
 
 
 def _montar_instrument_id(active_id, dt=None):
     if dt is None:
         dt = _instrument_time()
-    return f"do{int(active_id)}{dt.strftime('%Y%m%d')}D{dt.strftime('%H%M')}T1MPSPT"
+    return f"do{int(active_id)}{dt.strftime('%Y%m%d')}D{dt.strftime('%H%M')}T5MPSPT"
 
 
 def _extrair_instrumentos_recursivo(obj, active_id, out=None):
@@ -1064,9 +715,9 @@ def _extrair_instrumentos_recursivo(obj, active_id, out=None):
     return out
 
 
-def _instrumento_eh_1m(item, expected_id):
+def _instrumento_eh_5m(item, expected_id):
     iid = str(item.get("instrument_id", ""))
-    return iid == expected_id or "T1M" in iid.upper()
+    return iid == expected_id or "T5M" in iid.upper()
 
 
 def _buscar_instrumento(active_id, dt=None):
@@ -1081,7 +732,7 @@ def _buscar_instrumento(active_id, dt=None):
         try:
             resposta = _enviar_e_aguardar("digital-options.get-instruments", version, body, timeout=0.9)
             candidatos = [x for x in _extrair_instrumentos_recursivo(resposta, active_id)
-                          if _instrumento_eh_1m(x, expected)]
+                          if _instrumento_eh_5m(x, expected)]
             if not candidatos:
                 continue
             escolhido = next((x for x in candidatos if x["instrument_id"] == expected), candidatos[0])
@@ -1158,25 +809,18 @@ def executar_ordem_intravela(symbol, sinal, resultado):
     if sinal not in ("CALL", "PUT"):
         return None
 
-    pode_operar, gerenciamento = _gerenciamento_permite_operar()
-    if not pode_operar:
-        motivo = gerenciamento.get("motivo_parada") or "GERENCIAMENTO"
-        estado["execucao"]["ultimo_erro"] = f"PARADO_{motivo}"
-        _atualizar_estado_execucao()
-        log(
-            f"[GERENCIAMENTO] Nova ordem bloqueada: {motivo} | "
-            f"lucro_dia=R${gerenciamento['lucro_dia']:.2f} | "
-            f"pico=R${gerenciamento['pico_lucro_dia']:.2f}"
-        )
-        return f"PARADO_{motivo}"
-
     if not BULLEX_USER_BALANCE_ID:
         estado["execucao"]["ultimo_erro"] = "SEM_BALANCE_ID"
         _atualizar_estado_execucao()
         return "SEM_BALANCE_ID"
 
-    # A vaga não é reservada aqui ainda: primeiro validamos ativo/horário.
-    # A reserva atômica acontece imediatamente antes do envio da ordem.
+    with _execucao_lock:
+        if UMA_OPERACAO_GLOBAL and _operacao_global_ativa is not None:
+            log(
+                f"[INTRAVELA] {symbol}: sinal ignorado; "
+                "já existe operação global ativa."
+            )
+            return "BLOQUEADA_GLOBAL"
 
     balance_id = _obter_balance_id()
     if not balance_id:
@@ -1234,27 +878,6 @@ def executar_ordem_intravela(symbol, sinal, resultado):
         "refund_value": 0,
     }
 
-    # Reserva ATÔMICA da vaga. Enquanto a corretora responde, esta ordem já
-    # conta no limite. Assim, duas threads podem ocupar as duas vagas, mas a
-    # terceira é bloqueada antes de enviar qualquer comando ao WebSocket.
-    with _execucao_lock:
-        if symbol in _operacoes_pendentes or symbol in _ordens_em_confirmacao:
-            log(f"[INTRAVELA] {symbol}: sinal ignorado; ativo já possui ordem pendente/em confirmação.")
-            return "ATIVO_JA_EM_OPERACAO"
-
-        abertas_ou_reservadas = len(_operacoes_pendentes) + len(_ordens_em_confirmacao)
-        if abertas_ou_reservadas >= MAX_OPERACOES_SIMULTANEAS:
-            log(
-                f"[INTRAVELA] {symbol}: sinal ignorado; "
-                f"limite de {MAX_OPERACOES_SIMULTANEAS} operações simultâneas atingido "
-                f"(pendentes={len(_operacoes_pendentes)}, confirmando={len(_ordens_em_confirmacao)})."
-            )
-            return "LIMITE_OPERACOES"
-
-        _ordens_em_confirmacao.add(symbol)
-
-    manter_reserva = False
-
     log(
         f"[AUTO INTRAVELA] Enviando {symbol} {sinal} R${valor:.2f} | "
         f"entrada_estimada={resultado['preco']:.5f} | "
@@ -1285,32 +908,52 @@ def executar_ordem_intravela(symbol, sinal, resultado):
                 "[AUTO INTRAVELA] Ordem não confirmada: "
                 + json.dumps(resposta, ensure_ascii=False)
             )
+            threading.Thread(
+                target=enviar_status_ordem_telegram,
+                args=(
+                    symbol,
+                    sinal,
+                    "NÃO ABERTA",
+                    _mensagem_erro_ordem(resposta) or str(resposta),
+                ),
+                daemon=True,
+                name=f"telegram-ordem-recusada-{active_id}",
+            ).start()
             return "SEM_CONFIRMACAO"
 
         with _bullex_diag_lock:
             _bullex_diag["orders_confirmed"] += 1
 
-        with _execucao_lock:
-            status = _registrar_ordem_confirmada(
-                symbol,
-                ticker,
-                sinal,
-                valor,
-                active_id,
-                balance_id,
-                "BINARIA_INTRAVELA",
-                resposta,
-                janela,
-            )
+        status = _registrar_ordem_confirmada(
+            symbol,
+            ticker,
+            sinal,
+            valor,
+            active_id,
+            balance_id,
+            "BINARIA_INTRAVELA",
+            resposta,
+            janela,
+        )
 
+        threading.Thread(
+            target=enviar_status_ordem_telegram,
+            args=(
+                symbol,
+                sinal,
+                "CONFIRMADA",
+                f"R${valor:.2f} | expira "
+                f"{datetime.fromtimestamp(candle_to, TZ).strftime('%H:%M:%S')}",
+            ),
+            daemon=True,
+            name=f"telegram-ordem-confirmada-{active_id}",
+        ).start()
+
+        with _execucao_lock:
             if _operacao_global_ativa is not None:
                 _operacao_global_ativa["preco_entrada_estimado"] = float(resultado["preco"])
-                _operacao_global_ativa["estrategia"] = "RETRACAO_MESMA_VELA"
+                _operacao_global_ativa["estrategia"] = "TREND_PULLBACK_M5"
                 _operacao_global_ativa["regime"] = "INTRAVELA"
-                _ordens_confirmadas_por_symbol[symbol] = _operacao_global_ativa.copy()
-
-            # Mantém a reserva até registrar a operação em _operacoes_pendentes.
-            manter_reserva = (status == "CONFIRMADA")
 
         return status
 
@@ -1322,19 +965,18 @@ def executar_ordem_intravela(symbol, sinal, resultado):
         _atualizar_estado_execucao()
         log(f"[AUTO INTRAVELA] ERRO ao enviar ordem: {e}")
         return "ERRO"
-    finally:
-        # Em falha/recusa, libera a vaga imediatamente. Em sucesso, a vaga só
-        # é liberada depois que registrar_operacao_intravela mover a ordem para
-        # _operacoes_pendentes, evitando qualquer janela de corrida.
-        if not manter_reserva:
-            with _execucao_lock:
-                _ordens_em_confirmacao.discard(symbol)
-                _ordens_confirmadas_por_symbol.pop(symbol, None)
 
 
 
 def _atualizar_progressao(resultado):
-    """Compatibilidade: a mão agora é calculada pelo gerenciamento autônomo."""
+    global _nivel_progressao
+    if resultado == "WIN":
+        _nivel_progressao = 0
+    elif resultado == "LOSS":
+        if _nivel_progressao < len(VALORES_ENTRADA) - 1:
+            _nivel_progressao += 1
+        else:
+            _nivel_progressao = 0
     _atualizar_estado_execucao()
 
 
@@ -1371,24 +1013,8 @@ def _normalizar_candle_ws(item):
         high = item.get("max", item.get("high"))
         low = item.get("min", item.get("low"))
 
-        # Preserve também os limites epoch da vela. A rotina FIM-M5 usa
-        # esses campos para localizar a última vela realmente fechada.
-        candle_from = int(timestamp)
-        to_raw = item.get("to")
-        if to_raw is None:
-            candle_to = None
-        else:
-            candle_to = float(to_raw)
-            if candle_to > 10_000_000_000_000:
-                candle_to /= 1_000_000_000
-            elif candle_to > 10_000_000_000:
-                candle_to /= 1_000
-            candle_to = int(candle_to)
-
         return {
             "id": item.get("id"),
-            "from": candle_from,
-            "to": candle_to,
             "datetime": dt.isoformat(),
             "open": float(item["open"]),
             "high": float(high),
@@ -1634,7 +1260,7 @@ def _aguardar_probe_pos_auth(request_id, nome, version, timeout=8):
     ativos = _extrair_mercado_aberto_da_resposta(resposta)
     log(
         f"[POS-AUTH IMEDIATO] Resposta recebida de {nome} v{version}: "
-        f"{len(ativos)} ativo(s) OTC reconhecido(s)."
+        f"{len(ativos)} par(es) normal(is) reconhecido(s)."
     )
 
     if ativos:
@@ -1642,7 +1268,7 @@ def _aguardar_probe_pos_auth(request_id, nome, version, timeout=8):
             _atualizar_ativos_mercado_aberto(ativos, f"{nome} v{version} IMEDIATO")
             _assinar_candles_mercado_aberto()
             log(
-                f"[OTC AUTO] Inicialização imediata concluída com "
+                f"[OPEN MARKET] Inicialização imediata concluída com "
                 f"{len(ativos)} ativo(s)."
             )
             return
@@ -1715,13 +1341,6 @@ def _on_bullex_message(ws, raw_message):
     nome = data.get("name")
     request_id = data.get("request_id")
     msg = data.get("msg")
-
-    # Tenta capturar liquidação financeira real de qualquer evento/resposta
-    # da Bullex antes dos returns específicos de autenticação/candles.
-    try:
-        _capturar_liquidacao_bullex(data)
-    except Exception as e:
-        log(f"[LIQUIDACAO REAL] Falha ao interpretar evento: {e}")
 
     active_id = None
     size = None
@@ -1817,12 +1436,14 @@ def _on_bullex_message(ws, raw_message):
                 with _bullex_diag_lock:
                     _bullex_diag["stored"] += 1
 
-                # FIM M5:
-                # o candle-generated M5 apenas alimenta o cache.
-                # O disparo da análise/ordem é feito pelo relógio do servidor,
-                # nos primeiros 3 segundos da nova vela M5.
+                # Estratégia única R13: observa a vela de 5M ainda aberta.
                 if int(size) == 300:
-                    pass
+                    threading.Thread(
+                        target=_processar_sinal_intravela,
+                        args=(active_id, dict(msg)),
+                        daemon=True,
+                        name=f"intravela-scan-{active_id}",
+                    ).start()
         return
 
     # ========================================================
@@ -2202,7 +1823,7 @@ def _primeiro_valor(item, chaves):
 
 
 def _normalizar_par_mercado_aberto(item):
-    """Compatibilidade: agora normaliza SOMENTE ativos OTC disponíveis."""
+    """Normaliza Forex normal e os OTC explicitamente configurados."""
     if not isinstance(item, dict):
         return None
 
@@ -2215,16 +1836,15 @@ def _normalizar_par_mercado_aberto(item):
             "instrument_type",
         )
     ]
-    texto = " ".join(str(x) for x in campos_texto if x not in (None, "")).upper()
-    eh_otc = item.get("is_otc") is True or item.get("isOtc") is True or "OTC" in texto
-    if not eh_otc:
-        return None
+    texto = " ".join(
+        str(x) for x in campos_texto if x not in (None, "")
+    ).upper()
 
-    # Ignora ativos explicitamente pausados/invisíveis quando a lista informa isso.
-    if item.get("is_paused") is True or item.get("isPaused") is True:
-        return None
-    if item.get("is_visible") is False or item.get("isVisible") is False:
-        return None
+    is_otc = (
+        item.get("is_otc") is True
+        or item.get("isOtc") is True
+        or "OTC" in texto
+    )
 
     active_id = _primeiro_valor(
         item,
@@ -2243,41 +1863,60 @@ def _normalizar_par_mercado_aberto(item):
         item,
         ("symbol", "asset_name", "assetName", "underlying", "underlying_name", "name", "ticker"),
     )
-    ticker = str(ticker or symbol or f"OTC-{active_id}").strip()
-    symbol = str(symbol or ticker).strip()
 
-    # Código único e estável no processo, sem limitar a uma lista fixa de pares.
-    codigo_base = re.sub(r"[^A-Z0-9]", "", ticker.upper()) or f"OTC{active_id}"
-    codigo = f"{codigo_base}_{active_id}"
+    base = re.sub(r"[^A-Z]", "", str(ticker or symbol or "").upper())
+    if len(base) < 6:
+        return None
+
+    par = base[:6]
+
+    if is_otc:
+        if par not in PARES_OTC_ALVO:
+            return None
+        codigo = f"{par}_OTC"
+        symbol_final = PARES_OTC_ALVO[par]
+        mercado = "OTC"
+    else:
+        if par not in PARES_MERCADO_ABERTO:
+            return None
+        codigo = par
+        symbol_final = PARES_MERCADO_ABERTO[par]
+        mercado = "ABERTO"
 
     return {
         "codigo": codigo,
-        "symbol": symbol,
+        "symbol": symbol_final,
         "active_id": active_id,
-        "ticker": ticker,
+        "ticker": str(ticker or (par + ("-OTC" if is_otc else ""))).strip(),
+        "is_otc": bool(is_otc),
+        "mercado": mercado,
         "raw": item,
     }
 
 
 def _extrair_mercado_aberto_da_resposta(resposta):
-    """Compatibilidade: extrai todos os OTC elegíveis retornados pela Traderoom."""
     encontrados = {}
     for item in _iter_dicts_recursivo(resposta):
         normalizado = _normalizar_par_mercado_aberto(item)
         if not normalizado:
             continue
-        aid = int(normalizado["active_id"])
-        atual = encontrados.get(aid)
+        codigo = normalizado["codigo"]
+        atual = encontrados.get(codigo)
         if atual is None:
-            encontrados[aid] = normalizado
+            encontrados[codigo] = normalizado
             continue
+        # Prefere registro explicitamente visível/ativo quando houver duplicidade.
         raw_novo = normalizado.get("raw") or {}
         raw_atual = atual.get("raw") or {}
         score_novo = int(raw_novo.get("is_visible") is True) + int(raw_novo.get("is_active") is True)
         score_atual = int(raw_atual.get("is_visible") is True) + int(raw_atual.get("is_active") is True)
         if score_novo > score_atual:
-            encontrados[aid] = normalizado
-    return sorted(encontrados.values(), key=lambda x: (x["ticker"], x["active_id"]))
+            encontrados[codigo] = normalizado
+    ordem = (
+        list(PARES_MERCADO_ABERTO.keys())
+        + [f"{c}_OTC" for c in PARES_OTC_ALVO.keys()]
+    )
+    return [encontrados[c] for c in ordem if c in encontrados]
 
 
 def _corpo_lista_instrumentos(nome):
@@ -2287,24 +1926,69 @@ def _corpo_lista_instrumentos(nome):
 
 
 def _consultar_lista_mercado_aberto(nome, versoes=("2.0", "1.0")):
+    """Consulta e agrega mercado aberto + OTC configurados.
+
+    Algumas respostas da Traderoom podem variar conforme versão/body.
+    A R17 não para na primeira resposta parcial: junta todos os ativos
+    reconhecidos para não perder os OTC.
+    """
     ultimo_erro = None
-    body = _corpo_lista_instrumentos(nome)
+    encontrados = {}
+
+    if nome == "digital-option-instruments.get-underlying-list":
+        corpos = (
+            {"type": "digital-option"},
+            {"type": "digital"},
+            None,
+        )
+    else:
+        corpos = (None,)
+
+    ultima_resposta = None
+
     for versao in versoes:
-        try:
-            resposta = _enviar_e_aguardar(nome, versao, body, timeout=12)
-            ativos = _extrair_mercado_aberto_da_resposta(resposta)
-            log(
-                f"[OTC AUTO] {nome} v{versao}: "
-                f"{len(ativos)} ativo(s) OTC reconhecido(s)."
-            )
-            if ativos:
-                return resposta, ativos
-        except Exception as e:
-            ultimo_erro = e
-            log(f"[OTC AUTO] Falha em {nome} v{versao}: {e}")
+        for body in corpos:
+            try:
+                resposta = _enviar_e_aguardar(
+                    nome,
+                    versao,
+                    body,
+                    timeout=12,
+                )
+                ultima_resposta = resposta
+                ativos = _extrair_mercado_aberto_da_resposta(resposta)
+
+                log(
+                    f"[ATIVOS] {nome} v{versao} body={body}: "
+                    f"{len(ativos)} configurado(s) reconhecido(s)."
+                )
+
+                for item in ativos:
+                    encontrados[item["codigo"]] = item
+
+            except Exception as e:
+                ultimo_erro = e
+                log(
+                    f"[ATIVOS] Falha em {nome} v{versao} "
+                    f"body={body}: {e}"
+                )
+
+    if encontrados:
+        ordem = (
+            list(PARES_MERCADO_ABERTO.keys())
+            + [f"{c}_OTC" for c in PARES_OTC_ALVO.keys()]
+        )
+        ativos_finais = [
+            encontrados[c]
+            for c in ordem
+            if c in encontrados
+        ]
+        return ultima_resposta, ativos_finais
+
     if ultimo_erro:
         raise ultimo_erro
-    return None, []
+
+    return ultima_resposta, []
 
 
 def _atualizar_ativos_mercado_aberto(ativos, origem):
@@ -2316,7 +2000,7 @@ def _atualizar_ativos_mercado_aberto(ativos, origem):
     global _bullex_assets_source
 
     if not ativos:
-        raise RuntimeError("Nenhum ativo OTC disponível foi encontrado na Traderoom.")
+        raise RuntimeError("Nenhum ativo configurado (aberto/OTC) foi encontrado na Traderoom.")
 
     novos_bullex = {}
     novos_ativos = {}
@@ -2326,6 +2010,8 @@ def _atualizar_ativos_mercado_aberto(ativos, origem):
             "symbol": item["symbol"],
             "active_id": int(item["active_id"]),
             "ticker": item["ticker"],
+            "is_otc": bool(item.get("is_otc")),
+            "mercado": item.get("mercado", "OTC" if item.get("is_otc") else "ABERTO"),
         }
         novos_ativos[codigo] = item["symbol"]
 
@@ -2339,7 +2025,7 @@ def _atualizar_ativos_mercado_aberto(ativos, origem):
         _bullex_assets_ready_event.set()
 
     estado["ativos_info"] = {
-        "tipo": "OTC",
+        "tipo": "MERCADO_ABERTO",
         "quantidade": len(novos_bullex),
         "status": "AUTOMÁTICO",
         "lista": ", ".join(
@@ -2348,16 +2034,26 @@ def _atualizar_ativos_mercado_aberto(ativos, origem):
         ) or "-",
     }
     log(
-        "[OTC AUTO] Ativos carregados: "
+        "[ATIVOS] Mercado aberto + OTC carregados: "
         + ", ".join(
             f"{cfg['ticker']}={cfg['active_id']}"
             for cfg in novos_bullex.values()
         )
     )
 
+    desejados = set(PARES_MERCADO_ABERTO.keys()) | {
+        f"{c}_OTC" for c in PARES_OTC_ALVO.keys()
+    }
+    faltantes = sorted(desejados - set(novos_bullex.keys()))
+    if faltantes:
+        log(
+            "[ATIVOS] Configurados mas não retornados pela Traderoom: "
+            + ", ".join(faltantes)
+        )
+
 
 def _inicializar_ativos_mercado_aberto():
-    """Descobre automaticamente todos os ativos OTC disponíveis.
+    """Descobre Forex normal e os OTC configurados automaticamente.
 
     A inicialização é serializada para impedir duas descobertas concorrentes
     após reconexões rápidas do WebSocket.
@@ -2365,7 +2061,7 @@ def _inicializar_ativos_mercado_aberto():
     global _bullex_assets_last_error
 
     if not _bullex_assets_init_lock.acquire(blocking=False):
-        log("[OTC AUTO] Descoberta de ativos já está em andamento.")
+        log("[OPEN MARKET] Descoberta de ativos já está em andamento.")
         return
 
     try:
@@ -2376,35 +2072,51 @@ def _inicializar_ativos_mercado_aberto():
             _, ativos = _consultar_lista_mercado_aberto(fonte_digital)
             if not ativos:
                 raise RuntimeError(
-                    "Lista digital não retornou ativos OTC disponíveis."
+                    "Lista digital não retornou os pares configurados."
                 )
 
             _atualizar_ativos_mercado_aberto(ativos, fonte_digital)
             _assinar_candles_mercado_aberto()
             log(
-                f"[OTC AUTO] Inicialização concluída com {len(ativos)} ativo(s)."
+                f"[OPEN MARKET] Inicialização concluída com {len(ativos)} ativo(s)."
             )
             return
 
         except Exception as e:
             _bullex_assets_last_error = str(e)
-            log(f"[OTC AUTO] Descoberta digital falhou: {e}")
+            log(f"[OPEN MARKET] Descoberta digital falhou: {e}")
 
-        # Limpa o mapa enquanto a Traderoom não retornar OTCs válidos.
+        # Diagnóstico adicional. IDs marginais nunca são usados para ordens.
+        try:
+            nome_marginal = "marginal-forex-instruments.get-underlying-list"
+            _, diagnostico = _consultar_lista_mercado_aberto(nome_marginal)
+            if diagnostico:
+                log(
+                    "[OPEN MARKET] A lista marginal reconheceu: "
+                    + ", ".join(
+                        f"{x['ticker']}={x['active_id']}" for x in diagnostico
+                    )
+                    + ". Mantidos apenas como diagnóstico; nenhuma ordem usa esses IDs."
+                )
+        except Exception as diag_e:
+            log(f"[OPEN MARKET] Diagnóstico marginal indisponível: {diag_e}")
+
+        # Mantém ATIVOS (a lista lógica dos pares) intacta. Somente o mapa
+        # de active_id fica vazio enquanto a Traderoom não retornar IDs válidos.
         with _bullex_assets_lock:
             ATIVO_BULLEX.clear()
             _bullex_assets_ready_event.clear()
 
         estado["ativos_info"] = {
-            "tipo": "OTC",
+            "tipo": "MERCADO_ABERTO",
             "quantidade": 0,
             "status": "AGUARDANDO",
             "lista": "-",
             "erro": _bullex_assets_last_error,
         }
         log(
-            "[OTC AUTO] Ativos ainda não disponíveis. "
-            "A leitura ficará bloqueada até nova autenticação/descoberta; Somente OTC será usado."
+            "[OPEN MARKET] Ativos ainda não disponíveis. "
+            "A leitura ficará bloqueada até nova autenticação/descoberta."
         )
     finally:
         _bullex_assets_init_lock.release()
@@ -2440,23 +2152,31 @@ def _aguardar_ativos_mercado_aberto(timeout=30):
     return False
 
 def _assinar_candles_mercado_aberto():
-    """Assina M5 e M15 dos ativos usados pela estratégia FIM."""
+    """Assina somente M5 dos ativos abertos/OTC usados pela R17."""
     assinaturas = set()
 
-    for config in ATIVO_BULLEX.values():
+    with _bullex_assets_lock:
+        configs = list(ATIVO_BULLEX.values())
+
+    for config in configs:
         active_id = int(config["active_id"])
-        for size in (300, 900):
-            chave = (active_id, size)
-            if chave in assinaturas:
-                continue
-            assinaturas.add(chave)
-            try:
-                _assinar_candle(active_id, size)
-            except Exception as e:
-                log(
-                    f"Nao foi possivel assinar candle-generated "
-                    f"active_id={active_id} size={size}: {e}"
-                )
+        chave = (active_id, 300)
+        if chave in assinaturas:
+            continue
+        assinaturas.add(chave)
+
+        try:
+            _assinar_candle(active_id, 300)
+            log(
+                f"[ATIVOS] Assinatura M5 ativa: "
+                f"{config.get('symbol')} [{config.get('mercado', 'ABERTO')}] "
+                f"active_id={active_id}"
+            )
+        except Exception as e:
+            log(
+                f"[ATIVOS] Falha assinatura M5 "
+                f"active_id={active_id}: {e}"
+            )
 
 
 def _enviar_e_aguardar(
@@ -2994,193 +2714,6 @@ def atr(candles, period=14):
     )
 
 
-def adx(candles, period=14):
-    """Calcula ADX de Wilder para medir força de tendência, sem direção."""
-    if len(candles) < (period * 2) + 1:
-        return None
-
-    trs = []
-    plus_dm = []
-    minus_dm = []
-    for i in range(1, len(candles)):
-        atual = candles[i]
-        anterior = candles[i - 1]
-        high = float(atual["high"])
-        low = float(atual["low"])
-        prev_high = float(anterior["high"])
-        prev_low = float(anterior["low"])
-        prev_close = float(anterior["close"])
-
-        up = high - prev_high
-        down = prev_low - low
-        plus_dm.append(up if up > down and up > 0 else 0.0)
-        minus_dm.append(down if down > up and down > 0 else 0.0)
-        trs.append(max(high - low, abs(high - prev_close), abs(low - prev_close)))
-
-    if len(trs) < period * 2:
-        return None
-
-    tr_s = sum(trs[:period])
-    p_s = sum(plus_dm[:period])
-    m_s = sum(minus_dm[:period])
-    dxs = []
-
-    def _dx(trv, pv, mv):
-        if trv <= 0:
-            return None
-        pdi = 100.0 * pv / trv
-        mdi = 100.0 * mv / trv
-        den = pdi + mdi
-        if den <= 0:
-            return 0.0
-        return 100.0 * abs(pdi - mdi) / den
-
-    first = _dx(tr_s, p_s, m_s)
-    if first is not None:
-        dxs.append(first)
-
-    for i in range(period, len(trs)):
-        tr_s = tr_s - (tr_s / period) + trs[i]
-        p_s = p_s - (p_s / period) + plus_dm[i]
-        m_s = m_s - (m_s / period) + minus_dm[i]
-        valor = _dx(tr_s, p_s, m_s)
-        if valor is not None:
-            dxs.append(valor)
-
-    if len(dxs) < period:
-        return None
-
-    valor_adx = sum(dxs[:period]) / period
-    for valor in dxs[period:]:
-        valor_adx = ((valor_adx * (period - 1)) + valor) / period
-    return valor_adx
-
-
-def _contexto_forca_m5(active_id):
-    """Retorna direção M5 somente quando tendência e força são suficientes."""
-    candles = somente_velas_fechadas(_candles_cache(active_id, 300), 5)
-    if len(candles) < 40:
-        return None
-    candles = candles[-80:]
-
-    closes = [float(c["close"]) for c in candles]
-    ema9s = ema_series(closes, 9)
-    ema21s = ema_series(closes, 21)
-    ema9 = ema9s[-1]
-    ema21 = ema21s[-1]
-    ema9_prev = ema9s[-3] if len(ema9s) >= 3 else None
-    ema21_prev = ema21s[-3] if len(ema21s) >= 3 else None
-    atr5 = atr(candles, 14)
-    adx15 = adx(candles, M5_ADX_PERIODO)
-
-    if None in (ema9, ema21, ema9_prev, ema21_prev) or not atr5 or atr5 <= 0 or adx15 is None:
-        return None
-    if adx15 < M5_ADX_MINIMO:
-        return None
-
-    separacao = abs(ema9 - ema21)
-    if separacao < atr5 * M5_SEPARACAO_EMAS_ATR_MIN:
-        return None
-
-    inclinacao9 = ema9 - ema9_prev
-    inclinacao21 = ema21 - ema21_prev
-    ultimos = candles[-M5_IMPULSO_CANDLES:]
-    altas = sum(float(c["close"]) > float(c["open"]) for c in ultimos)
-    baixas = sum(float(c["close"]) < float(c["open"]) for c in ultimos)
-
-    min_inclinacao = atr5 * M5_INCLINACAO_ATR_MIN
-    if (
-        ema9 > ema21
-        and inclinacao9 >= min_inclinacao
-        and inclinacao21 > 0
-        and altas >= M5_IMPULSO_MIN_DIRECIONAIS
-    ):
-        return {
-            "direcao": "CALL", "ema9": ema9, "ema21": ema21,
-            "adx": adx15, "atr": atr5, "separacao": separacao,
-            "impulso": altas,
-        }
-
-    if (
-        ema9 < ema21
-        and inclinacao9 <= -min_inclinacao
-        and inclinacao21 < 0
-        and baixas >= M5_IMPULSO_MIN_DIRECIONAIS
-    ):
-        return {
-            "direcao": "PUT", "ema9": ema9, "ema21": ema21,
-            "adx": adx15, "atr": atr5, "separacao": separacao,
-            "impulso": baixas,
-        }
-
-    return None
-
-
-# ============================================================
-# INFORMAÇÕES DA VELA
-# ============================================================
-
-
-def _contexto_forca_m15(active_id):
-    """Retorna direção M15 somente quando tendência e força são suficientes."""
-    candles = somente_velas_fechadas(_candles_cache(active_id, 900), 5)
-    if len(candles) < 40:
-        return None
-    candles = candles[-80:]
-
-    closes = [float(c["close"]) for c in candles]
-    ema9s = ema_series(closes, 9)
-    ema21s = ema_series(closes, 21)
-    ema9 = ema9s[-1]
-    ema21 = ema21s[-1]
-    ema9_prev = ema9s[-3] if len(ema9s) >= 3 else None
-    ema21_prev = ema21s[-3] if len(ema21s) >= 3 else None
-    atr5 = atr(candles, 14)
-    adx15 = adx(candles, M15_ADX_PERIODO)
-
-    if None in (ema9, ema21, ema9_prev, ema21_prev) or not atr5 or atr5 <= 0 or adx15 is None:
-        return None
-    if adx15 < M15_ADX_MINIMO:
-        return None
-
-    separacao = abs(ema9 - ema21)
-    if separacao < atr5 * M15_SEPARACAO_EMAS_ATR_MIN:
-        return None
-
-    inclinacao9 = ema9 - ema9_prev
-    inclinacao21 = ema21 - ema21_prev
-    ultimos = candles[-M15_IMPULSO_CANDLES:]
-    altas = sum(float(c["close"]) > float(c["open"]) for c in ultimos)
-    baixas = sum(float(c["close"]) < float(c["open"]) for c in ultimos)
-
-    min_inclinacao = atr5 * M15_INCLINACAO_ATR_MIN
-    if (
-        ema9 > ema21
-        and inclinacao9 >= min_inclinacao
-        and inclinacao21 > 0
-        and altas >= M15_IMPULSO_MIN_DIRECIONAIS
-    ):
-        return {
-            "direcao": "CALL", "ema9": ema9, "ema21": ema21,
-            "adx": adx15, "atr": atr5, "separacao": separacao,
-            "impulso": altas,
-        }
-
-    if (
-        ema9 < ema21
-        and inclinacao9 <= -min_inclinacao
-        and inclinacao21 < 0
-        and baixas >= M15_IMPULSO_MIN_DIRECIONAIS
-    ):
-        return {
-            "direcao": "PUT", "ema9": ema9, "ema21": ema21,
-            "adx": adx15, "atr": atr5, "separacao": separacao,
-            "impulso": baixas,
-        }
-
-    return None
-
-
 # ============================================================
 # INFORMAÇÕES DA VELA
 # ============================================================
@@ -3398,7 +2931,7 @@ def analisar_pullback(
     candles_5m,
     candles_15m
 ):
-    """Estratégia principal 5M + 5M + pullback + confirmação separada.
+    """Estratégia principal 5M + 15M + pullback + confirmação separada.
 
     A lógica mantém o núcleo conservador, mas elimina filtros redundantes
     que estavam transformando quase todos os setups válidos em AGUARDAR.
@@ -3420,7 +2953,7 @@ def analisar_pullback(
             "score": 0,
             "preco": float(candles_5m[-1]["close"]),
             "vela": candles_5m[-1]["_dt"],
-            "mensagem": "Poucas velas de 5M.",
+            "mensagem": "Poucas velas de 15M.",
             "score_call": 0,
             "score_put": 0,
         }
@@ -3578,7 +3111,7 @@ def analisar_pullback(
         bloqueio = f"RSI extremo ({rsi14:.2f})."
     elif tendencia_5m == "ALTA":
         if tendencia_15m != "ALTA":
-            bloqueio = "5M em alta, mas 5M não confirma."
+            bloqueio = "5M em alta, mas 15M não confirma."
         elif not pullback_call:
             bloqueio = "Alta alinhada, mas sem pullback válido."
         elif not confirmacao_call:
@@ -3589,7 +3122,7 @@ def analisar_pullback(
             sinal = "CALL"
     elif tendencia_5m == "BAIXA":
         if tendencia_15m != "BAIXA":
-            bloqueio = "5M em baixa, mas 5M não confirma."
+            bloqueio = "5M em baixa, mas 15M não confirma."
         elif not pullback_put:
             bloqueio = "Baixa alinhada, mas sem pullback válido."
         elif not confirmacao_put:
@@ -3617,13 +3150,13 @@ def analisar_pullback(
 
     if sinal == "CALL":
         mensagem = (
-            "CALL FORTE | 5M ALTA + 5M ALTA | "
+            "CALL FORTE | 5M ALTA + 15M ALTA | "
             "Pullback real | Confirmação em vela separada | "
             f"Score={score_call}/12 | RSI={rsi14:.2f}"
         )
     elif sinal == "PUT":
         mensagem = (
-            "PUT FORTE | 5M BAIXA + 5M BAIXA | "
+            "PUT FORTE | 5M BAIXA + 15M BAIXA | "
             "Pullback real | Confirmação em vela separada | "
             f"Score={score_put}/12 | RSI={rsi14:.2f}"
         )
@@ -3631,7 +3164,7 @@ def analisar_pullback(
         mensagem = f"AGUARDAR | {bloqueio}"
     else:
         mensagem = (
-            f"AGUARDAR | 5M={tendencia_5m} | 5M={tendencia_15m} | "
+            f"AGUARDAR | 5M={tendencia_5m} | 15M={tendencia_15m} | "
             f"Pullback={detalhes_pullback} | Confirmação={detalhes_confirmacao} | "
             f"CALL={score_call} | PUT={score_put}"
         )
@@ -3666,18 +3199,8 @@ def analisar_pullback(
 
 
 # ============================================================
-# ESTRATÉGIA ÚNICA - S/R M5 + REVERSÃO NA MESMA VELA M5
+# ESTRATÉGIA ÚNICA - S/R M15 + RETRAÇÃO NA MESMA VELA M5
 # ============================================================
-
-def _bloqueio_loss_restante(symbol):
-    # Bloqueio após LOSS desativado.
-    return 0.0
-
-
-def _aplicar_bloqueio_loss(symbol):
-    # Mantido apenas por compatibilidade com chamadas antigas.
-    return None
-
 
 def _symbol_por_active_id(active_id):
     try:
@@ -3699,14 +3222,6 @@ def _candles_cache(active_id, size):
     return ordenar_candles(candles)
 
 
-def _atr_cache_1m(active_id):
-    candles = _candles_cache(active_id, 300)
-    fechadas = somente_velas_fechadas(candles, 1)
-    if len(fechadas) < 15:
-        return None
-    return atr(fechadas, 14)
-
-
 def _atr_cache_5m(active_id):
     candles = _candles_cache(active_id, 300)
     fechadas = somente_velas_fechadas(candles, 5)
@@ -3715,12 +3230,20 @@ def _atr_cache_5m(active_id):
     return atr(fechadas, 14)
 
 
-def _pivos_m5(candles):
-    """Retorna pivôs de suporte e resistência usando apenas candles M5 fechados."""
+def _atr_cache_15m(active_id):
+    candles = _candles_cache(active_id, 900)
+    fechadas = somente_velas_fechadas(candles, 15)
+    if len(fechadas) < 15:
+        return None
+    return atr(fechadas, 14)
+
+
+def _pivos_sr(candles, janela):
+    """Retorna pivôs de suporte e resistência usando apenas candles M15 fechados."""
     infos = [candle_info(c) for c in candles]
     suportes = []
     resistencias = []
-    w = SR_M5_PIVOT_JANELA
+    w = janela
 
     for i in range(w, len(infos) - w):
         atual = infos[i]
@@ -3762,35 +3285,77 @@ def _agrupar_niveis(valores, tolerancia):
     return grupos
 
 
-def _niveis_sr_m5(active_id):
-    candles = _candles_cache(active_id, 300)
-    fechadas = somente_velas_fechadas(candles, 5)
+def _niveis_sr_m15(active_id):
+    candles = _candles_cache(active_id, 900)
+    fechadas = somente_velas_fechadas(candles, 15)
 
     if len(fechadas) < 25:
         return [], [], None
 
+    fechadas = fechadas[-SR_M15_LOOKBACK:]
+    atr15 = atr(fechadas, 14)
+    if not atr15 or atr15 <= 0:
+        return [], [], None
+
+    tolerancia = atr15 * SR_M15_TOLERANCIA_ATR
+    sup_pivos, res_pivos = _pivos_sr(fechadas, SR_M15_PIVOT_JANELA)
+
+    suportes = [
+        g for g in _agrupar_niveis(sup_pivos, tolerancia)
+        if g["toques"] >= SR_M15_MIN_TOQUES
+    ]
+    resistencias = [
+        g for g in _agrupar_niveis(res_pivos, tolerancia)
+        if g["toques"] >= SR_M15_MIN_TOQUES
+    ]
+
+    return suportes, resistencias, atr15
+
+
+
+def _niveis_sr_m5(active_id):
+    candles = _candles_cache(active_id, 300)
+    fechadas = somente_velas_fechadas(candles, 5)
+    if len(fechadas) < 25:
+        return [], [], None
     fechadas = fechadas[-SR_M5_LOOKBACK:]
     atr5 = atr(fechadas, 14)
     if not atr5 or atr5 <= 0:
         return [], [], None
-
     tolerancia = atr5 * SR_M5_TOLERANCIA_ATR
-    sup_pivos, res_pivos = _pivos_m5(fechadas)
-
-    suportes = [
-        g for g in _agrupar_niveis(sup_pivos, tolerancia)
-        if g["toques"] >= SR_M5_MIN_TOQUES
-    ]
-    resistencias = [
-        g for g in _agrupar_niveis(res_pivos, tolerancia)
-        if g["toques"] >= SR_M5_MIN_TOQUES
-    ]
-
+    sup, res = _pivos_sr(fechadas, SR_M5_PIVOT_JANELA)
+    suportes = [g for g in _agrupar_niveis(sup, tolerancia) if g["toques"] >= SR_M5_MIN_TOQUES]
+    resistencias = [g for g in _agrupar_niveis(res, tolerancia) if g["toques"] >= SR_M5_MIN_TOQUES]
     return suportes, resistencias, atr5
 
 
+def _combinar_niveis_sr(n15, n5, atr5):
+    """M15 tem prioridade; M5 exige >=3 toques; confluência M5+M15 é a mais forte."""
+    limite = atr5 * SR_CONFLUENCIA_ATR5
+    saida = []
+    for a in n15:
+        item = dict(a)
+        item["timeframe"] = "M15"
+        item["confluencia"] = False
+        perto = [b for b in n5 if abs(b["nivel"] - a["nivel"]) <= limite]
+        if perto:
+            b = min(perto, key=lambda x: abs(x["nivel"] - a["nivel"]))
+            item["nivel"] = (a["nivel"] + b["nivel"]) / 2.0
+            item["timeframe"] = "M5+M15"
+            item["confluencia"] = True
+            item["toques"] = a["toques"] + b["toques"]
+        saida.append(item)
+    for b in n5:
+        if any(abs(b["nivel"] - a["nivel"]) <= limite for a in n15):
+            continue
+        item = dict(b)
+        item["timeframe"] = "M5"
+        item["confluencia"] = False
+        saida.append(item)
+    return saida
+
 def _nivel_mais_proximo(niveis, preco, lado):
-    """Escolhe o nível M5 relevante mais próximo do preço atual."""
+    """Escolhe o nível M15 relevante mais próximo do preço atual."""
     if not niveis:
         return None
 
@@ -3806,289 +3371,138 @@ def _nivel_mais_proximo(niveis, preco, lado):
     return min(candidatos, key=lambda g: abs(preco - g["nivel"]))
 
 
+def _adx_candles(candles, period=14):
+    """ADX simples (Wilder) calculado somente com candles fechados."""
+    if len(candles) < period * 2 + 2:
+        return None
+    trs, plus_dm, minus_dm = [], [], []
+    for i in range(1, len(candles)):
+        h = float(candles[i]["high"]); l = float(candles[i]["low"])
+        ph = float(candles[i-1]["high"]); pl = float(candles[i-1]["low"])
+        pc = float(candles[i-1]["close"])
+        trs.append(max(h-l, abs(h-pc), abs(l-pc)))
+        up = h-ph; down = pl-l
+        plus_dm.append(up if up > down and up > 0 else 0.0)
+        minus_dm.append(down if down > up and down > 0 else 0.0)
+    if len(trs) < period:
+        return None
+    atr_w=sum(trs[:period]); pdm=sum(plus_dm[:period]); mdm=sum(minus_dm[:period])
+    dx=[]
+    for i in range(period, len(trs)):
+        atr_w = atr_w - atr_w/period + trs[i]
+        pdm = pdm - pdm/period + plus_dm[i]
+        mdm = mdm - mdm/period + minus_dm[i]
+        if atr_w <= 0: continue
+        pdi=100*pdm/atr_w; mdi=100*mdm/atr_w
+        den=pdi+mdi
+        if den>0: dx.append(100*abs(pdi-mdi)/den)
+    if len(dx) < period:
+        return sum(dx)/len(dx) if dx else None
+    adx=sum(dx[:period])/period
+    for v in dx[period:]: adx=((adx*(period-1))+v)/period
+    return adx
 
-def _log_fim_diagnostico(active_id, symbol, status, **dados):
-    """Log compacto para entender por que a FIM entrou ou bloqueou."""
-    partes = [f"[FIM-M5][DIAG] {symbol}", status]
-    for chave, valor in dados.items():
-        if isinstance(valor, float):
-            partes.append(f"{chave}={valor:.3f}")
-        else:
-            partes.append(f"{chave}={valor}")
-    log(" | ".join(partes))
+
+def _fechadas_antes(candles, candle_from, segundos):
+    """Evita usar a vela atual ou informação futura na análise."""
+    out=[]
+    for c in ordenar_candles(candles):
+        dt=c.get("_dt")
+        if dt is not None and dt.timestamp()+segundos <= candle_from+0.001:
+            out.append(c)
+    return out
 
 
 def _resultado_retracao_intravela(msg, active_id):
-    """R58 — estratégia nova: pullback de tendência confirmado.
+    """R20: continuação de tendência M15 + pullback M5 + confirmação intravela.
 
-    Entrada sempre na ABERTURA de uma nova vela M5, usando apenas velas
-    anteriores já fechadas.
-
-    CALL:
-      1) M15 em tendência de alta: EMA20 > EMA50, EMA20 subindo e ADX >= 22.
-      2) M5 alinhado: EMA9 > EMA20 > EMA50 e ADX >= 18.
-      3) Penúltima vela faz retração contra a tendência e toca/procura a EMA20.
-      4) Última vela confirma a retomada: verde, corpo forte e fecha acima da
-         máxima da vela de retração.
-      5) RSI entre 52 e 68 para evitar entrada já excessivamente esticada.
-
-    PUT é o espelho da regra acima.
-
-    A ideia é operar CONTINUAÇÃO depois de um pullback real, em vez de prever
-    apenas pela cor/sequência das velas.
+    M15 define a direção por EMA20/EMA50, inclinação da EMA20 e ADX.
+    M5 exige EMA9/20/50 alinhadas e a última vela fechada fazendo pullback
+    controlado até a região da EMA20. A vela M5 atual precisa confirmar a
+    retomada rompendo a máxima/mínima da vela de pullback.
     """
-    if not isinstance(msg, dict):
-        return None
-
-    codigo, symbol = _symbol_por_active_id(active_id)
-    symbol = symbol or str(active_id)
-
+    if not isinstance(msg, dict): return None
     try:
-        candle_from = int(float(msg["from"]))
-        candle_to = int(float(msg.get("to") or (candle_from + 300)))
-        preco_atual = float(msg.get("close", msg.get("open")))
-    except Exception:
+        abertura=float(msg["open"]); fechamento=float(msg["close"])
+        maxima=float(msg.get("max",msg.get("high"))); minima=float(msg.get("min",msg.get("low")))
+        candle_from=int(float(msg["from"])); candle_to=int(float(msg.get("to") or candle_from+300))
+    except Exception: return None
+
+    server_ts,_=_horario_servidor_atual()
+    decorridos=max(0.0,server_ts-candle_from); restantes=max(0.0,candle_to-server_ts)
+    if decorridos < INTRAVELA_MIN_SEGUNDOS_DECORRIDOS or restantes < INTRAVELA_MIN_SEGUNDOS_RESTANTES:
         return None
 
-    server_ts, _ = _horario_servidor_atual()
-    decorridos = max(0.0, float(server_ts) - candle_from)
-    restantes = max(0.0, candle_to - float(server_ts))
+    m5=_fechadas_antes(_candles_cache(active_id,300),candle_from,300)[-90:]
+    m15=_fechadas_antes(_candles_cache(active_id,900),candle_from,900)[-90:]
+    if len(m5)<55 or len(m15)<55: return None
 
-    # Só entra perto da abertura da nova vela M5.
-    if decorridos > 12.0:
-        return None
+    c5=closes(m5); c15=closes(m15)
+    atr5=atr(m5,14); adx5=_adx_candles(m5,14); adx15=_adx_candles(m15,14)
+    e9=ema(c5,9); e20=ema(c5,20); e50=ema(c5,50)
+    e20_15=ema(c15,20); e50_15=ema(c15,50)
+    e20_15_prev=ema(c15[:-3],20) if len(c15[:-3])>=20 else None
+    rsi5=rsi(c5,14)
+    vals=(atr5,adx5,adx15,e9,e20,e50,e20_15,e50_15,e20_15_prev,rsi5)
+    if any(v is None for v in vals) or atr5<=0: return None
 
-    def fechadas_ate_abertura(size, duracao):
-        """Retorna somente candles encerrados até candle_from."""
-        resultado = []
-        for c in ordenar_candles(_candles_cache(active_id, size)):
-            try:
-                c_from = int(float(c.get("from")))
-            except Exception:
-                c_from = None
+    prev=m5[-1]
+    po=float(prev["open"]); pc=float(prev["close"]); ph=float(prev["high"]); pl=float(prev["low"])
+    prange=max(ph-pl,1e-12); pbody=abs(pc-po)
+    current_range=max(maxima-minima,1e-12); current_body=abs(fechamento-abertura)
 
-            try:
-                c_to = int(float(c.get("to")))
-            except Exception:
-                c_to = None
+    # Evita mercado lateral e também velas de confirmação já excessivamente esticadas.
+    if adx15 < 20 or adx5 < 17: return None
+    if current_range > atr5*1.55 or current_body > atr5*1.20: return None
 
-            if c_to is None and c_from is not None:
-                c_to = c_from + duracao
+    # Pullback deve alcançar a região da EMA20, mas não atravessar a EMA50 com força.
+    tol=atr5*0.18
+    touch20 = pl <= e20+tol and ph >= e20-tol
 
-            if c_to is None:
-                dt = c.get("_dt")
-                if isinstance(dt, datetime):
-                    c_to = int(dt.timestamp()) + duracao
+    # Tendência principal e microestrutura.
+    trend_call=(e20_15>e50_15 and e20_15>e20_15_prev and c15[-1]>e20_15 and e9>e20>e50)
+    trend_put=(e20_15<e50_15 and e20_15<e20_15_prev and c15[-1]<e20_15 and e9<e20<e50)
 
-            if c_to is not None and c_to <= candle_from:
-                resultado.append(c)
+    # A retração é preferencialmente contrária à tendência; doji pequeno também é aceito.
+    prev_bear = pc < po or pbody/prange <= 0.35
+    prev_bull = pc > po or pbody/prange <= 0.35
 
-        return resultado
+    # Confirmação ocorre durante a vela atual: direção + rompimento do extremo do pullback.
+    call_confirm=(fechamento>abertura and fechamento>ph and fechamento>e9 and current_body>=atr5*0.18)
+    put_confirm=(fechamento<abertura and fechamento<pl and fechamento<e9 and current_body>=atr5*0.18)
 
-    m5 = fechadas_ate_abertura(300, 300)
-    m15 = fechadas_ate_abertura(900, 900)
+    sinal=None
+    if trend_call and touch20 and prev_bear and pl >= e50-tol and 50 <= rsi5 <= 68 and call_confirm:
+        sinal="CALL"
+    elif trend_put and touch20 and prev_bull and ph <= e50+tol and 32 <= rsi5 <= 50 and put_confirm:
+        sinal="PUT"
+    if sinal is None: return None
 
-    if len(m5) < 60 or len(m15) < 55:
-        return None
-
-    m5 = m5[-90:]
-    m15 = m15[-80:]
-
-    closes5 = [float(c["close"]) for c in m5]
-    closes15 = [float(c["close"]) for c in m15]
-
-    # -----------------------------
-    # CONTEXTO M15
-    # -----------------------------
-    ema20_15 = ema(closes15, 20)
-    ema50_15 = ema(closes15, 50)
-    ema20_15_prev = ema(closes15[:-3], 20) if len(closes15) >= 53 else None
-    adx15 = adx(m15, 14)
-
-    # -----------------------------
-    # CONTEXTO M5
-    # -----------------------------
-    ema9_5 = ema(closes5, 9)
-    ema20_5 = ema(closes5, 20)
-    ema50_5 = ema(closes5, 50)
-    ema20_series_5 = ema_series(closes5, 20)
-    ema50_series_5 = ema_series(closes5, 50)
-
-    rsi14 = rsi(closes5, 14)
-    atr14 = atr(m5, 14)
-    adx5 = adx(m5, 14)
-
-    if any(v is None for v in (
-        ema20_15, ema50_15, ema20_15_prev, adx15,
-        ema9_5, ema20_5, ema50_5, rsi14, atr14, adx5
-    )):
-        return None
-
-    if atr14 <= 0:
-        return None
-
-    # Tendência precisa ter força mínima.
-    if adx15 < 22.0 or adx5 < 18.0:
-        return None
-
-    retracao = candle_info(m5[-2])
-    confirmacao = candle_info(m5[-1])
-
-    ema20_retracao = ema20_series_5[-2]
-    ema50_retracao = ema50_series_5[-2]
-    if ema20_retracao is None or ema50_retracao is None:
-        return None
-
-    # Qualidade estrutural da vela de confirmação.
-    corpo_confirmacao_atr = confirmacao["body"] / atr14
-    range_confirmacao_atr = confirmacao["range"] / atr14
-    range_retracao_atr = retracao["range"] / atr14
-
-    if not (0.25 <= corpo_confirmacao_atr <= 1.20):
-        return None
-    if range_confirmacao_atr > 1.55 or range_retracao_atr > 1.70:
-        return None
-    if confirmacao["body_ratio"] < 0.50:
-        return None
-
-    direcao = None
-
-    # ==========================================================
-    # CALL
-    # ==========================================================
-    tendencia15_call = (
-        ema20_15 > ema50_15
-        and ema20_15 > ema20_15_prev
-        and closes15[-1] > ema20_15
-    )
-
-    alinhamento5_call = (
-        ema9_5 > ema20_5 > ema50_5
-    )
-
-    # Retração real: vela contra a tendência, procurando a EMA20,
-    # mas sem perder completamente a estrutura da EMA50.
-    toque_ema20_call = (
-        retracao["low"] <= ema20_retracao + (0.15 * atr14)
-        and retracao["close"] >= ema50_retracao - (0.10 * atr14)
-    )
-
-    confirmacao_call = (
-        confirmacao["close"] > confirmacao["open"]
-        and confirmacao["close"] > retracao["high"]
-        and confirmacao["close"] > ema9_5
-        and (
-            (confirmacao["close"] - confirmacao["low"])
-            / max(confirmacao["range"], 1e-12)
-        ) >= 0.70
-    )
-
-    retracao_call = retracao["close"] < retracao["open"]
-
-    if (
-        tendencia15_call
-        and alinhamento5_call
-        and retracao_call
-        and toque_ema20_call
-        and confirmacao_call
-        and 52.0 <= rsi14 <= 68.0
-    ):
-        direcao = "CALL"
-
-    # ==========================================================
-    # PUT
-    # ==========================================================
-    tendencia15_put = (
-        ema20_15 < ema50_15
-        and ema20_15 < ema20_15_prev
-        and closes15[-1] < ema20_15
-    )
-
-    alinhamento5_put = (
-        ema9_5 < ema20_5 < ema50_5
-    )
-
-    toque_ema20_put = (
-        retracao["high"] >= ema20_retracao - (0.15 * atr14)
-        and retracao["close"] <= ema50_retracao + (0.10 * atr14)
-    )
-
-    confirmacao_put = (
-        confirmacao["close"] < confirmacao["open"]
-        and confirmacao["close"] < retracao["low"]
-        and confirmacao["close"] < ema9_5
-        and (
-            (confirmacao["high"] - confirmacao["close"])
-            / max(confirmacao["range"], 1e-12)
-        ) >= 0.70
-    )
-
-    retracao_put = retracao["close"] > retracao["open"]
-
-    if (
-        direcao is None
-        and tendencia15_put
-        and alinhamento5_put
-        and retracao_put
-        and toque_ema20_put
-        and confirmacao_put
-        and 32.0 <= rsi14 <= 48.0
-    ):
-        direcao = "PUT"
-
-    if direcao is None:
-        return None
-
-    # Score serve apenas para ranquear os sinais simultâneos.
-    score = 10
-    if adx15 >= 28.0:
-        score += 1
-    if adx5 >= 24.0:
-        score += 1
-    if direcao == "CALL" and 55.0 <= rsi14 <= 64.0:
-        score += 1
-    if direcao == "PUT" and 36.0 <= rsi14 <= 45.0:
-        score += 1
+    score=10
+    if adx15>=25: score+=1
+    if adx5>=22: score+=1
+    if abs(pc-e20)<=atr5*0.12: score+=1
+    if current_body>=atr5*0.30: score+=1
+    if (sinal=="CALL" and 54<=rsi5<=64) or (sinal=="PUT" and 36<=rsi5<=46): score+=1
 
     return {
-        "sinal": direcao,
-        "score": score,
-        "score_call": score if direcao == "CALL" else 0,
-        "score_put": score if direcao == "PUT" else 0,
-        "preco": preco_atual,
-        "vela": datetime.fromtimestamp(candle_from, TZ),
-        "estrategia": "PULLBACK_TENDENCIA_CONFIRMADO",
-        "regime": "PULLBACK_EMA20",
-        "pullback": "EMA20 + vela de retracao",
-        "rejeicao": "confirmacao rompe extrema da retracao",
-        "lateral": "NAO",
-        "atr": atr14,
-        "rsi": rsi14,
-        "ema5": ema9_5,
-        "ema13": ema20_5,
-        "ema21": ema50_5,
-        "tendencia_5m": (
-            f"{direcao} | EMA9/20/50 | ADX {adx5:.1f}"
-        ),
-        "tendencia_15m": (
-            f"{direcao} | EMA20/50 | ADX {adx15:.1f}"
-        ),
-        "zona_fibonacci": "N/A",
-        "bloqueio": "SINAL",
-        "mensagem": (
-            f"{direcao} PULLBACK EMA20 CONFIRMADO | "
-            f"ADX5={adx5:.1f} | ADX15={adx15:.1f} | RSI={rsi14:.1f}"
-        ),
-        "candle_from": candle_from,
-        "candle_to": candle_to,
-        "segundos_decorridos": decorridos,
-        "segundos_restantes": restantes,
-        "padrao_sequencia": "PULLBACK_EMA20",
-        "quantidade_velas_sequencia": 0,
-        "adx_m5": adx5,
-        "adx_m15": adx15,
-        "distancia_ema_atr": abs(closes5[-1] - ema20_5) / atr14,
-        "range_ultima_atr": range_confirmacao_atr,
+        "sinal":sinal,"score":score,
+        "score_call":score if sinal=="CALL" else 1,"score_put":score if sinal=="PUT" else 1,
+        "preco":fechamento,"vela":datetime.fromtimestamp(candle_from,TZ),
+        "estrategia":"TREND_PULLBACK_M5_CONFIRMADO","regime":"TENDENCIA_PULLBACK",
+        "pullback":f"PULLBACK EMA20 M5 + ROMPIMENTO | ADX15={adx15:.1f}",
+        "rejeicao":"CONFIRMACAO DE RETOMADA",
+        "lateral":"NÃO" if adx15>=20 else "SIM","atr":atr5,"rsi":rsi5,
+        "ema5":e9,"ema13":e20,"ema21":e50,
+        "tendencia_5m":"ALTA" if sinal=="CALL" else "BAIXA",
+        "tendencia_15m":"ALTA" if sinal=="CALL" else "BAIXA",
+        "zona_fibonacci":"N/A","bloqueio":"SINAL",
+        "mensagem":f"{sinal} | pullback EMA20 M5 confirmado | ADX5={adx5:.1f} ADX15={adx15:.1f} RSI={rsi5:.1f} | restam={restantes:.1f}s",
+        "candle_from":candle_from,"candle_to":candle_to,
+        "segundos_decorridos":decorridos,"segundos_restantes":restantes,
+        "impulso":current_body,"retracao_ratio":abs(pc-e20)/atr5,
+        "nivel_sr":e20,"tipo_nivel":"EMA20_M5","toques_nivel":0,
+        "distancia_abertura_nivel":abs(abertura-e20),"adx5":adx5,"adx15":adx15,
     }
 
 def _atualizar_dashboard_intravela(symbol, resultado):
@@ -4107,10 +3521,10 @@ def _atualizar_dashboard_intravela(symbol, resultado):
     estado["detalhes"] = {
         "score_call": resultado.get("score_call", "-"),
         "score_put": resultado.get("score_put", "-"),
-        "rsi": (f"{resultado['rsi']:.2f}" if isinstance(resultado.get("rsi"), (int, float)) else "-"),
-        "ema5": "-",
-        "ema13": (f"{resultado['ema13']:.6f}" if isinstance(resultado.get("ema13"), (int, float)) else "-"),
-        "ema21": (f"{resultado['ema21']:.6f}" if isinstance(resultado.get("ema21"), (int, float)) else "-"),
+        "rsi": f"{resultado.get('rsi'):.2f}" if isinstance(resultado.get("rsi"), (int, float)) else "-",
+        "ema5": f"{resultado.get('ema5'):.5f}" if isinstance(resultado.get("ema5"), (int, float)) else "-",
+        "ema13": f"{resultado.get('ema13'):.5f}" if isinstance(resultado.get("ema13"), (int, float)) else "-",
+        "ema21": f"{resultado.get('ema21'):.5f}" if isinstance(resultado.get("ema21"), (int, float)) else "-",
         "tendencia_5m": resultado.get("tendencia_5m", "-"),
         "tendencia_15m": resultado.get("tendencia_15m", "-"),
         "pullback": resultado.get("pullback", "-"),
@@ -4121,318 +3535,10 @@ def _atualizar_dashboard_intravela(symbol, resultado):
             if isinstance(resultado.get("atr"), (int, float)) else "-"
         ),
         "bloqueio": resultado.get("bloqueio", "-"),
-        "regime": "INTRAVELA",
-        "estrategia": "SEQUENCIA_M5_TENDENCIA",
+        "regime": resultado.get("regime", "TENDENCIA_PULLBACK"),
+        "estrategia": resultado.get("estrategia", "TREND_PULLBACK_M5_CONFIRMADO"),
         "zona_fibonacci": "-",
     }
-
-
-
-_relogio_m5_lock = threading.Lock()
-_relogio_m5_ultima_janela = None
-_fim_m5_clock_thread = None
-_fim_m5_clock_thread_lock = threading.Lock()
-
-
-def _ativos_para_scan_m5():
-    """Retorna os active_ids dos ativos OTC realmente inicializados no ATIVO_BULLEX."""
-    candidatos = set()
-
-    try:
-        with _bullex_assets_lock:
-            mapa_bullex = dict(ATIVO_BULLEX)
-    except Exception:
-        mapa_bullex = dict(globals().get("ATIVO_BULLEX") or {})
-
-    for cfg in mapa_bullex.values():
-        if not isinstance(cfg, dict):
-            continue
-        try:
-            active_id = cfg.get("active_id")
-            if active_id is not None:
-                candidatos.add(int(active_id))
-        except Exception:
-            continue
-
-    prontos = []
-    sem_m5 = 0
-    sem_m15 = 0
-
-    for active_id in sorted(candidatos):
-        try:
-            candles_m5 = list(_candles_cache(int(active_id), 300) or [])
-            if not candles_m5:
-                sem_m5 += 1
-                continue
-
-            candles_m15 = list(_candles_cache(int(active_id), 900) or [])
-            if not candles_m15:
-                sem_m15 += 1
-                continue
-
-            prontos.append(int(active_id))
-        except Exception:
-            sem_m5 += 1
-
-    log(
-        f"[FIM-M5][RELOGIO] OTC inicializados={len(candidatos)} | "
-        f"prontos M5+M15={len(prontos)} | sem_m5={sem_m5} | sem_m15={sem_m15}"
-    )
-    return prontos
-
-
-def _ultimo_candle_fechado_m5(active_id, abertura_nova_m5):
-    """
-    Retorna a vela M5 fechada mais recente antes da abertura da nova M5.
-
-    Importante:
-    _candles_cache() já faz sua própria sincronização usando _bullex_cv.
-    Portanto NÃO usamos um lock externo inexistente.
-    """
-    try:
-        candles = list(_candles_cache(int(active_id), 300) or [])
-    except Exception as exc:
-        log(
-            f"[FIM-M5][RELOGIO] active_id={active_id} "
-            f"erro ao ler cache M5: {exc}"
-        )
-        return None
-
-    abertura_nova_m5 = int(abertura_nova_m5)
-    melhor = None
-    melhor_to = -1
-
-    for c in candles:
-        if not isinstance(c, dict):
-            continue
-
-        try:
-            c_from_raw = c.get("from")
-            if c_from_raw is None:
-                continue
-
-            c_from = int(float(c_from_raw))
-
-            c_to_raw = c.get("to")
-            if c_to_raw is None:
-                c_to = c_from + 300
-            else:
-                c_to = int(float(c_to_raw))
-        except (TypeError, ValueError):
-            continue
-
-        # A vela já está fechada se terminou na abertura da nova M5
-        # ou em qualquer instante anterior.
-        if c_to <= abertura_nova_m5 and c_to > melhor_to:
-            melhor_to = c_to
-            melhor = c
-
-    if melhor is None:
-        # Log compacto para diagnosticar apenas quando necessário.
-        if candles:
-            try:
-                ult = candles[-1]
-                log(
-                    f"[FIM-M5][RELOGIO] active_id={active_id} "
-                    f"cache_m5={len(candles)} | ultimo_from={ult.get('from')} "
-                    f"| ultimo_to={ult.get('to')} | abertura={abertura_nova_m5}"
-                )
-            except Exception:
-                pass
-        return None
-
-    return dict(melhor)
-
-
-
-def _rank_sinal_fim_m5(resultado):
-    """
-    Ranking entre sinais JÁ aprovados pela estratégia.
-
-    Prioridade:
-      1) maior score da estratégia;
-      2) contexto M15 mais forte (ADX);
-      3) menor distância da EMA em unidades de ATR;
-      4) última vela menos esticada em unidades de ATR.
-
-    Isso não cria sinal novo nem relaxa filtros: apenas escolhe os melhores
-    quando há mais sinais aprovados do que vagas simultâneas.
-    """
-    return (
-        float(resultado.get("score", 0)),
-        float(resultado.get("adx_m15", 0)),
-        -float(resultado.get("distancia_ema_atr", 999)),
-        -float(resultado.get("range_ultima_atr", 999)),
-    )
-
-
-def _avaliar_candidato_fim_m5(active_id, abertura_m5):
-    """Avalia um ativo usando apenas caches já carregados, sem enviar ordem."""
-    codigo, symbol = _symbol_por_active_id(active_id)
-    if not codigo or not symbol:
-        return None
-
-    ultimo = _ultimo_candle_fechado_m5(active_id, abertura_m5)
-    if ultimo is None:
-        log(f"[FIM-M5][RELOGIO] active_id={active_id} sem M5 fechado disponível.")
-        return None
-
-    msg_nova = {
-        "active_id": int(active_id),
-        "size": 300,
-        "from": int(abertura_m5),
-        "to": int(abertura_m5 + 300),
-        "open": ultimo.get("close"),
-        "close": ultimo.get("close"),
-        "min": ultimo.get("close"),
-        "max": ultimo.get("close"),
-        "phase": "deal",
-        "_gatilho": "RELOGIO_SERVIDOR_RANK",
-    }
-
-    resultado = _resultado_retracao_intravela(msg_nova, active_id)
-    if resultado is None:
-        return None
-
-    return {
-        "active_id": int(active_id),
-        "codigo": codigo,
-        "symbol": symbol,
-        "resultado": resultado,
-    }
-
-
-def _disparar_fim_m5_pelo_relogio():
-    """
-    Na abertura de cada M5, avalia TODOS os ativos prontos, ranqueia os sinais
-    aprovados e envia somente os melhores, respeitando as vagas disponíveis.
-    """
-    global _relogio_m5_ultima_janela
-
-    try:
-        ts_servidor, fonte = _horario_servidor_atual()
-        ts_servidor = float(ts_servidor)
-    except Exception:
-        return
-
-    abertura_m5 = int(ts_servidor // 300) * 300
-    decorridos = ts_servidor - abertura_m5
-
-    if decorridos < 0 or decorridos > 3.0:
-        return
-
-    with _relogio_m5_lock:
-        if _relogio_m5_ultima_janela == abertura_m5:
-            return
-
-    ativos = _ativos_para_scan_m5()
-    if not ativos:
-        log("[FIM-M5][RELOGIO] Nenhum ativo pronto com M5+M15 disponível.")
-        return
-
-    with _relogio_m5_lock:
-        if _relogio_m5_ultima_janela == abertura_m5:
-            return
-        _relogio_m5_ultima_janela = abertura_m5
-
-    log(
-        f"[FIM-M5][RELOGIO] Nova M5 detectada | "
-        f"abertura={datetime.fromtimestamp(abertura_m5, TZ).strftime('%H:%M:%S')} "
-        f"| atraso={decorridos:.3f}s | fonte={fonte} | ativos={len(ativos)}"
-    )
-
-    candidatos = []
-    workers = min(16, max(1, len(ativos)))
-    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="fim-rank") as executor:
-        futuros = {
-            executor.submit(_avaliar_candidato_fim_m5, int(active_id), abertura_m5): int(active_id)
-            for active_id in ativos
-        }
-        for futuro in as_completed(futuros):
-            try:
-                item = futuro.result()
-                if item is not None:
-                    candidatos.append(item)
-            except Exception as exc:
-                log(
-                    f"[FIM-M5][RANK] active_id={futuros[futuro]} "
-                    f"erro={type(exc).__name__}: {exc}"
-                )
-
-    if not candidatos:
-        log("[FIM-M5][RANK] Nenhum sinal aprovado neste fechamento M5.")
-        return
-
-    candidatos.sort(key=lambda x: _rank_sinal_fim_m5(x["resultado"]), reverse=True)
-
-    with _execucao_lock:
-        ocupadas = len(_operacoes_pendentes) + len(_ordens_em_confirmacao)
-        vagas = max(0, MAX_OPERACOES_SIMULTANEAS - ocupadas)
-
-    if vagas <= 0:
-        log(
-            f"[FIM-M5][RANK] {len(candidatos)} sinais aprovados, mas sem vagas "
-            f"(ocupadas={ocupadas}/{MAX_OPERACOES_SIMULTANEAS})."
-        )
-        return
-
-    escolhidos = candidatos[:vagas]
-    descartados = candidatos[vagas:]
-
-    resumo = " | ".join(
-        f"#{i+1} {item['symbol']} {item['resultado']['sinal']} "
-        f"score={item['resultado']['score']} ADX={item['resultado'].get('adx_m15', 0):.1f} "
-        f"distEMA={item['resultado'].get('distancia_ema_atr', 0):.2f}ATR"
-        for i, item in enumerate(candidatos[:min(6, len(candidatos))])
-    )
-    log(
-        f"[FIM-M5][RANK] aprovados={len(candidatos)} | vagas={vagas} | "
-        f"selecionados={len(escolhidos)} | ranking: {resumo}"
-    )
-
-    for item in descartados:
-        r = item["resultado"]
-        log(
-            f"[FIM-M5][RANK] {item['symbol']} {r['sinal']} NÃO SELECIONADO | "
-            f"score={r['score']} | ADX={r.get('adx_m15', 0):.1f} | "
-            f"distEMA={r.get('distancia_ema_atr', 0):.2f}ATR"
-        )
-
-    for item in escolhidos:
-        active_id = item["active_id"]
-        codigo = item["codigo"]
-        symbol = item["symbol"]
-        resultado = item["resultado"]
-        candle_key = (int(active_id), int(resultado["candle_from"]))
-
-        with _intravela_lock:
-            if candle_key in _intravela_velas_tentadas:
-                continue
-            _intravela_velas_tentadas.add(candle_key)
-
-        _atualizar_dashboard_intravela(symbol, resultado)
-        log(
-            f"[INTRAVELA][TOP3-SEQUENCIA] {symbol} -> {resultado['sinal']} | "
-            f"score={resultado['score']} | ADX={resultado.get('adx_m15', 0):.1f} | "
-            f"distEMA={resultado.get('distancia_ema_atr', 0):.2f}ATR | "
-            f"{resultado['pullback']} | preco={resultado['preco']:.5f}"
-        )
-
-        threading.Thread(
-            target=registrar_operacao_intravela,
-            args=(symbol, resultado),
-            daemon=True,
-            name=f"intravela-top3-sequencia-{codigo}-{resultado['candle_from']}",
-        ).start()
-
-def _loop_gatilho_relogio_m5():
-    """Loop leve: verifica a virada da vela M5 várias vezes por segundo."""
-    while True:
-        try:
-            _disparar_fim_m5_pelo_relogio()
-        except Exception as exc:
-            log(f"[FIM-M5][RELOGIO] erro: {type(exc).__name__}: {exc}")
-        time.sleep(0.10)
 
 
 def _processar_sinal_intravela(active_id, msg):
@@ -4456,10 +3562,20 @@ def _processar_sinal_intravela(active_id, msg):
 
     _atualizar_dashboard_intravela(symbol, resultado)
 
+    # O Telegram recebe o SINAL assim que o setup técnico é confirmado.
+    # Isso independe de a Bullex aceitar ou recusar a ordem depois.
+    threading.Thread(
+        target=enviar_sinal_telegram,
+        args=(symbol, resultado),
+        daemon=True,
+        name=f"telegram-sinal-{codigo}-{resultado['candle_from']}",
+    ).start()
+
     log(
-        f"[INTRAVELA] {symbol} -> {resultado['sinal']} | "
+        f"[INTRAVELA] {symbol} [{_mercado_do_symbol(symbol)}] -> {resultado['sinal']} | "
         f"score={resultado['score']} | "
-        f"estrategia={resultado.get('estrategia')} | "
+        f"setup={resultado.get('estrategia')} | "
+        f"ADX5={resultado.get('adx5', 0):.1f} | ADX15={resultado.get('adx15', 0):.1f} | "
         f"{resultado['pullback']} | "
         f"decorridos={resultado['segundos_decorridos']:.1f}s | "
         f"restantes={resultado['segundos_restantes']:.1f}s | "
@@ -4476,39 +3592,28 @@ def _processar_sinal_intravela(active_id, msg):
 
 
 def calcular_estatisticas_por_estrategia():
-    """Estatísticas da estratégia R58 de pullback confirmado."""
-    grupos = {
-        "PULLBACK_EMA20": {
-            "total": 0,
-            "wins": 0,
-            "losses": 0,
-            "dojis": 0,
-            "taxa": 0.0,
-        },
-    }
-
+    wins = losses = dojis = 0
     for item in _historico_resultados:
-        if item.get("estrategia") != "PULLBACK_TENDENCIA_CONFIRMADO":
+        if item.get("estrategia") != "TREND_PULLBACK_M5_CONFIRMADO":
             continue
-
-        g = grupos["PULLBACK_EMA20"]
-        resultado = item.get("resultado")
-        g["total"] += 1
-
-        if resultado == "WIN":
-            g["wins"] += 1
-        elif resultado == "LOSS":
-            g["losses"] += 1
-        elif resultado == "DOJI":
-            g["dojis"] += 1
-
-    g = grupos["PULLBACK_EMA20"]
-    decididos = g["wins"] + g["losses"]
-    g["taxa"] = round(
-        g["wins"] / decididos * 100 if decididos else 0.0,
-        2,
-    )
-    return grupos
+        r = item.get("resultado")
+        if r == "WIN":
+            wins += 1
+        elif r == "LOSS":
+            losses += 1
+        elif r == "DOJI":
+            dojis += 1
+    total = wins + losses + dojis
+    decididos = wins + losses
+    return {
+        "TREND_PULLBACK_M5_CONFIRMADO": {
+            "total": total,
+            "wins": wins,
+            "losses": losses,
+            "dojis": dojis,
+            "taxa": round(wins / decididos * 100 if decididos else 0.0, 2),
+        }
+    }
 
 
 # ============================================================
@@ -4516,39 +3621,47 @@ def calcular_estatisticas_por_estrategia():
 # ============================================================
 
 def calcular_estatisticas():
-    total = len(_historico_resultados)
+    total = len(
+        _historico_resultados
+    )
 
-    wins = sum(1 for x in _historico_resultados if x.get("resultado") == "WIN")
-    losses = sum(1 for x in _historico_resultados if x.get("resultado") == "LOSS")
-    dojis = sum(1 for x in _historico_resultados if x.get("resultado") == "DOJI")
+    wins = sum(
+        1
+        for x in _historico_resultados
+        if x["resultado"] == "WIN"
+    )
 
-    decididos = wins + losses
-    taxa = wins / decididos * 100 if decididos > 0 else 0.0
+    losses = sum(
+        1
+        for x in _historico_resultados
+        if x["resultado"] == "LOSS"
+    )
 
-    # Soma o lucro/prejuízo já registrado em cada operação. Isso permite
-    # combinar payouts diferentes e usar a liquidação REAL recebida da Bullex.
-    lucro_total = 0.0
-    for item in _historico_resultados:
-        lucro_item = _float_seguro(item.get("lucro"))
-        if lucro_item is not None:
-            lucro_total += lucro_item
-            continue
+    dojis = sum(
+        1
+        for x in _historico_resultados
+        if x["resultado"] == "DOJI"
+    )
 
-        # Compatibilidade com registros antigos que ainda não tenham "lucro".
-        resultado = item.get("resultado")
-        valor = float(item.get("valor") or 0.0)
-        if resultado == "WIN":
-            lucro_total += valor * (PAYOUT_LUCRO_PERCENTUAL / 100.0)
-        elif resultado == "LOSS":
-            lucro_total -= valor
+    decididos = (
+        wins + losses
+    )
+
+    taxa = (
+        wins / decididos * 100
+        if decididos > 0
+        else 0
+    )
 
     return {
         "total": total,
         "wins": wins,
         "losses": losses,
         "dojis": dojis,
-        "taxa": round(taxa, 2),
-        "lucro_total": round(lucro_total, 2),
+        "taxa": round(
+            taxa,
+            2
+        ),
     }
 
 
@@ -4614,6 +3727,12 @@ def enviar_telegram(texto):
 # ENVIAR SINAL
 # ============================================================
 
+
+def _mercado_do_symbol(symbol):
+    texto = str(symbol or "").upper()
+    return "OTC" if "OTC" in texto else "ABERTO"
+
+
 def enviar_sinal_telegram(
     symbol,
     resultado
@@ -4673,17 +3792,17 @@ def enviar_sinal_telegram(
     )
 
     texto = (
-        f"{emoji} SINAL FIM M5\n\n"
+        f"{emoji} SINAL FOREX 5M\n\n"
         f"Ativo: {symbol}\n"
+        f"Mercado: {_mercado_do_symbol(symbol)}\n"
         f"Direcao: {sinal}\n"
         f"Score: {resultado.get('score', 0)}\n"
         f"Estrategia: {resultado.get('estrategia', '-')}\n"
-        f"Padrao: {resultado.get('padrao_sequencia', '-')}\n"
         f"Regime: {resultado.get('regime', '-')}\n"
         f"Preco: {fmt(resultado.get('preco'))}\n"
         f"Vela analisada: "
         f"{vela.strftime('%Y-%m-%d %H:%M:%S BRT')}\n\n"
-        f"Tendencia 15M: "
+        f"Tendencia 5M: "
         f"{resultado.get('tendencia_5m', '-')}\n"
         f"Tendencia 15M: "
         f"{resultado.get('tendencia_15m', '-')}\n"
@@ -4701,8 +3820,8 @@ def enviar_sinal_telegram(
         f"{fmt(resultado.get('ema21'))}\n"
         f"ATR 14: "
         f"{fmt(resultado.get('atr'), 6)}\n\n"
-        f"➡️ ENTRADA: MESMA VELA M5\n"
-        f"⏱️ EXPIRACAO: 5 MINUTOS (fechamento da vela M5)\n\n"
+        f"➡️ ENTRADA: RETRACAO NA VELA ATUAL\n"
+        f"⏱️ EXPIRACAO: FIM DA MESMA VELA M5\n\n"
         f"⚠️ Sinal tecnico experimental."
     )
 
@@ -4720,9 +3839,23 @@ def enviar_sinal_telegram(
 # REGISTRAR OPERAÇÃO
 # ============================================================
 
-def registrar_operacao_intravela(symbol, resultado):
-    global _operacao_global_ativa
 
+def enviar_status_ordem_telegram(symbol, sinal, status, detalhe=""):
+    mercado = _mercado_do_symbol(symbol)
+    icone = "✅" if status == "CONFIRMADA" else "⚠️"
+    texto = (
+        f"{icone} STATUS DA ORDEM\n\n"
+        f"Ativo: {symbol}\n"
+        f"Mercado: {mercado}\n"
+        f"Direcao: {sinal}\n"
+        f"Status: {status}\n"
+    )
+    if detalhe:
+        texto += f"Detalhe: {detalhe}\n"
+    enviar_telegram(texto)
+
+
+def registrar_operacao_intravela(symbol, resultado):
     sinal = resultado.get("sinal")
     if sinal not in ("CALL", "PUT"):
         return
@@ -4742,18 +3875,15 @@ def registrar_operacao_intravela(symbol, resultado):
         return
 
     with _execucao_lock:
-        # Cada ativo usa os próprios dados de confirmação; isso evita que duas
-        # ordens confirmadas quase juntas troquem option_id/valor entre si.
-        info = _ordens_confirmadas_por_symbol.get(symbol, {}).copy()
-        if not info:
-            info = (_operacao_global_ativa or {}).copy()
+        info = (_operacao_global_ativa or {}).copy()
 
     operacao = {
         "id": chave,
         "symbol": symbol,
+        "mercado": _mercado_do_symbol(symbol),
         "sinal": sinal,
         "score": resultado.get("score", 0),
-        "estrategia": "SEQUENCIA_M5_TENDENCIA",
+        "estrategia": "TREND_PULLBACK_M5_CONFIRMADO",
         "regime": "INTRAVELA",
         "preco_sinal": float(resultado["preco"]),
         "vela_sinal": candle_dt,
@@ -4770,32 +3900,14 @@ def registrar_operacao_intravela(symbol, resultado):
         "candle_to": int(resultado["candle_to"]),
         "retracao_ratio": resultado.get("retracao_ratio"),
         "impulso": resultado.get("impulso"),
-        "nivel_m5": resultado.get("nivel_m5"),
+        "nivel_sr": resultado.get("nivel_sr"),
         "tipo_nivel": resultado.get("tipo_nivel"),
         "toques_nivel": resultado.get("toques_nivel"),
         "distancia_abertura_nivel": resultado.get("distancia_abertura_nivel"),
-        "padrao_sequencia": resultado.get("padrao_sequencia"),
-        "quantidade_velas_sequencia": resultado.get("quantidade_velas_sequencia"),
-        "rsi_entrada": resultado.get("rsi"),
-        "adx_m5": resultado.get("adx_m5"),
-        "adx_m15": resultado.get("adx_m15"),
     }
 
-    # Registro e liberação da reserva acontecem sob o mesmo lock: não existe
-    # instante em que a ordem deixe de contar no limite entre confirmação e
-    # entrada em _operacoes_pendentes.
-    with _execucao_lock:
-        _operacoes_pendentes[symbol] = operacao
-        _ultimas_operacoes_registradas[symbol] = chave
-        _ordens_em_confirmacao.discard(symbol)
-        _ordens_confirmadas_por_symbol.pop(symbol, None)
-
-        if (
-            _operacao_global_ativa is not None
-            and _operacao_global_ativa.get("symbol") == symbol
-        ):
-            _operacao_global_ativa = None
-
+    _operacoes_pendentes[symbol] = operacao
+    _ultimas_operacoes_registradas[symbol] = chave
 
     log(
         f"[INTRAVELA] {symbol}: operação registrada {sinal} | "
@@ -4803,12 +3915,6 @@ def registrar_operacao_intravela(symbol, resultado):
         f"expira={datetime.fromtimestamp(int(resultado['candle_to']), TZ).strftime('%H:%M:%S')}"
     )
 
-    threading.Thread(
-        target=enviar_sinal_telegram,
-        args=(symbol, resultado),
-        daemon=True,
-        name=f"telegram-intravela-{symbol}-{candle_from}",
-    ).start()
 
 
 
@@ -4843,37 +3949,14 @@ def avaliar_operacao(symbol, candles):
         operacao["saida"] = saida
 
         if operacao["sinal"] == "CALL":
-            resultado_candle = "WIN" if saida > entrada else "LOSS" if saida < entrada else "DOJI"
+            resultado = "WIN" if saida > entrada else "LOSS" if saida < entrada else "DOJI"
         else:
-            resultado_candle = "WIN" if saida < entrada else "LOSS" if saida > entrada else "DOJI"
+            resultado = "WIN" if saida < entrada else "LOSS" if saida > entrada else "DOJI"
 
-        # Se a Bullex já informou o resultado oficial da liquidação, ele tem
-        # prioridade. Caso contrário, mantém a classificação técnica pelo candle.
-        resultado = operacao.get("resultado_bullex") or resultado_candle
         operacao["resultado"] = resultado
-        operacao["resultado_candle"] = resultado_candle
         operacao["finalizado_em"] = agora
-
-        valor_operacao = float(operacao.get("valor") or 0.0)
-        lucro_real = _float_seguro(operacao.get("lucro_real"))
-        if lucro_real is not None:
-            operacao["lucro"] = round(lucro_real, 2)
-            operacao["fonte_lucro"] = "BULLEX_REAL"
-        elif resultado == "WIN":
-            operacao["lucro"] = round(
-                valor_operacao * (PAYOUT_LUCRO_PERCENTUAL / 100.0), 2
-            )
-            operacao["fonte_lucro"] = f"FALLBACK_{PAYOUT_LUCRO_PERCENTUAL:.2f}%"
-        elif resultado == "LOSS":
-            operacao["lucro"] = round(-valor_operacao, 2)
-            operacao["fonte_lucro"] = "VALOR_ENTRADA"
-        else:
-            operacao["lucro"] = 0.0
-            operacao["fonte_lucro"] = "DOJI"
-
         _historico_resultados.append(operacao.copy())
         del _operacoes_pendentes[symbol]
-
 
         with _execucao_lock:
             if (
@@ -4885,22 +3968,12 @@ def avaliar_operacao(symbol, candles):
         _atualizar_progressao(resultado)
         _atualizar_estado_execucao()
 
-        gerenciamento = _resumo_gerenciamento()
-        if gerenciamento["status"] == "PARADO":
-            log(
-                f"[GERENCIAMENTO] OPERAÇÕES ENCERRADAS | "
-                f"motivo={gerenciamento['motivo_parada']} | "
-                f"lucro_dia=R${gerenciamento['lucro_dia']:.2f} | "
-                f"pico=R${gerenciamento['pico_lucro_dia']:.2f}"
-            )
-
         estatisticas = calcular_estatisticas()
 
         log(
             f"[RESULTADO INTRAVELA] {symbol} {operacao['sinal']} -> {resultado} | "
             f"entrada={entrada:.5f} | fechamento_mesma_vela={saida:.5f} | "
-            f"taxa_total={estatisticas['taxa']:.2f}% | "
-            f"lucro_total=R${estatisticas['lucro_total']:.2f}"
+            f"taxa_total={estatisticas['taxa']:.2f}%"
         )
 
         enviar_resultado_telegram(operacao, estatisticas)
@@ -4940,11 +4013,12 @@ def enviar_resultado_telegram(
     texto = (
         f"{emoji} RESULTADO DA OPERACAO\n\n"
         f"Ativo: {operacao['symbol']}\n"
+        f"Mercado: {_mercado_do_symbol(operacao['symbol'])}\n"
         f"Direcao: {operacao['sinal']}\n"
         f"Estrategia: {operacao.get('estrategia', '-')}\n"
-        f"Padrao: {operacao.get('padrao_sequencia') or operacao.get('regime', '-')}\n"
-        f"Resultado: {resultado}\n"
-        + f"\nEntrada: {fmt(operacao.get('entrada'))}\n"
+        f"Regime: {operacao.get('regime', '-')}\n"
+        f"Resultado: {resultado}\n\n"
+        f"Entrada: {fmt(operacao.get('entrada'))}\n"
         f"Saida: {fmt(operacao.get('saida'))}\n"
         f"Fonte da vela: Bullex\n\n"
         f"📊 ESTATISTICAS\n"
@@ -4952,10 +4026,7 @@ def enviar_resultado_telegram(
         f"Wins: {estatisticas['wins']}\n"
         f"Losses: {estatisticas['losses']}\n"
         f"Dojis: {estatisticas['dojis']}\n"
-        f"Taxa: {estatisticas['taxa']:.2f}%\n"
-        f"Resultado financeiro: R${float(operacao.get('lucro') or 0.0):.2f}\n"
-        f"Fonte do lucro: {operacao.get('fonte_lucro', '-')}\n"
-        f"Lucro acumulado: R${estatisticas['lucro_total']:.2f}"
+        f"Taxa: {estatisticas['taxa']:.2f}%"
     )
 
     enviar_telegram(texto)
@@ -4999,10 +4070,10 @@ def finalizar_operacoes_vencidas_antes_da_leitura():
 # ============================================================
 
 def processar_ativo(chave, symbol, executar_sinal=False):
-    """O ciclo M5 de manutenção não cria sinais por polling.
+    """Na R13 o loop de 5 minutos não cria sinais.
 
-    Ele mantém histórico atualizado, dashboard e finaliza operações.
-    Os sinais surgem exclusivamente do candle-generated M5 em tempo real.
+    Ele apenas mantém histórico atualizado e finaliza operações.
+    Os sinais surgem exclusivamente do candle-generated da vela corrente.
     """
     with _bullex_assets_lock:
         config = ATIVO_BULLEX.get(chave)
@@ -5012,8 +4083,6 @@ def processar_ativo(chave, symbol, executar_sinal=False):
 
     try:
         candles_5m = obter_candles(symbol, TIMEFRAME, OUTPUTSIZE)
-        # Mantém histórico M15 carregado para o filtro de tendência/força.
-        obter_candles(symbol, TIMEFRAME_TREND, OUTPUTSIZE_5M)
         avaliar_operacao(symbol, candles_5m)
 
         ultimo, idade = idade_do_ultimo_candle(candles_5m)
@@ -5024,7 +4093,7 @@ def processar_ativo(chave, symbol, executar_sinal=False):
             estado["atualidade_min"] = f"{idade:.1f} min" if idade is not None else "-"
             if estado.get("sinal") not in ("CALL", "PUT"):
                 estado["sinal"] = "AGUARDAR"
-                estado["mensagem"] = "Monitorando FIM M5: decisão pelas velas M5 fechadas + contexto M15, entrada até 3s da nova M5 e máximo 2 operações simultâneas."
+                estado["mensagem"] = "Monitorando retração na vela atual em tempo real."
         return None
 
     except Exception as e:
@@ -5082,13 +4151,13 @@ def executar_leitura():
     if not _aguardar_ativos_mercado_aberto(timeout=8):
         erro_ativos = _bullex_assets_last_error or "aguardando resposta da Traderoom"
         log(
-            "[OTC AUTO] Leitura adiada: active_id dos pares ainda não está pronto. "
+            "[OPEN MARKET] Leitura adiada: active_id dos pares ainda não está pronto. "
             f"Detalhe: {erro_ativos}"
         )
         estado["sinal"] = "AGUARDAR"
         estado["score"] = 0
         estado["mensagem"] = (
-            "Aguardando carregamento dos pares de OTC na Bullex."
+            "Aguardando carregamento dos pares de mercado aberto na Bullex."
         )
         estado["atualizado"] = agora_brt().strftime("%H:%M:%S BRT")
         return
@@ -5112,11 +4181,28 @@ def executar_leitura():
 
         return
 
-    # No ciclo M5, sinais NÃO são gerados aqui por polling.
-    # A retração é detectada em tempo real no candle-generated.
+    # A R17 gera sinais EXCLUSIVAMENTE em tempo real no candle-generated.
+    # Este ciclo de 5 minutos apenas finaliza/atualiza operações e saúde dos ativos.
     finalizar_operacoes_vencidas_antes_da_leitura()
 
-    for chave, symbol in ATIVOS.items():
+    with _bullex_assets_lock:
+        ativos_ciclo = list(ATIVOS.items())
+        qtd_aberto = sum(
+            1 for cfg in ATIVO_BULLEX.values()
+            if not cfg.get("is_otc")
+        )
+        qtd_otc = sum(
+            1 for cfg in ATIVO_BULLEX.values()
+            if cfg.get("is_otc")
+        )
+
+    log(
+        f"[MONITOR] ativos mapeados={len(ativos_ciclo)} | "
+        f"ABERTO={qtd_aberto} | OTC={qtd_otc} | "
+        "sinais=intravela/candle-generated"
+    )
+
+    for chave, symbol in ativos_ciclo:
         processar_ativo(chave, symbol, executar_sinal=False)
 
     estado[
@@ -5145,28 +4231,38 @@ def executar_leitura():
 # ============================================================
 
 def esperar_ate_proxima_leitura():
-    """Sincroniza a manutenção do robô com a próxima abertura de vela M5.
-
-    O sinal continua vindo em tempo real pelo candle-generated M5.
-    Esta rotina mantém histórico, resultados pendentes, dashboard
-    e descoberta/manutenção dos ativos alinhados ao ciclo de 5 minutos.
-    """
     agora = agora_brt()
 
-    minuto_atual = agora.minute
-    minutos_ate_proxima = 5 - (minuto_atual % 5)
-    proxima = (
-        agora.replace(second=0, microsecond=100000)
-        + timedelta(minutes=minutos_ate_proxima)
-    )
+    proximo_bloco = (
+        (agora.minute // 5)
+        + 1
+    ) * 5
+
+    if proximo_bloco >= 60:
+        proxima = (
+            agora + timedelta(hours=1)
+        ).replace(
+            minute=0,
+            second=0,
+            microsecond=100000,
+        )
+
+    else:
+        proxima = agora.replace(
+            minute=proximo_bloco,
+            second=0,
+            microsecond=100000,
+        )
 
     segundos = max(
-        (proxima - agora).total_seconds(),
-        0.2,
+        (
+            proxima - agora
+        ).total_seconds(),
+        1
     )
 
     log(
-        f"[{BULLEX_DIAGNOSTIC_VERSION}][M5] Proxima leitura M5: "
+        "Proxima leitura: "
         f"{proxima.strftime('%H:%M:%S BRT')}"
     )
 
@@ -5177,40 +4273,9 @@ def esperar_ate_proxima_leitura():
 # LOOP
 # ============================================================
 
-def _garantir_relogio_m5_iniciado():
-    """Inicia exatamente um thread do relógio M5 neste processo."""
-    global _fim_m5_clock_thread
-
-    with _fim_m5_clock_thread_lock:
-        if _fim_m5_clock_thread is not None and _fim_m5_clock_thread.is_alive():
-            return
-
-        with _bullex_assets_lock:
-            qtd_ativos = len(ATIVO_BULLEX)
-
-        if qtd_ativos <= 0:
-            log("[FIM-M5][RELOGIO] Thread não iniciado: ativos OTC ainda não carregados.")
-            return
-
-        _fim_m5_clock_thread = threading.Thread(
-            target=_loop_gatilho_relogio_m5,
-            daemon=True,
-            name="fim-m5-clock",
-        )
-        _fim_m5_clock_thread.start()
-        log(
-            f"[FIM-M5][RELOGIO] Thread iniciado após carga OTC | "
-            f"ativos={qtd_ativos}"
-        )
-
-
 def loop_robo():
     log(
         "Loop do robo iniciado."
-    )
-    log(
-        f"[R30][M5] Scheduler ativo: leitura/manutencao a cada 5 minutos | "
-        f"expiracao={EXPIRACAO_MINUTOS} minuto(s) | cooldown_loss={BLOQUEIO_LOSS_MINUTOS} min"
     )
 
     try:
@@ -5226,11 +4291,10 @@ def loop_robo():
         if _aguardar_ativos_mercado_aberto(timeout=30):
             with _bullex_assets_lock:
                 ativos_prontos = ", ".join(ATIVO_BULLEX.keys())
-            log(f"[OTC AUTO] Pronto para leitura: {ativos_prontos}")
-            _garantir_relogio_m5_iniciado()
+            log(f"[OPEN MARKET] Pronto para leitura: {ativos_prontos}")
         else:
             log(
-                "[OTC AUTO] Inicialização ainda incompleta; "
+                "[OPEN MARKET] Inicialização ainda incompleta; "
                 "a primeira leitura ficará em AGUARDAR, sem gerar KeyError."
             )
 
@@ -5551,12 +4615,12 @@ Filtros da entrada
 </div>
 
 <div class="linha">
-<span>Nível M5</span>
-<span class="valor">MESMA VELA M5</span>
+<span>Nível M15</span>
+<span class="valor">MESMA VELA 5M</span>
 </div>
 
 <div class="linha">
-<span>Tendência 15M</span>
+<span>Tendência 5M</span>
 <span class="valor">
 {{ estado.detalhes.tendencia_5m }}
 </span>
@@ -5677,13 +4741,6 @@ DOJI
 </div>
 </div>
 
-<div class="box">
-LUCRO TOTAL
-<div class="numero">
-R$ {{ '%.2f'|format(estado.estatisticas.lucro_total) }}
-</div>
-</div>
-
 </div>
 
 <br>
@@ -5715,7 +4772,7 @@ Quando houver sinal:
 <br>
 
 <strong>
-Entrada: FIM M5 em tempo real
+Entrada: próxima vela de 5 minutos
 </strong>
 
 <br>
@@ -5824,7 +4881,7 @@ def health():
             ),
         "estrategia":
             (
-                "Retracao intravela na mesma vela de 5 minutos"
+                "S/R M5 + retracao intravela na mesma vela M5 | SOMENTE MERCADO ABERTO"
             ),
         "fonte_candles": "Bullex",
         "execucao_automatica": BULLEX_AUTO_TRADE,
@@ -5850,10 +4907,9 @@ def health():
             telegram_configurado(),
         "operacoes_pendentes":
             len(_operacoes_pendentes),
-        "entradas": VALORES_ENTRADA,
-        "gerenciamento": _resumo_gerenciamento(),
-        "gestao_6_9_ativa": True,
-        "mercado": "OTC",
+        "entrada_fixa": 5.00,
+        "progressao_ativa": False,
+        "mercado": "ABERTO",
         "ativos_mercado_aberto": {
             "detectado": _bullex_assets_detected,
             "quantidade": len(ATIVO_BULLEX),
@@ -5883,7 +4939,7 @@ def health():
 
 _atualizar_estado_execucao()
 
-log(f"AUTO TRADE={'ATIVO' if BULLEX_AUTO_TRADE else 'DESATIVADO'} | estrategia=R59 PULLBACK | progressao=5->6->12->25 apos LOSS | WIN->5 | max_ops={MAX_OPERACOES_SIMULTANEAS}")
+log(f"AUTO TRADE DEMO={'ATIVO' if BULLEX_AUTO_TRADE else 'DESATIVADO'} | entrada fixa=R${_valor_entrada_atual():.2f} | progressao=DESATIVADA")
 log(f"BULLEX_USER_BALANCE_ID={'CONFIGURADO' if BULLEX_USER_BALANCE_ID else 'AUSENTE'}")
 
 log(
@@ -5891,8 +4947,6 @@ log(
     f"ATIVOS={list(ATIVO_BULLEX.keys())} | "
     f"WS={BULLEX_WS_URL}"
 )
-
-
 
 if __name__ == "__main__":
     garantir_robo_iniciado()
