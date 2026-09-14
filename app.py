@@ -114,7 +114,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OPEN-ONLY-BINARY-5-BRL-20260914-R23-TREND-PULLBACK-ENTRADA-INICIO-M5"
+BULLEX_DIAGNOSTIC_VERSION = "OPEN-ONLY-BINARY-5-BRL-20260914-R24-UMA-OPERACAO-MELHOR-CLASSIFICADA"
 
 _bullex_diag = {
     "messages": 0,
@@ -275,6 +275,17 @@ _ultimas_operacoes_registradas = {}
 _historico_resultados = []
 _execucao_lock = threading.RLock()
 _operacao_global_ativa = None
+# R24: também bloqueia novas ordens enquanto uma ordem está sendo enviada,
+# evitando corrida entre dois ativos que sinalizem praticamente ao mesmo tempo.
+_operacao_global_em_envio = False
+
+# R24: candidatos da mesma abertura M5 são comparados antes da execução.
+# Uma pequena janela de coleta permite escolher o setup mais forte sem atrasar
+# a entrada para o meio da vela.
+_r24_candidatos_lock = threading.RLock()
+_r24_candidatos = {}
+_r24_dispatchers = set()
+R24_JANELA_CLASSIFICACAO_SEGUNDOS = 0.45
 _nivel_progressao = 0
 _bullex_balance_id = None
 _bullex_balance_source = None
@@ -807,6 +818,7 @@ def _registrar_ordem_confirmada(symbol, ticker, sinal, valor, active_id, balance
 
 def executar_ordem_intravela(symbol, sinal, resultado):
     global _operacao_global_ativa
+    global _operacao_global_em_envio
     global _bullex_last_error
 
     if not BULLEX_AUTO_TRADE:
@@ -821,15 +833,19 @@ def executar_ordem_intravela(symbol, sinal, resultado):
         return "SEM_BALANCE_ID"
 
     with _execucao_lock:
-        if UMA_OPERACAO_GLOBAL and _operacao_global_ativa is not None:
+        if UMA_OPERACAO_GLOBAL and (_operacao_global_ativa is not None or _operacao_global_em_envio):
             log(
                 f"[INTRAVELA] {symbol}: sinal ignorado; "
-                "já existe operação global ativa."
+                "já existe operação global ativa ou ordem em envio."
             )
             return "BLOQUEADA_GLOBAL"
+        if UMA_OPERACAO_GLOBAL:
+            _operacao_global_em_envio = True
 
     balance_id = _obter_balance_id()
     if not balance_id:
+        with _execucao_lock:
+            _operacao_global_em_envio = False
         return "SEM_BALANCE_ID"
 
     config = next(
@@ -837,6 +853,8 @@ def executar_ordem_intravela(symbol, sinal, resultado):
         None,
     )
     if not config:
+        with _execucao_lock:
+            _operacao_global_em_envio = False
         return "SEM_ATIVO"
 
     active_id = int(config["active_id"])
@@ -855,6 +873,8 @@ def executar_ordem_intravela(symbol, sinal, resultado):
             f"[INTRAVELA] {symbol}: vela do sinal já encerrou; "
             "ordem NÃO enviada."
         )
+        with _execucao_lock:
+            _operacao_global_em_envio = False
         return "VELA_ENCERRADA"
 
     if restantes < INTRAVELA_MIN_SEGUNDOS_RESTANTES:
@@ -862,6 +882,8 @@ def executar_ordem_intravela(symbol, sinal, resultado):
             f"[INTRAVELA] {symbol}: restam apenas {restantes:.1f}s; "
             "ordem NÃO enviada para evitar cair na próxima vela."
         )
+        with _execucao_lock:
+            _operacao_global_em_envio = False
         return "POUCO_TEMPO"
 
     janela = {
@@ -925,6 +947,8 @@ def executar_ordem_intravela(symbol, sinal, resultado):
                 daemon=True,
                 name=f"telegram-ordem-recusada-{active_id}",
             ).start()
+            with _execucao_lock:
+                _operacao_global_em_envio = False
             return "SEM_CONFIRMACAO"
 
         with _bullex_diag_lock:
@@ -941,6 +965,9 @@ def executar_ordem_intravela(symbol, sinal, resultado):
             resposta,
             janela,
         )
+
+        with _execucao_lock:
+            _operacao_global_em_envio = False
 
         threading.Thread(
             target=enviar_status_ordem_telegram,
@@ -969,6 +996,8 @@ def executar_ordem_intravela(symbol, sinal, resultado):
         _bullex_last_error = str(e)
         estado["execucao"]["ultimo_erro"] = str(e)
         _atualizar_estado_execucao()
+        with _execucao_lock:
+            _operacao_global_em_envio = False
         log(f"[AUTO INTRAVELA] ERRO ao enviar ordem: {e}")
         return "ERRO"
 
@@ -3696,16 +3725,78 @@ def _log_diagnostico_r22(active_id, symbol, msg):
             limite=int(diag["candle_from"])-86400
             _r22_diag_emitidos.intersection_update({k for k in _r22_diag_emitidos if k[1]>=limite})
     if "adx5" not in diag:
-        log(f"[R23 DIAG] {symbol} | bloqueio={diag['motivo']}")
+        log(f"[R24 DIAG] {symbol} | bloqueio={diag['motivo']}")
         return
     log(
-        f"[R23 DIAG] {symbol} | M15={diag['t15']} ADX15={diag['adx15']:.1f} | "
+        f"[R24 DIAG] {symbol} | M15={diag['t15']} ADX15={diag['adx15']:.1f} | "
         f"M5={diag['t5']} ADX5={diag['adx5']:.1f} RSI={diag['rsi']:.1f} | "
         f"pullbackEMA20={'SIM' if diag['touch20'] else 'NÃO'} | "
         f"confCALL={'SIM' if diag['call_confirm'] else 'NÃO'} "
         f"confPUT={'SIM' if diag['put_confirm'] else 'NÃO'} | "
         f"bloqueio={diag['motivo']} | restam={diag['restantes']:.1f}s"
     )
+
+
+
+def _r24_chave_classificacao(resultado):
+    """Quanto maior, melhor. Prioriza score e depois força/qualidade do setup."""
+    score = float(resultado.get("score") or 0)
+    adx15 = float(resultado.get("adx15") or 0)
+    adx5 = float(resultado.get("adx5") or 0)
+    rsi_v = float(resultado.get("rsi") or 50)
+    sinal = resultado.get("sinal")
+    # Centro preferido das faixas usadas pela própria estratégia.
+    rsi_alvo = 59.0 if sinal == "CALL" else 41.0
+    qualidade_rsi = max(0.0, 10.0 - abs(rsi_v - rsi_alvo))
+    retracao = float(resultado.get("retracao_ratio") or 99)
+    # Menor distância normalizada da EMA20 é melhor, por isso entra negativa.
+    return (score, adx15 + adx5, qualidade_rsi, -retracao)
+
+
+def _r24_despachar_melhor(candle_from):
+    """Coleta por fração de segundo e envia somente o melhor setup da abertura."""
+    time.sleep(R24_JANELA_CLASSIFICACAO_SEGUNDOS)
+    with _r24_candidatos_lock:
+        candidatos = _r24_candidatos.pop(int(candle_from), [])
+        _r24_dispatchers.discard(int(candle_from))
+
+    if not candidatos:
+        return
+
+    # Se já existe uma operação (ou uma ordem em envio), nenhum candidato entra.
+    with _execucao_lock:
+        ocupado = UMA_OPERACAO_GLOBAL and (
+            _operacao_global_ativa is not None or _operacao_global_em_envio
+        )
+    if ocupado:
+        log(f"[R24 RANK] vela={candle_from}: candidatos ignorados; já existe operação global ativa/em envio.")
+        return
+
+    candidatos.sort(key=lambda x: _r24_chave_classificacao(x[2]), reverse=True)
+    active_id, symbol, resultado = candidatos[0]
+    ranking = ", ".join(
+        f"{sym}:{res.get('sinal')} score={res.get('score')} ADX15={res.get('adx15',0):.1f} ADX5={res.get('adx5',0):.1f}"
+        for _, sym, res in candidatos
+    )
+    log(f"[R24 RANK] candidatos={ranking} | ESCOLHIDO={symbol} {resultado.get('sinal')}")
+
+    _atualizar_dashboard_intravela(symbol, resultado)
+
+    threading.Thread(
+        target=enviar_sinal_telegram,
+        args=(symbol, resultado),
+        daemon=True,
+        name=f"telegram-sinal-r24-{active_id}-{resultado['candle_from']}",
+    ).start()
+
+    log(
+        f"[R24 ENTRADA] {symbol} [{_mercado_do_symbol(symbol)}] -> {resultado['sinal']} | "
+        f"score={resultado['score']} | ADX5={resultado.get('adx5', 0):.1f} | "
+        f"ADX15={resultado.get('adx15', 0):.1f} | decorridos={resultado['segundos_decorridos']:.1f}s | "
+        f"preco={resultado['preco']:.5f}"
+    )
+
+    registrar_operacao_intravela(symbol, resultado)
 
 
 def _processar_sinal_intravela(active_id, msg):
@@ -3716,7 +3807,7 @@ def _processar_sinal_intravela(active_id, msg):
     if not dentro_do_horario():
         return
 
-    # R23: nenhum sinal/ordem é permitido antes do preload M5+M15 completo.
+    # R24: nenhum sinal/ordem é permitido antes do preload M5+M15 completo.
     if not _historico_pronto_event.is_set():
         return
 
@@ -3732,35 +3823,22 @@ def _processar_sinal_intravela(active_id, msg):
             return
         _intravela_velas_tentadas.add(candle_key)
 
-    _atualizar_dashboard_intravela(symbol, resultado)
-
-    # R23: o Telegram recebe o sinal quando o setup da vela anterior está pronto
-    # e a nova M5 entrou na janela de execução de 2 a 8 segundos.
-    threading.Thread(
-        target=enviar_sinal_telegram,
-        args=(symbol, resultado),
-        daemon=True,
-        name=f"telegram-sinal-{codigo}-{resultado['candle_from']}",
-    ).start()
-
-    log(
-        f"[INTRAVELA] {symbol} [{_mercado_do_symbol(symbol)}] -> {resultado['sinal']} | "
-        f"score={resultado['score']} | "
-        f"setup={resultado.get('estrategia')} | "
-        f"ADX5={resultado.get('adx5', 0):.1f} | ADX15={resultado.get('adx15', 0):.1f} | "
-        f"{resultado['pullback']} | "
-        f"decorridos={resultado['segundos_decorridos']:.1f}s | "
-        f"restantes={resultado['segundos_restantes']:.1f}s | "
-        f"preco={resultado['preco']:.5f}"
-    )
-
-    # Nunca bloqueia o callback do WebSocket esperando a resposta da ordem.
-    threading.Thread(
-        target=registrar_operacao_intravela,
-        args=(symbol, resultado),
-        daemon=True,
-        name=f"intravela-order-{codigo}-{resultado['candle_from']}",
-    ).start()
+    # R24: em vez de executar o primeiro callback que chegar, guarda todos os
+    # setups válidos da mesma abertura M5 por uma fração de segundo e escolhe
+    # somente o melhor classificado. Continua existindo no máximo UMA operação
+    # global por vez.
+    with _r24_candidatos_lock:
+        _r24_candidatos.setdefault(int(resultado["candle_from"]), []).append(
+            (int(active_id), symbol, resultado)
+        )
+        if int(resultado["candle_from"]) not in _r24_dispatchers:
+            _r24_dispatchers.add(int(resultado["candle_from"]))
+            threading.Thread(
+                target=_r24_despachar_melhor,
+                args=(int(resultado["candle_from"]),),
+                daemon=True,
+                name=f"r24-rank-{resultado['candle_from']}",
+            ).start()
 
 
 def calcular_estatisticas_por_estrategia():
@@ -4056,7 +4134,7 @@ def registrar_operacao_intravela(symbol, resultado):
         "sinal": sinal,
         "score": resultado.get("score", 0),
         "estrategia": "TREND_PULLBACK_M5_ENTRADA_INICIO",
-        "regime": "INTRAVELA",
+        "regime": "INICIO_M5",
         "preco_sinal": float(resultado["preco"]),
         "vela_sinal": candle_dt,
         "vela_entrada": candle_dt,
@@ -4353,7 +4431,7 @@ def executar_leitura():
 
         return
 
-    # R23: garante histórico completo antes de liberar qualquer análise/ordem.
+    # R24: garante histórico completo antes de liberar qualquer análise/ordem.
     if not _historico_pronto_event.is_set():
         _precarregar_historico_r22()
         if not _historico_pronto_event.is_set():
@@ -4381,7 +4459,7 @@ def executar_leitura():
     log(
         f"[MONITOR] ativos mapeados={len(ativos_ciclo)} | "
         f"ABERTO={qtd_aberto} | OTC={qtd_otc} | "
-        "sinais=R23 trend/pullback + entrada 2-8s da M5 + preload M5/M15"
+        "sinais=R24 trend/pullback + entrada 2-8s + melhor classificada + 1 global"
     )
 
     for chave, symbol in ativos_ciclo:
