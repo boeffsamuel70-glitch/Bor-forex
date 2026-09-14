@@ -114,7 +114,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OPEN-ONLY-BINARY-5-BRL-20260913-R20-TREND-PULLBACK-M5"
+BULLEX_DIAGNOSTIC_VERSION = "OPEN-ONLY-BINARY-5-BRL-20260913-R21-TREND-PULLBACK-DIAG-M5"
 
 _bullex_diag = {
     "messages": 0,
@@ -3541,6 +3541,102 @@ def _atualizar_dashboard_intravela(symbol, resultado):
     }
 
 
+_r21_diag_lock = threading.RLock()
+_r21_diag_emitidos = set()
+
+
+def _diagnostico_r21(active_id, msg):
+    """Gera um diagnóstico por ativo/vela sem alterar a decisão da estratégia."""
+    if not isinstance(msg, dict):
+        return None
+    try:
+        abertura=float(msg["open"]); fechamento=float(msg["close"])
+        maxima=float(msg.get("max",msg.get("high"))); minima=float(msg.get("min",msg.get("low")))
+        candle_from=int(float(msg["from"])); candle_to=int(float(msg.get("to") or candle_from+300))
+    except Exception:
+        return None
+
+    server_ts,_=_horario_servidor_atual()
+    decorridos=max(0.0,server_ts-candle_from); restantes=max(0.0,candle_to-server_ts)
+    if decorridos < INTRAVELA_MIN_SEGUNDOS_DECORRIDOS or restantes < INTRAVELA_MIN_SEGUNDOS_RESTANTES:
+        return None
+
+    m5=_fechadas_antes(_candles_cache(active_id,300),candle_from,300)[-90:]
+    m15=_fechadas_antes(_candles_cache(active_id,900),candle_from,900)[-90:]
+    if len(m5)<55 or len(m15)<55:
+        return {"candle_from":candle_from,"motivo":f"HISTORICO_INSUFICIENTE M5={len(m5)} M15={len(m15)}"}
+
+    c5=closes(m5); c15=closes(m15)
+    atr5=atr(m5,14); adx5=_adx_candles(m5,14); adx15=_adx_candles(m15,14)
+    e9=ema(c5,9); e20=ema(c5,20); e50=ema(c5,50)
+    e20_15=ema(c15,20); e50_15=ema(c15,50)
+    e20_15_prev=ema(c15[:-3],20) if len(c15[:-3])>=20 else None
+    rsi5=rsi(c5,14)
+    vals=(atr5,adx5,adx15,e9,e20,e50,e20_15,e50_15,e20_15_prev,rsi5)
+    if any(v is None for v in vals) or not atr5 or atr5<=0:
+        return {"candle_from":candle_from,"motivo":"INDICADORES_INDISPONIVEIS"}
+
+    prev=m5[-1]
+    po=float(prev["open"]); pc=float(prev["close"]); ph=float(prev["high"]); pl=float(prev["low"])
+    prange=max(ph-pl,1e-12); pbody=abs(pc-po)
+    current_range=max(maxima-minima,1e-12); current_body=abs(fechamento-abertura)
+    tol=atr5*0.18
+    touch20 = pl <= e20+tol and ph >= e20-tol
+    trend_call=(e20_15>e50_15 and e20_15>e20_15_prev and c15[-1]>e20_15 and e9>e20>e50)
+    trend_put=(e20_15<e50_15 and e20_15<e20_15_prev and c15[-1]<e20_15 and e9<e20<e50)
+    prev_bear = pc < po or pbody/prange <= 0.35
+    prev_bull = pc > po or pbody/prange <= 0.35
+    call_confirm=(fechamento>abertura and fechamento>ph and fechamento>e9 and current_body>=atr5*0.18)
+    put_confirm=(fechamento<abertura and fechamento<pl and fechamento<e9 and current_body>=atr5*0.18)
+
+    if adx15 < 20: motivo="ADX15_FRACO"
+    elif adx5 < 17: motivo="ADX5_FRACO"
+    elif current_range > atr5*1.55 or current_body > atr5*1.20: motivo="VELA_ATUAL_ESTICADA"
+    elif not (trend_call or trend_put): motivo="SEM_TENDENCIA_ALINHADA"
+    elif not touch20: motivo="SEM_PULLBACK_EMA20"
+    elif trend_call and not prev_bear: motivo="PULLBACK_CALL_SEM_RETRACAO"
+    elif trend_put and not prev_bull: motivo="PULLBACK_PUT_SEM_RETRACAO"
+    elif trend_call and pl < e50-tol: motivo="CALL_ATRAVESSOU_EMA50"
+    elif trend_put and ph > e50+tol: motivo="PUT_ATRAVESSOU_EMA50"
+    elif trend_call and not (50 <= rsi5 <= 68): motivo="RSI_CALL_FORA"
+    elif trend_put and not (32 <= rsi5 <= 50): motivo="RSI_PUT_FORA"
+    elif trend_call and not call_confirm: motivo="CALL_AGUARDA_ROMPIMENTO"
+    elif trend_put and not put_confirm: motivo="PUT_AGUARDA_ROMPIMENTO"
+    else: motivo="SETUP_APROVADO"
+
+    tendencia15="ALTA" if e20_15>e50_15 else "BAIXA" if e20_15<e50_15 else "NEUTRA"
+    tendencia5="ALTA" if e9>e20>e50 else "BAIXA" if e9<e20<e50 else "MISTA"
+    return {"candle_from":candle_from,"motivo":motivo,"adx5":adx5,"adx15":adx15,
+            "rsi":rsi5,"t5":tendencia5,"t15":tendencia15,"touch20":touch20,
+            "call_confirm":call_confirm,"put_confirm":put_confirm,"restantes":restantes}
+
+
+def _log_diagnostico_r21(active_id, symbol, msg):
+    diag=_diagnostico_r21(active_id,msg)
+    if not diag:
+        return
+    key=(int(active_id),int(diag["candle_from"]))
+    with _r21_diag_lock:
+        if key in _r21_diag_emitidos:
+            return
+        _r21_diag_emitidos.add(key)
+        # evita crescimento ilimitado em processos longos
+        if len(_r21_diag_emitidos)>1000:
+            limite=int(diag["candle_from"])-86400
+            _r21_diag_emitidos.intersection_update({k for k in _r21_diag_emitidos if k[1]>=limite})
+    if "adx5" not in diag:
+        log(f"[R21 DIAG] {symbol} | bloqueio={diag['motivo']}")
+        return
+    log(
+        f"[R21 DIAG] {symbol} | M15={diag['t15']} ADX15={diag['adx15']:.1f} | "
+        f"M5={diag['t5']} ADX5={diag['adx5']:.1f} RSI={diag['rsi']:.1f} | "
+        f"pullbackEMA20={'SIM' if diag['touch20'] else 'NÃO'} | "
+        f"confCALL={'SIM' if diag['call_confirm'] else 'NÃO'} "
+        f"confPUT={'SIM' if diag['put_confirm'] else 'NÃO'} | "
+        f"bloqueio={diag['motivo']} | restam={diag['restantes']:.1f}s"
+    )
+
+
 def _processar_sinal_intravela(active_id, msg):
     codigo, symbol = _symbol_por_active_id(active_id)
     if not codigo or not symbol:
@@ -3551,6 +3647,7 @@ def _processar_sinal_intravela(active_id, msg):
 
     resultado = _resultado_retracao_intravela(msg, active_id)
     if resultado is None:
+        _log_diagnostico_r21(active_id, symbol, msg)
         return
 
     candle_key = (int(active_id), int(resultado["candle_from"]))
@@ -4181,7 +4278,7 @@ def executar_leitura():
 
         return
 
-    # A R17 gera sinais EXCLUSIVAMENTE em tempo real no candle-generated.
+    # A R21 gera sinais em tempo real no candle-generated e registra diagnóstico por M5.
     # Este ciclo de 5 minutos apenas finaliza/atualiza operações e saúde dos ativos.
     finalizar_operacoes_vencidas_antes_da_leitura()
 
@@ -4199,7 +4296,7 @@ def executar_leitura():
     log(
         f"[MONITOR] ativos mapeados={len(ativos_ciclo)} | "
         f"ABERTO={qtd_aberto} | OTC={qtd_otc} | "
-        "sinais=intravela/candle-generated"
+        "sinais=R21 trend/pullback + diagnostico/candle-generated"
     )
 
     for chave, symbol in ativos_ciclo:
