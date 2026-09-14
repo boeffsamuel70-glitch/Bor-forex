@@ -114,7 +114,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OPEN-ONLY-BINARY-5-BRL-20260914-R22-TREND-PULLBACK-PRELOAD-M5-M15"
+BULLEX_DIAGNOSTIC_VERSION = "OPEN-ONLY-BINARY-5-BRL-20260914-R23-TREND-PULLBACK-ENTRADA-INICIO-M5"
 
 _bullex_diag = {
     "messages": 0,
@@ -169,7 +169,8 @@ VALORES_ENTRADA = [5.00]
 EXPIRACAO_MINUTOS = 5
 # A antiga janela de 3 segundos foi removida.
 # Esta estratégia entra DURANTE a vela atual e expira no fechamento da MESMA vela.
-INTRAVELA_MIN_SEGUNDOS_DECORRIDOS = 20
+INTRAVELA_MIN_SEGUNDOS_DECORRIDOS = 2
+INTRAVELA_MAX_SEGUNDOS_DECORRIDOS = 8
 INTRAVELA_MIN_SEGUNDOS_RESTANTES = 35
 
 # Estratégia R17: somente suporte/resistência M5.
@@ -3496,23 +3497,24 @@ def _fechadas_antes(candles, candle_from, segundos):
 
 
 def _resultado_retracao_intravela(msg, active_id):
-    """R22: continuação de tendência M15 + pullback M5 + confirmação intravela.
+    """R23: mesma leitura direcional da R22, mas entrada no INICIO da nova M5.
 
-    M15 define a direção por EMA20/EMA50, inclinação da EMA20 e ADX.
-    M5 exige EMA9/20/50 alinhadas e a última vela fechada fazendo pullback
-    controlado até a região da EMA20. A vela M5 atual precisa confirmar a
-    retomada rompendo a máxima/mínima da vela de pullback.
+    A decisão usa somente velas já fechadas antes da vela atual. A última vela
+    fechada deve ter produzido o pullback/retração da R22. Não esperamos mais
+    o rompimento no meio da vela atual: se o setup estiver pronto, a ordem é
+    tentada entre 2 e 8 segundos após a abertura da nova M5.
     """
     if not isinstance(msg, dict): return None
     try:
         abertura=float(msg["open"]); fechamento=float(msg["close"])
-        maxima=float(msg.get("max",msg.get("high"))); minima=float(msg.get("min",msg.get("low")))
         candle_from=int(float(msg["from"])); candle_to=int(float(msg.get("to") or candle_from+300))
     except Exception: return None
 
     server_ts,_=_horario_servidor_atual()
     decorridos=max(0.0,server_ts-candle_from); restantes=max(0.0,candle_to-server_ts)
-    if decorridos < INTRAVELA_MIN_SEGUNDOS_DECORRIDOS or restantes < INTRAVELA_MIN_SEGUNDOS_RESTANTES:
+    if decorridos < INTRAVELA_MIN_SEGUNDOS_DECORRIDOS or decorridos > INTRAVELA_MAX_SEGUNDOS_DECORRIDOS:
+        return None
+    if restantes < INTRAVELA_MIN_SEGUNDOS_RESTANTES:
         return None
 
     m5=_fechadas_antes(_candles_cache(active_id,300),candle_from,300)[-90:]
@@ -3531,32 +3533,20 @@ def _resultado_retracao_intravela(msg, active_id):
     prev=m5[-1]
     po=float(prev["open"]); pc=float(prev["close"]); ph=float(prev["high"]); pl=float(prev["low"])
     prange=max(ph-pl,1e-12); pbody=abs(pc-po)
-    current_range=max(maxima-minima,1e-12); current_body=abs(fechamento-abertura)
 
-    # Evita mercado lateral e também velas de confirmação já excessivamente esticadas.
     if adx15 < 20 or adx5 < 17: return None
-    if current_range > atr5*1.55 or current_body > atr5*1.20: return None
 
-    # Pullback deve alcançar a região da EMA20, mas não atravessar a EMA50 com força.
     tol=atr5*0.18
     touch20 = pl <= e20+tol and ph >= e20-tol
-
-    # Tendência principal e microestrutura.
     trend_call=(e20_15>e50_15 and e20_15>e20_15_prev and c15[-1]>e20_15 and e9>e20>e50)
     trend_put=(e20_15<e50_15 and e20_15<e20_15_prev and c15[-1]<e20_15 and e9<e20<e50)
-
-    # A retração é preferencialmente contrária à tendência; doji pequeno também é aceito.
     prev_bear = pc < po or pbody/prange <= 0.35
     prev_bull = pc > po or pbody/prange <= 0.35
 
-    # Confirmação ocorre durante a vela atual: direção + rompimento do extremo do pullback.
-    call_confirm=(fechamento>abertura and fechamento>ph and fechamento>e9 and current_body>=atr5*0.18)
-    put_confirm=(fechamento<abertura and fechamento<pl and fechamento<e9 and current_body>=atr5*0.18)
-
     sinal=None
-    if trend_call and touch20 and prev_bear and pl >= e50-tol and 50 <= rsi5 <= 68 and call_confirm:
+    if trend_call and touch20 and prev_bear and pl >= e50-tol and 50 <= rsi5 <= 68:
         sinal="CALL"
-    elif trend_put and touch20 and prev_bull and ph <= e50+tol and 32 <= rsi5 <= 50 and put_confirm:
+    elif trend_put and touch20 and prev_bull and ph <= e50+tol and 32 <= rsi5 <= 50:
         sinal="PUT"
     if sinal is None: return None
 
@@ -3564,25 +3554,24 @@ def _resultado_retracao_intravela(msg, active_id):
     if adx15>=25: score+=1
     if adx5>=22: score+=1
     if abs(pc-e20)<=atr5*0.12: score+=1
-    if current_body>=atr5*0.30: score+=1
     if (sinal=="CALL" and 54<=rsi5<=64) or (sinal=="PUT" and 36<=rsi5<=46): score+=1
 
     return {
         "sinal":sinal,"score":score,
         "score_call":score if sinal=="CALL" else 1,"score_put":score if sinal=="PUT" else 1,
         "preco":fechamento,"vela":datetime.fromtimestamp(candle_from,TZ),
-        "estrategia":"TREND_PULLBACK_M5_CONFIRMADO","regime":"TENDENCIA_PULLBACK",
-        "pullback":f"PULLBACK EMA20 M5 + ROMPIMENTO | ADX15={adx15:.1f}",
-        "rejeicao":"CONFIRMACAO DE RETOMADA",
+        "estrategia":"TREND_PULLBACK_M5_ENTRADA_INICIO","regime":"TENDENCIA_PULLBACK",
+        "pullback":f"PULLBACK EMA20 M5 FECHADO | ADX15={adx15:.1f}",
+        "rejeicao":"ENTRADA NO INICIO DA PROXIMA M5",
         "lateral":"NÃO" if adx15>=20 else "SIM","atr":atr5,"rsi":rsi5,
         "ema5":e9,"ema13":e20,"ema21":e50,
         "tendencia_5m":"ALTA" if sinal=="CALL" else "BAIXA",
         "tendencia_15m":"ALTA" if sinal=="CALL" else "BAIXA",
         "zona_fibonacci":"N/A","bloqueio":"SINAL",
-        "mensagem":f"{sinal} | pullback EMA20 M5 confirmado | ADX5={adx5:.1f} ADX15={adx15:.1f} RSI={rsi5:.1f} | restam={restantes:.1f}s",
+        "mensagem":f"{sinal} | setup R22 pronto na vela anterior | entrada no inicio M5 | decorridos={decorridos:.1f}s",
         "candle_from":candle_from,"candle_to":candle_to,
         "segundos_decorridos":decorridos,"segundos_restantes":restantes,
-        "impulso":current_body,"retracao_ratio":abs(pc-e20)/atr5,
+        "impulso":0.0,"retracao_ratio":abs(pc-e20)/atr5,
         "nivel_sr":e20,"tipo_nivel":"EMA20_M5","toques_nivel":0,
         "distancia_abertura_nivel":abs(abertura-e20),"adx5":adx5,"adx15":adx15,
     }
@@ -3618,7 +3607,7 @@ def _atualizar_dashboard_intravela(symbol, resultado):
         ),
         "bloqueio": resultado.get("bloqueio", "-"),
         "regime": resultado.get("regime", "TENDENCIA_PULLBACK"),
-        "estrategia": resultado.get("estrategia", "TREND_PULLBACK_M5_CONFIRMADO"),
+        "estrategia": resultado.get("estrategia", "TREND_PULLBACK_M5_ENTRADA_INICIO"),
         "zona_fibonacci": "-",
     }
 
@@ -3707,10 +3696,10 @@ def _log_diagnostico_r22(active_id, symbol, msg):
             limite=int(diag["candle_from"])-86400
             _r22_diag_emitidos.intersection_update({k for k in _r22_diag_emitidos if k[1]>=limite})
     if "adx5" not in diag:
-        log(f"[R22 DIAG] {symbol} | bloqueio={diag['motivo']}")
+        log(f"[R23 DIAG] {symbol} | bloqueio={diag['motivo']}")
         return
     log(
-        f"[R22 DIAG] {symbol} | M15={diag['t15']} ADX15={diag['adx15']:.1f} | "
+        f"[R23 DIAG] {symbol} | M15={diag['t15']} ADX15={diag['adx15']:.1f} | "
         f"M5={diag['t5']} ADX5={diag['adx5']:.1f} RSI={diag['rsi']:.1f} | "
         f"pullbackEMA20={'SIM' if diag['touch20'] else 'NÃO'} | "
         f"confCALL={'SIM' if diag['call_confirm'] else 'NÃO'} "
@@ -3727,7 +3716,7 @@ def _processar_sinal_intravela(active_id, msg):
     if not dentro_do_horario():
         return
 
-    # R22: nenhum sinal/ordem é permitido antes do preload M5+M15 completo.
+    # R23: nenhum sinal/ordem é permitido antes do preload M5+M15 completo.
     if not _historico_pronto_event.is_set():
         return
 
@@ -3745,8 +3734,8 @@ def _processar_sinal_intravela(active_id, msg):
 
     _atualizar_dashboard_intravela(symbol, resultado)
 
-    # O Telegram recebe o SINAL assim que o setup técnico é confirmado.
-    # Isso independe de a Bullex aceitar ou recusar a ordem depois.
+    # R23: o Telegram recebe o sinal quando o setup da vela anterior está pronto
+    # e a nova M5 entrou na janela de execução de 2 a 8 segundos.
     threading.Thread(
         target=enviar_sinal_telegram,
         args=(symbol, resultado),
@@ -3777,7 +3766,7 @@ def _processar_sinal_intravela(active_id, msg):
 def calcular_estatisticas_por_estrategia():
     wins = losses = dojis = 0
     for item in _historico_resultados:
-        if item.get("estrategia") != "TREND_PULLBACK_M5_CONFIRMADO":
+        if item.get("estrategia") != "TREND_PULLBACK_M5_ENTRADA_INICIO":
             continue
         r = item.get("resultado")
         if r == "WIN":
@@ -3789,7 +3778,7 @@ def calcular_estatisticas_por_estrategia():
     total = wins + losses + dojis
     decididos = wins + losses
     return {
-        "TREND_PULLBACK_M5_CONFIRMADO": {
+        "TREND_PULLBACK_M5_ENTRADA_INICIO": {
             "total": total,
             "wins": wins,
             "losses": losses,
@@ -4003,8 +3992,8 @@ def enviar_sinal_telegram(
         f"{fmt(resultado.get('ema21'))}\n"
         f"ATR 14: "
         f"{fmt(resultado.get('atr'), 6)}\n\n"
-        f"➡️ ENTRADA: RETRACAO NA VELA ATUAL\n"
-        f"⏱️ EXPIRACAO: FIM DA MESMA VELA M5\n\n"
+        f"➡️ ENTRADA: INICIO DA NOVA VELA M5 (2-8s)\n"
+        f"⏱️ EXPIRACAO: FIM DA VELA M5 ATUAL\n\n"
         f"⚠️ Sinal tecnico experimental."
     )
 
@@ -4066,7 +4055,7 @@ def registrar_operacao_intravela(symbol, resultado):
         "mercado": _mercado_do_symbol(symbol),
         "sinal": sinal,
         "score": resultado.get("score", 0),
-        "estrategia": "TREND_PULLBACK_M5_CONFIRMADO",
+        "estrategia": "TREND_PULLBACK_M5_ENTRADA_INICIO",
         "regime": "INTRAVELA",
         "preco_sinal": float(resultado["preco"]),
         "vela_sinal": candle_dt,
@@ -4364,7 +4353,7 @@ def executar_leitura():
 
         return
 
-    # R22: garante histórico completo antes de liberar qualquer análise/ordem.
+    # R23: garante histórico completo antes de liberar qualquer análise/ordem.
     if not _historico_pronto_event.is_set():
         _precarregar_historico_r22()
         if not _historico_pronto_event.is_set():
@@ -4392,7 +4381,7 @@ def executar_leitura():
     log(
         f"[MONITOR] ativos mapeados={len(ativos_ciclo)} | "
         f"ABERTO={qtd_aberto} | OTC={qtd_otc} | "
-        "sinais=R22 trend/pullback + preload M5/M15 + diagnostico/candle-generated"
+        "sinais=R23 trend/pullback + entrada 2-8s da M5 + preload M5/M15"
     )
 
     for chave, symbol in ativos_ciclo:
