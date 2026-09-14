@@ -114,7 +114,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OPEN-ONLY-BINARY-5-BRL-20260913-R21-TREND-PULLBACK-DIAG-M5"
+BULLEX_DIAGNOSTIC_VERSION = "OPEN-ONLY-BINARY-5-BRL-20260914-R22-TREND-PULLBACK-PRELOAD-M5-M15"
 
 _bullex_diag = {
     "messages": 0,
@@ -269,18 +269,23 @@ _robo_started = False
 _ultimos_sinais_telegram = {}
 _operacoes_pendentes = {}
 _ultimas_operacoes_registradas = {}
-# Base histórica consolidada antes da estratégia de retração intravela:
-# 44 operações decididas = 22 WIN / 22 LOSS = 50,00%.
-_historico_resultados = (
-    [{"resultado": "WIN", "origem": "BASE_ANTES_R13", "estrategia": "BASE"} for _ in range(22)]
-    + [{"resultado": "LOSS", "origem": "BASE_ANTES_R13", "estrategia": "BASE"} for _ in range(22)]
-)
+# R22 inicia a estatística da estratégia do zero.
+# Somente resultados realmente obtidos após este deploy entram na contagem.
+_historico_resultados = []
 _execucao_lock = threading.RLock()
 _operacao_global_ativa = None
 _nivel_progressao = 0
 _bullex_balance_id = None
 _bullex_balance_source = None
 _bullex_instrument_cache = {}
+
+# ============================================================
+# R22 - PRELOAD OBRIGATÓRIO M5 + M15
+# ============================================================
+_historico_pronto_event = threading.Event()
+_historico_preload_lock = threading.Lock()
+_historico_preload_status = {}
+_historico_preload_ultima_tentativa = None
 
 # ============================================================
 # HORÁRIO DO SERVIDOR / JANELA DE ENTRADA 5M
@@ -2152,7 +2157,7 @@ def _aguardar_ativos_mercado_aberto(timeout=30):
     return False
 
 def _assinar_candles_mercado_aberto():
-    """Assina somente M5 dos ativos abertos/OTC usados pela R17."""
+    """R22: assina M5 e M15 para alimentar estratégia e preload recente."""
     assinaturas = set()
 
     with _bullex_assets_lock:
@@ -2160,24 +2165,24 @@ def _assinar_candles_mercado_aberto():
 
     for config in configs:
         active_id = int(config["active_id"])
-        chave = (active_id, 300)
-        if chave in assinaturas:
-            continue
-        assinaturas.add(chave)
+        for size, rotulo in ((300, "M5"), (900, "M15")):
+            chave = (active_id, size)
+            if chave in assinaturas:
+                continue
+            assinaturas.add(chave)
 
-        try:
-            _assinar_candle(active_id, 300)
-            log(
-                f"[ATIVOS] Assinatura M5 ativa: "
-                f"{config.get('symbol')} [{config.get('mercado', 'ABERTO')}] "
-                f"active_id={active_id}"
-            )
-        except Exception as e:
-            log(
-                f"[ATIVOS] Falha assinatura M5 "
-                f"active_id={active_id}: {e}"
-            )
-
+            try:
+                _assinar_candle(active_id, size)
+                log(
+                    f"[ATIVOS] Assinatura {rotulo} ativa: "
+                    f"{config.get('symbol')} [{config.get('mercado', 'ABERTO')}] "
+                    f"active_id={active_id}"
+                )
+            except Exception as e:
+                log(
+                    f"[ATIVOS] Falha assinatura {rotulo} "
+                    f"active_id={active_id}: {e}"
+                )
 
 def _enviar_e_aguardar(
     nome,
@@ -2558,6 +2563,83 @@ def obter_candles(
         )
 
     return candles[-int(outputsize):]
+
+
+def _contar_fechadas_cache(active_id, size):
+    segundos = 300 if int(size) == 300 else 900
+    return len(somente_velas_fechadas(_candidatos_candles_cache(active_id, size), segundos // 60))
+
+
+def _precarregar_historico_r22(forcar=False):
+    """Carrega histórico recente M5 e M15 de TODOS os ativos antes de liberar sinais.
+
+    A estratégia exige pelo menos 55 velas fechadas de cada timeframe. O evento
+    global só é liberado quando todos os ativos mapeados atendem esse mínimo.
+    """
+    global _historico_preload_ultima_tentativa
+
+    if _historico_pronto_event.is_set() and not forcar:
+        return True
+
+    if not _historico_preload_lock.acquire(blocking=False):
+        return _historico_pronto_event.is_set()
+
+    try:
+        _historico_pronto_event.clear()
+        _historico_preload_ultima_tentativa = agora_brt().isoformat()
+
+        with _bullex_assets_lock:
+            itens = [(codigo, dict(cfg)) for codigo, cfg in ATIVO_BULLEX.items()]
+
+        if not itens:
+            log("[R22 PRELOAD] Nenhum ativo mapeado ainda.")
+            return False
+
+        log(f"[R22 PRELOAD] Iniciando M5+M15 para {len(itens)} ativo(s).")
+        todos_ok = True
+        status_local = {}
+
+        for codigo, cfg in itens:
+            symbol = cfg.get("symbol")
+            active_id = int(cfg.get("active_id"))
+            erro = None
+            try:
+                # O feed M5/M15 já está assinado. obter_candles usa o último ID
+                # recebido para pedir histórico recente com only_closed=True.
+                obter_candles(symbol, TIMEFRAME, max(OUTPUTSIZE, 90))
+                obter_candles(symbol, TIMEFRAME_TREND, max(OUTPUTSIZE_15M, 90))
+            except Exception as e:
+                erro = str(e)
+
+            m5 = len(somente_velas_fechadas(_candles_cache(active_id, 300), 5))
+            m15 = len(somente_velas_fechadas(_candles_cache(active_id, 900), 15))
+            ok = m5 >= 55 and m15 >= 55 and erro is None
+            if not ok:
+                todos_ok = False
+
+            status_local[codigo] = {
+                "symbol": symbol, "active_id": active_id,
+                "m5": m5, "m15": m15, "pronto": ok, "erro": erro,
+            }
+            log(
+                f"[R22 PRELOAD] {symbol} | M5={m5} M15={m15} | "
+                f"status={'PRONTO' if ok else 'AGUARDANDO'}"
+                + (f" | erro={erro}" if erro else "")
+            )
+
+        _historico_preload_status.clear()
+        _historico_preload_status.update(status_local)
+
+        if todos_ok:
+            _historico_pronto_event.set()
+            log("[R22 PRELOAD] CONCLUÍDO: todos os ativos têm M5+M15 suficiente. ENTRADAS LIBERADAS.")
+            return True
+
+        log("[R22 PRELOAD] INCOMPLETO: entradas continuam BLOQUEADAS até todos os ativos ficarem prontos.")
+        return False
+    finally:
+        _historico_preload_lock.release()
+
 
 
 # ============================================================
@@ -3199,7 +3281,7 @@ def analisar_pullback(
 
 
 # ============================================================
-# ESTRATÉGIA ÚNICA - S/R M15 + RETRAÇÃO NA MESMA VELA M5
+# ESTRATÉGIA R22 - TENDÊNCIA M15 + PULLBACK M5 + CONFIRMAÇÃO INTRAVELA
 # ============================================================
 
 def _symbol_por_active_id(active_id):
@@ -3414,7 +3496,7 @@ def _fechadas_antes(candles, candle_from, segundos):
 
 
 def _resultado_retracao_intravela(msg, active_id):
-    """R20: continuação de tendência M15 + pullback M5 + confirmação intravela.
+    """R22: continuação de tendência M15 + pullback M5 + confirmação intravela.
 
     M15 define a direção por EMA20/EMA50, inclinação da EMA20 e ADX.
     M5 exige EMA9/20/50 alinhadas e a última vela fechada fazendo pullback
@@ -3541,11 +3623,11 @@ def _atualizar_dashboard_intravela(symbol, resultado):
     }
 
 
-_r21_diag_lock = threading.RLock()
-_r21_diag_emitidos = set()
+_r22_diag_lock = threading.RLock()
+_r22_diag_emitidos = set()
 
 
-def _diagnostico_r21(active_id, msg):
+def _diagnostico_r22(active_id, msg):
     """Gera um diagnóstico por ativo/vela sem alterar a decisão da estratégia."""
     if not isinstance(msg, dict):
         return None
@@ -3611,24 +3693,24 @@ def _diagnostico_r21(active_id, msg):
             "call_confirm":call_confirm,"put_confirm":put_confirm,"restantes":restantes}
 
 
-def _log_diagnostico_r21(active_id, symbol, msg):
-    diag=_diagnostico_r21(active_id,msg)
+def _log_diagnostico_r22(active_id, symbol, msg):
+    diag=_diagnostico_r22(active_id,msg)
     if not diag:
         return
     key=(int(active_id),int(diag["candle_from"]))
-    with _r21_diag_lock:
-        if key in _r21_diag_emitidos:
+    with _r22_diag_lock:
+        if key in _r22_diag_emitidos:
             return
-        _r21_diag_emitidos.add(key)
+        _r22_diag_emitidos.add(key)
         # evita crescimento ilimitado em processos longos
-        if len(_r21_diag_emitidos)>1000:
+        if len(_r22_diag_emitidos)>1000:
             limite=int(diag["candle_from"])-86400
-            _r21_diag_emitidos.intersection_update({k for k in _r21_diag_emitidos if k[1]>=limite})
+            _r22_diag_emitidos.intersection_update({k for k in _r22_diag_emitidos if k[1]>=limite})
     if "adx5" not in diag:
-        log(f"[R21 DIAG] {symbol} | bloqueio={diag['motivo']}")
+        log(f"[R22 DIAG] {symbol} | bloqueio={diag['motivo']}")
         return
     log(
-        f"[R21 DIAG] {symbol} | M15={diag['t15']} ADX15={diag['adx15']:.1f} | "
+        f"[R22 DIAG] {symbol} | M15={diag['t15']} ADX15={diag['adx15']:.1f} | "
         f"M5={diag['t5']} ADX5={diag['adx5']:.1f} RSI={diag['rsi']:.1f} | "
         f"pullbackEMA20={'SIM' if diag['touch20'] else 'NÃO'} | "
         f"confCALL={'SIM' if diag['call_confirm'] else 'NÃO'} "
@@ -3645,9 +3727,13 @@ def _processar_sinal_intravela(active_id, msg):
     if not dentro_do_horario():
         return
 
+    # R22: nenhum sinal/ordem é permitido antes do preload M5+M15 completo.
+    if not _historico_pronto_event.is_set():
+        return
+
     resultado = _resultado_retracao_intravela(msg, active_id)
     if resultado is None:
-        _log_diagnostico_r21(active_id, symbol, msg)
+        _log_diagnostico_r22(active_id, symbol, msg)
         return
 
     candle_key = (int(active_id), int(resultado["candle_from"]))
@@ -4167,7 +4253,7 @@ def finalizar_operacoes_vencidas_antes_da_leitura():
 # ============================================================
 
 def processar_ativo(chave, symbol, executar_sinal=False):
-    """Na R13 o loop de 5 minutos não cria sinais.
+    """Na R22 o loop de 5 minutos mantém histórico e finaliza operações.
 
     Ele apenas mantém histórico atualizado e finaliza operações.
     Os sinais surgem exclusivamente do candle-generated da vela corrente.
@@ -4278,8 +4364,18 @@ def executar_leitura():
 
         return
 
-    # A R21 gera sinais em tempo real no candle-generated e registra diagnóstico por M5.
-    # Este ciclo de 5 minutos apenas finaliza/atualiza operações e saúde dos ativos.
+    # R22: garante histórico completo antes de liberar qualquer análise/ordem.
+    if not _historico_pronto_event.is_set():
+        _precarregar_historico_r22()
+        if not _historico_pronto_event.is_set():
+            estado["sinal"] = "AGUARDAR"
+            estado["mensagem"] = "R22 aguardando preload M5+M15 de todos os ativos."
+            estado["atualizado"] = agora_brt().strftime("%H:%M:%S BRT")
+            log("[R22 PRELOAD] Leitura sem sinais: histórico ainda incompleto.")
+            return
+
+    # A R22 gera sinais em tempo real no candle-generated após preload M5+M15.
+    # Este ciclo de 5 minutos finaliza/atualiza operações e saúde dos ativos.
     finalizar_operacoes_vencidas_antes_da_leitura()
 
     with _bullex_assets_lock:
@@ -4296,7 +4392,7 @@ def executar_leitura():
     log(
         f"[MONITOR] ativos mapeados={len(ativos_ciclo)} | "
         f"ABERTO={qtd_aberto} | OTC={qtd_otc} | "
-        "sinais=R21 trend/pullback + diagnostico/candle-generated"
+        "sinais=R22 trend/pullback + preload M5/M15 + diagnostico/candle-generated"
     )
 
     for chave, symbol in ativos_ciclo:
@@ -4978,7 +5074,7 @@ def health():
             ),
         "estrategia":
             (
-                "S/R M5 + retracao intravela na mesma vela M5 | SOMENTE MERCADO ABERTO"
+                "R22 tendencia M15 + pullback EMA20 M5 + confirmacao intravela | SOMENTE MERCADO ABERTO"
             ),
         "fonte_candles": "Bullex",
         "execucao_automatica": BULLEX_AUTO_TRADE,
@@ -5006,6 +5102,9 @@ def health():
             len(_operacoes_pendentes),
         "entrada_fixa": 5.00,
         "progressao_ativa": False,
+        "historico_preload_pronto": _historico_pronto_event.is_set(),
+        "historico_preload_ultima_tentativa": _historico_preload_ultima_tentativa,
+        "historico_preload_status": dict(_historico_preload_status),
         "mercado": "ABERTO",
         "ativos_mercado_aberto": {
             "detectado": _bullex_assets_detected,
