@@ -120,7 +120,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OTC-ONLY-BINARY-5-BRL-20260914-R25-TREND-PULLBACK-R24-24H"
+BULLEX_DIAGNOSTIC_VERSION = "OTC-AUTONOMO-KNN-R1-20260915-MULTIATIVO"
 
 _bullex_diag = {
     "messages": 0,
@@ -196,7 +196,12 @@ INTRAVELA_RETRACAO_MAX = 0.68
 INTRAVELA_REJEICAO_ATR_MIN = 0.10
 INTRAVELA_PAVIO_MIN_FRACAO_MOVIMENTO = 0.10
 
-UMA_OPERACAO_GLOBAL = True
+UMA_OPERACAO_GLOBAL = False
+MAX_OPERACOES_POR_ATIVO = 1
+AUTONOMO_MIN_AMOSTRAS = 45
+AUTONOMO_K_VIZINHOS = 17
+AUTONOMO_CONFIANCA_MIN = 0.62
+AUTONOMO_MARGEM_MIN = 0.12
 
 _intravela_lock = threading.RLock()
 _intravela_estado = {}
@@ -283,7 +288,9 @@ _execucao_lock = threading.RLock()
 _operacao_global_ativa = None
 # R24: também bloqueia novas ordens enquanto uma ordem está sendo enviada,
 # evitando corrida entre dois ativos que sinalizem praticamente ao mesmo tempo.
-_operacao_global_em_envio = False
+_operacao_global_em_envIO_LEGACY = False
+_operacoes_ativas_por_symbol = {}
+_operacoes_em_envio = set()
 
 # R24: candidatos da mesma abertura M5 são comparados antes da execução.
 # Uma pequena janela de coleta permite escolher o setup mais forte sem atrasar
@@ -673,7 +680,8 @@ def _atualizar_estado_execucao():
         "modo": "DEMO",
         "valor_atual": _valor_entrada_atual(),
         "nivel_progressao": _nivel_progressao,
-        "operacao_ativa": _operacao_global_ativa is not None,
+        "operacao_ativa": bool(_operacoes_ativas_por_symbol),
+        "operacoes_ativas": len(_operacoes_ativas_por_symbol),
         "balance_id_disponivel": _bullex_balance_id is not None,
         "balance_source": _bullex_balance_source,
     })
@@ -783,48 +791,31 @@ def _resposta_indica_indisponibilidade_produto(resposta):
 
 
 def _registrar_ordem_confirmada(symbol, ticker, sinal, valor, active_id, balance_id,
-                                produto, resposta, janela, instrument_id=None,
-                                instrument_index=None):
-    global _operacao_global_ativa
-
-    candle_open_dt = datetime.fromtimestamp(janela["candle_open"], TZ)
-    candle_close_dt = datetime.fromtimestamp(janela["candle_close"], TZ)
-    msg = resposta.get("msg") if isinstance(resposta, dict) else None
-    option_id = msg.get("id") if isinstance(msg, dict) else None
-
-    _operacao_global_ativa = {
-        "symbol": symbol,
-        "ticker": ticker,
-        "sinal": sinal,
-        "valor": valor,
-        "asset_id": active_id,
-        "balance_id": str(balance_id),
-        "produto": produto,
-        "option_id": option_id,
-        "instrument_id": instrument_id,
-        "instrument_index": instrument_index,
-        "expired": int(janela["candle_close"]),
-        "expiracao": candle_close_dt.isoformat(),
-        "candle_open": candle_open_dt.isoformat(),
-        "atraso_segundos": round(float(janela["atraso_segundos"]), 3),
-        "fonte_horario": janela["source"],
-        "enviada_em": agora_brt().isoformat(),
-        "resultado": "PENDENTE",
-        "response": resposta,
+                                 produto, resposta, janela, instrument_id=None,
+                                 instrument_index=None):
+    candle_open_dt=datetime.fromtimestamp(janela['candle_open'],TZ)
+    candle_close_dt=datetime.fromtimestamp(janela['candle_close'],TZ)
+    msg=resposta.get('msg') if isinstance(resposta,dict) else None
+    option_id=msg.get('id') if isinstance(msg,dict) else None
+    info={
+        'symbol':symbol,'ticker':ticker,'sinal':sinal,'valor':valor,'asset_id':active_id,
+        'balance_id':str(balance_id),'produto':produto,'option_id':option_id,
+        'instrument_id':instrument_id,'instrument_index':instrument_index,
+        'expired':int(janela['candle_close']),'expiracao':candle_close_dt.isoformat(),
+        'candle_open':candle_open_dt.isoformat(),'atraso_segundos':round(float(janela['atraso_segundos']),3),
+        'fonte_horario':janela['source'],'enviada_em':agora_brt().isoformat(),'resultado':'PENDENTE',
+        'response':resposta,
     }
-    estado["execucao"]["ultima_ordem"] = _operacao_global_ativa.copy()
-    estado["execucao"]["ultimo_erro"] = None
+    with _execucao_lock:
+        _operacoes_ativas_por_symbol[symbol]=info
+        _operacoes_em_envio.discard(symbol)
+    estado['execucao']['ultima_ordem']=info.copy()
+    estado['execucao']['ultimo_erro']=None
     _atualizar_estado_execucao()
-    log(
-        f"[AUTO] ORDEM CONFIRMADA via {produto}: "
-        f"{symbol} {sinal} R${valor:.2f} id={option_id}"
-    )
-    return "CONFIRMADA"
-
+    log(f"[AUTO] ORDEM CONFIRMADA via {produto}: {symbol} {sinal} R${valor:.2f} id={option_id}")
+    return 'CONFIRMADA'
 
 def executar_ordem_intravela(symbol, sinal, resultado):
-    global _operacao_global_ativa
-    global _operacao_global_em_envio
     global _bullex_last_error
 
     if not BULLEX_AUTO_TRADE:
@@ -839,19 +830,15 @@ def executar_ordem_intravela(symbol, sinal, resultado):
         return "SEM_BALANCE_ID"
 
     with _execucao_lock:
-        if UMA_OPERACAO_GLOBAL and (_operacao_global_ativa is not None or _operacao_global_em_envio):
-            log(
-                f"[INTRAVELA] {symbol}: sinal ignorado; "
-                "já existe operação global ativa ou ordem em envio."
-            )
-            return "BLOQUEADA_GLOBAL"
-        if UMA_OPERACAO_GLOBAL:
-            _operacao_global_em_envio = True
+        if symbol in _operacoes_ativas_por_symbol or symbol in _operacoes_em_envio or symbol in _operacoes_pendentes:
+            log(f"[AUTONOMO] {symbol}: já existe operação deste ativo ativa/em envio.")
+            return "BLOQUEADA_ATIVO"
+        _operacoes_em_envio.add(symbol)
 
     balance_id = _obter_balance_id()
     if not balance_id:
         with _execucao_lock:
-            _operacao_global_em_envio = False
+            _operacoes_em_envio.discard(symbol)
         return "SEM_BALANCE_ID"
 
     config = next(
@@ -860,7 +847,7 @@ def executar_ordem_intravela(symbol, sinal, resultado):
     )
     if not config:
         with _execucao_lock:
-            _operacao_global_em_envio = False
+            _operacoes_em_envio.discard(symbol)
         return "SEM_ATIVO"
 
     active_id = int(config["active_id"])
@@ -880,7 +867,7 @@ def executar_ordem_intravela(symbol, sinal, resultado):
             "ordem NÃO enviada."
         )
         with _execucao_lock:
-            _operacao_global_em_envio = False
+            _operacoes_em_envio.discard(symbol)
         return "VELA_ENCERRADA"
 
     if restantes < INTRAVELA_MIN_SEGUNDOS_RESTANTES:
@@ -889,7 +876,7 @@ def executar_ordem_intravela(symbol, sinal, resultado):
             "ordem NÃO enviada para evitar cair na próxima vela."
         )
         with _execucao_lock:
-            _operacao_global_em_envio = False
+            _operacoes_em_envio.discard(symbol)
         return "POUCO_TEMPO"
 
     janela = {
@@ -954,7 +941,7 @@ def executar_ordem_intravela(symbol, sinal, resultado):
                 name=f"telegram-ordem-recusada-{active_id}",
             ).start()
             with _execucao_lock:
-                _operacao_global_em_envio = False
+                _operacoes_em_envio.discard(symbol)
             return "SEM_CONFIRMACAO"
 
         with _bullex_diag_lock:
@@ -973,7 +960,7 @@ def executar_ordem_intravela(symbol, sinal, resultado):
         )
 
         with _execucao_lock:
-            _operacao_global_em_envio = False
+            _operacoes_em_envio.discard(symbol)
 
         threading.Thread(
             target=enviar_status_ordem_telegram,
@@ -989,10 +976,10 @@ def executar_ordem_intravela(symbol, sinal, resultado):
         ).start()
 
         with _execucao_lock:
-            if _operacao_global_ativa is not None:
-                _operacao_global_ativa["preco_entrada_estimado"] = float(resultado["preco"])
-                _operacao_global_ativa["estrategia"] = "TREND_PULLBACK_M5"
-                _operacao_global_ativa["regime"] = "INTRAVELA"
+            if symbol in _operacoes_ativas_por_symbol:
+                _operacoes_ativas_por_symbol[symbol]["preco_entrada_estimado"] = float(resultado["preco"])
+                _operacoes_ativas_por_symbol[symbol]["estrategia"] = "AUTONOMO_KNN_M5"
+                _operacoes_ativas_por_symbol[symbol]["regime"] = resultado.get("regime", "AUTONOMO")
 
         return status
 
@@ -1003,7 +990,7 @@ def executar_ordem_intravela(symbol, sinal, resultado):
         estado["execucao"]["ultimo_erro"] = str(e)
         _atualizar_estado_execucao()
         with _execucao_lock:
-            _operacao_global_em_envio = False
+            _operacoes_em_envio.discard(symbol)
         log(f"[AUTO INTRAVELA] ERRO ao enviar ordem: {e}")
         return "ERRO"
 
@@ -3531,20 +3518,62 @@ def _fechadas_antes(candles, candle_from, segundos):
     return out
 
 
+def _autonomo_features(candles, idx):
+    """Cria uma fotografia numérica usando somente informação conhecida até idx."""
+    if idx < 22 or idx >= len(candles):
+        return None
+    janela = candles[:idx + 1]
+    c = closes(janela)
+    a = atr(janela, 14)
+    if not a or a <= 0:
+        return None
+    preco = c[-1]
+    e5, e13, e21 = ema(c, 5), ema(c, 13), ema(c, 21)
+    rv = rsi(c, 14)
+    if None in (e5, e13, e21, rv):
+        return None
+    info = candle_info(janela[-1])
+    def ret(n):
+        base = c[-1-n]
+        return (preco-base)/a if base else 0.0
+    return [
+        ret(1), ret(2), ret(3), ret(6), ret(12),
+        (preco-e5)/a, (e5-e13)/a, (e13-e21)/a,
+        (rv-50.0)/50.0,
+        (info['close']-info['open'])/a,
+        info['range']/a,
+        info['upper_wick']/a, info['lower_wick']/a,
+    ]
+
+
+def _autonomo_distancia(a, b):
+    return sum((x-y)*(x-y) for x,y in zip(a,b)) ** 0.5
+
+
+def _autonomo_ajuste_online(symbol, sinal):
+    """Pequeno ajuste baseado apenas em operações reais já encerradas deste processo."""
+    itens=[x for x in _historico_resultados if x.get('symbol')==symbol and x.get('sinal')==sinal and x.get('resultado') in ('WIN','LOSS')][-30:]
+    if len(itens) < 5:
+        return 0.0, len(itens)
+    wins=sum(1 for x in itens if x.get('resultado')=='WIN')
+    taxa=wins/len(itens)
+    return max(-0.08,min(0.08,(taxa-0.5)*0.20)), len(itens)
+
+
 def _resultado_retracao_intravela(msg, active_id):
-    """R23: mesma leitura direcional da R22, mas entrada no INICIO da nova M5.
+    """Motor autônomo R1: aprende padrões do próprio histórico M5 do ativo.
 
-    A decisão usa somente velas já fechadas antes da vela atual. A última vela
-    fechada deve ter produzido o pullback/retração da R22. Não esperamos mais
-    o rompimento no meio da vela atual: se o setup estiver pronto, a ordem é
-    tentada entre 2 e 8 segundos após a abertura da nova M5.
+    Não recebe uma regra CALL/PUT fixa. Para cada nova M5, compara o estado
+    recente com estados históricos semelhantes e observa o que aconteceu na
+    vela seguinte. Se não houver amostras ou vantagem suficiente, NÃO opera.
     """
-    if not isinstance(msg, dict): return None
+    if not isinstance(msg, dict):
+        return None
     try:
-        abertura=float(msg["open"]); fechamento=float(msg["close"])
-        candle_from=int(float(msg["from"])); candle_to=int(float(msg.get("to") or candle_from+300))
-    except Exception: return None
-
+        abertura=float(msg['open']); preco=float(msg['close'])
+        candle_from=int(float(msg['from'])); candle_to=int(float(msg.get('to') or candle_from+300))
+    except Exception:
+        return None
     server_ts,_=_horario_servidor_atual()
     decorridos=max(0.0,server_ts-candle_from); restantes=max(0.0,candle_to-server_ts)
     if decorridos < INTRAVELA_MIN_SEGUNDOS_DECORRIDOS or decorridos > INTRAVELA_MAX_SEGUNDOS_DECORRIDOS:
@@ -3552,63 +3581,64 @@ def _resultado_retracao_intravela(msg, active_id):
     if restantes < INTRAVELA_MIN_SEGUNDOS_RESTANTES:
         return None
 
-    m5=_fechadas_antes(_candles_cache(active_id,300),candle_from,300)[-90:]
-    m15=_fechadas_antes(_candles_cache(active_id,900),candle_from,900)[-90:]
-    if len(m5)<55 or len(m15)<55: return None
+    m5=_fechadas_antes(_candles_cache(active_id,300),candle_from,300)[-150:]
+    if len(m5) < AUTONOMO_MIN_AMOSTRAS + 24:
+        return None
+    atual=_autonomo_features(m5, len(m5)-1)
+    if atual is None:
+        return None
 
-    c5=closes(m5); c15=closes(m15)
-    atr5=atr(m5,14); adx5=_adx_candles(m5,14); adx15=_adx_candles(m15,14)
-    e9=ema(c5,9); e20=ema(c5,20); e50=ema(c5,50)
-    e20_15=ema(c15,20); e50_15=ema(c15,50)
-    e20_15_prev=ema(c15[:-3],20) if len(c15[:-3])>=20 else None
-    rsi5=rsi(c5,14)
-    vals=(atr5,adx5,adx15,e9,e20,e50,e20_15,e50_15,e20_15_prev,rsi5)
-    if any(v is None for v in vals) or atr5<=0: return None
+    exemplos=[]
+    # O alvo é a direção da vela imediatamente seguinte ao estado observado.
+    for i in range(22, len(m5)-1):
+        feat=_autonomo_features(m5, i)
+        if feat is None: continue
+        entrada=float(m5[i]['close']); saida=float(m5[i+1]['close'])
+        if saida == entrada: continue
+        label='CALL' if saida > entrada else 'PUT'
+        exemplos.append((_autonomo_distancia(atual,feat),label))
+    if len(exemplos) < AUTONOMO_MIN_AMOSTRAS:
+        return None
+    exemplos.sort(key=lambda x:x[0])
+    vizinhos=exemplos[:min(AUTONOMO_K_VIZINHOS,len(exemplos))]
+    # Vizinhos mais próximos pesam mais; evita que um padrão distante domine.
+    call_w=put_w=0.0
+    for dist,label in vizinhos:
+        peso=1.0/(0.10+dist)
+        if label=='CALL': call_w+=peso
+        else: put_w+=peso
+    total=call_w+put_w
+    if total<=0: return None
+    p_call=call_w/total; p_put=put_w/total
+    sinal='CALL' if p_call>=p_put else 'PUT'
+    confianca=max(p_call,p_put)
+    ajuste,amostras_online=_autonomo_ajuste_online(_symbol_por_active_id(active_id)[1],sinal)
+    confianca_ajustada=max(0.0,min(1.0,confianca+ajuste))
+    margem=abs(p_call-p_put)
+    if confianca_ajustada < AUTONOMO_CONFIANCA_MIN or margem < AUTONOMO_MARGEM_MIN:
+        return None
 
-    prev=m5[-1]
-    po=float(prev["open"]); pc=float(prev["close"]); ph=float(prev["high"]); pl=float(prev["low"])
-    prange=max(ph-pl,1e-12); pbody=abs(pc-po)
-
-    if adx15 < 20 or adx5 < 17: return None
-
-    tol=atr5*0.18
-    touch20 = pl <= e20+tol and ph >= e20-tol
-    trend_call=(e20_15>e50_15 and e20_15>e20_15_prev and c15[-1]>e20_15 and e9>e20>e50)
-    trend_put=(e20_15<e50_15 and e20_15<e20_15_prev and c15[-1]<e20_15 and e9<e20<e50)
-    prev_bear = pc < po or pbody/prange <= 0.35
-    prev_bull = pc > po or pbody/prange <= 0.35
-
-    sinal=None
-    if trend_call and touch20 and prev_bear and pl >= e50-tol and 50 <= rsi5 <= 68:
-        sinal="CALL"
-    elif trend_put and touch20 and prev_bull and ph <= e50+tol and 32 <= rsi5 <= 50:
-        sinal="PUT"
-    if sinal is None: return None
-
-    score=10
-    if adx15>=25: score+=1
-    if adx5>=22: score+=1
-    if abs(pc-e20)<=atr5*0.12: score+=1
-    if (sinal=="CALL" and 54<=rsi5<=64) or (sinal=="PUT" and 36<=rsi5<=46): score+=1
-
+    c=closes(m5); a=atr(m5,14); rv=rsi(c,14)
+    e5,e13,e21=ema(c,5),ema(c,13),ema(c,21)
+    tendencia='ALTA' if e5 and e13 and e21 and e5>e13>e21 else 'BAIXA' if e5 and e13 and e21 and e5<e13<e21 else 'NEUTRA'
+    score=round(confianca_ajustada*100,1)
     return {
-        "sinal":sinal,"score":score,
-        "score_call":score if sinal=="CALL" else 1,"score_put":score if sinal=="PUT" else 1,
-        "preco":fechamento,"vela":datetime.fromtimestamp(candle_from,TZ),
-        "estrategia":"TREND_PULLBACK_M5_ENTRADA_INICIO","regime":"TENDENCIA_PULLBACK",
-        "pullback":f"PULLBACK EMA20 M5 FECHADO | ADX15={adx15:.1f}",
-        "rejeicao":"ENTRADA NO INICIO DA PROXIMA M5",
-        "lateral":"NÃO" if adx15>=20 else "SIM","atr":atr5,"rsi":rsi5,
-        "ema5":e9,"ema13":e20,"ema21":e50,
-        "tendencia_5m":"ALTA" if sinal=="CALL" else "BAIXA",
-        "tendencia_15m":"ALTA" if sinal=="CALL" else "BAIXA",
-        "zona_fibonacci":"N/A","bloqueio":"SINAL",
-        "mensagem":f"{sinal} | setup R22 pronto na vela anterior | entrada no inicio M5 | decorridos={decorridos:.1f}s",
-        "candle_from":candle_from,"candle_to":candle_to,
-        "segundos_decorridos":decorridos,"segundos_restantes":restantes,
-        "impulso":0.0,"retracao_ratio":abs(pc-e20)/atr5,
-        "nivel_sr":e20,"tipo_nivel":"EMA20_M5","toques_nivel":0,
-        "distancia_abertura_nivel":abs(abertura-e20),"adx5":adx5,"adx15":adx15,
+        'sinal':sinal,'score':score,
+        'score_call':round(p_call*100,1),'score_put':round(p_put*100,1),
+        'preco':preco,'vela':datetime.fromtimestamp(candle_from,TZ),
+        'estrategia':'AUTONOMO_KNN_M5','regime':tendencia,
+        'pullback':f'APRENDIZADO: {len(exemplos)} exemplos; {len(vizinhos)} vizinhos',
+        'rejeicao':f'confianca={confianca_ajustada*100:.1f}% margem={margem*100:.1f}%',
+        'lateral':'N/A','atr':a,'rsi':rv,'ema5':e5,'ema13':e13,'ema21':e21,
+        'tendencia_5m':tendencia,'tendencia_15m':'MULTIESCALA_M5',
+        'zona_fibonacci':'N/A','bloqueio':'SINAL_AUTONOMO',
+        'mensagem':f'{sinal} autonomo | confiança {confianca_ajustada*100:.1f}% | histórico {len(exemplos)} | online {amostras_online}',
+        'candle_from':candle_from,'candle_to':candle_to,
+        'segundos_decorridos':decorridos,'segundos_restantes':restantes,
+        'impulso':0.0,'retracao_ratio':0.0,'nivel_sr':None,'tipo_nivel':'MODELO_AUTONOMO',
+        'toques_nivel':0,'distancia_abertura_nivel':0.0,'adx5':0.0,'adx15':0.0,
+        'confianca':confianca_ajustada,'amostras_modelo':len(exemplos),
+        'vizinhos':len(vizinhos),'ajuste_online':ajuste,
     }
 
 def _atualizar_dashboard_intravela(symbol, resultado):
@@ -3641,8 +3671,8 @@ def _atualizar_dashboard_intravela(symbol, resultado):
             if isinstance(resultado.get("atr"), (int, float)) else "-"
         ),
         "bloqueio": resultado.get("bloqueio", "-"),
-        "regime": resultado.get("regime", "TENDENCIA_PULLBACK"),
-        "estrategia": resultado.get("estrategia", "TREND_PULLBACK_M5_ENTRADA_INICIO"),
+        "regime": resultado.get("regime", "AUTONOMO"),
+        "estrategia": resultado.get("estrategia", "AUTONOMO_KNN_M5"),
         "zona_fibonacci": "-",
     }
 
@@ -3807,50 +3837,26 @@ def _r24_despachar_melhor(candle_from):
 
 def _processar_sinal_intravela(active_id, msg):
     codigo, symbol = _symbol_por_active_id(active_id)
-    if not codigo or not symbol:
+    if not codigo or not symbol or not dentro_do_horario() or not _historico_pronto_event.is_set():
         return
-
-    if not dentro_do_horario():
-        return
-
-    # R24: nenhum sinal/ordem é permitido antes do preload M5+M15 completo.
-    if not _historico_pronto_event.is_set():
-        return
-
     resultado = _resultado_retracao_intravela(msg, active_id)
     if resultado is None:
-        _log_diagnostico_r22(active_id, symbol, msg)
         return
-
-    candle_key = (int(active_id), int(resultado["candle_from"]))
-
+    candle_key=(int(active_id),int(resultado['candle_from']))
     with _intravela_lock:
         if candle_key in _intravela_velas_tentadas:
             return
         _intravela_velas_tentadas.add(candle_key)
-
-    # R24: em vez de executar o primeiro callback que chegar, guarda todos os
-    # setups válidos da mesma abertura M5 por uma fração de segundo e escolhe
-    # somente o melhor classificado. Continua existindo no máximo UMA operação
-    # global por vez.
-    with _r24_candidatos_lock:
-        _r24_candidatos.setdefault(int(resultado["candle_from"]), []).append(
-            (int(active_id), symbol, resultado)
-        )
-        if int(resultado["candle_from"]) not in _r24_dispatchers:
-            _r24_dispatchers.add(int(resultado["candle_from"]))
-            threading.Thread(
-                target=_r24_despachar_melhor,
-                args=(int(resultado["candle_from"]),),
-                daemon=True,
-                name=f"r24-rank-{resultado['candle_from']}",
-            ).start()
-
+    _atualizar_dashboard_intravela(symbol, resultado)
+    threading.Thread(target=enviar_sinal_telegram,args=(symbol,resultado),daemon=True,
+                     name=f"telegram-autonomo-{active_id}-{resultado['candle_from']}").start()
+    log(f"[AUTONOMO] {symbol} -> {resultado['sinal']} | confiança={resultado.get('confianca',0)*100:.1f}% | amostras={resultado.get('amostras_modelo',0)}")
+    registrar_operacao_intravela(symbol, resultado)
 
 def calcular_estatisticas_por_estrategia():
     wins = losses = dojis = 0
     for item in _historico_resultados:
-        if item.get("estrategia") != "TREND_PULLBACK_M5_ENTRADA_INICIO":
+        if item.get("estrategia") != "AUTONOMO_KNN_M5":
             continue
         r = item.get("resultado")
         if r == "WIN":
@@ -3862,7 +3868,7 @@ def calcular_estatisticas_por_estrategia():
     total = wins + losses + dojis
     decididos = wins + losses
     return {
-        "TREND_PULLBACK_M5_ENTRADA_INICIO": {
+        "AUTONOMO_KNN_M5": {
             "total": total,
             "wins": wins,
             "losses": losses,
@@ -4131,7 +4137,7 @@ def registrar_operacao_intravela(symbol, resultado):
         return
 
     with _execucao_lock:
-        info = (_operacao_global_ativa or {}).copy()
+        info = _operacoes_ativas_por_symbol.get(symbol, {}).copy()
 
     operacao = {
         "id": chave,
@@ -4139,8 +4145,8 @@ def registrar_operacao_intravela(symbol, resultado):
         "mercado": _mercado_do_symbol(symbol),
         "sinal": sinal,
         "score": resultado.get("score", 0),
-        "estrategia": "TREND_PULLBACK_M5_ENTRADA_INICIO",
-        "regime": "INICIO_M5",
+        "estrategia": "AUTONOMO_KNN_M5",
+        "regime": resultado.get("regime", "AUTONOMO"),
         "preco_sinal": float(resultado["preco"]),
         "vela_sinal": candle_dt,
         "vela_entrada": candle_dt,
@@ -4180,7 +4186,6 @@ def registrar_operacao_intravela(symbol, resultado):
 # ============================================================
 
 def avaliar_operacao(symbol, candles):
-    global _operacao_global_ativa
 
     operacao = _operacoes_pendentes.get(symbol)
     if not operacao:
@@ -4215,11 +4220,8 @@ def avaliar_operacao(symbol, candles):
         del _operacoes_pendentes[symbol]
 
         with _execucao_lock:
-            if (
-                _operacao_global_ativa is not None
-                and _operacao_global_ativa.get("symbol") == symbol
-            ):
-                _operacao_global_ativa = None
+            _operacoes_ativas_por_symbol.pop(symbol, None)
+            _operacoes_em_envio.discard(symbol)
 
         _atualizar_progressao(resultado)
         _atualizar_estado_execucao()
@@ -4440,7 +4442,7 @@ def executar_leitura():
     log(
         f"[MONITOR] ativos mapeados={len(ativos_ciclo)} | "
         f"ABERTO={qtd_aberto} | OTC={qtd_otc} | "
-        "sinais=R25 OTC | R24 trend/pullback + entrada 2-8s + melhor classificada + 1 global | 24H"
+        "sinais=AUTONOMO KNN OTC | entrada 2-8s | 1 por ativo | multiativo simultaneo | 24H"
     )
 
     for chave, symbol in ativos_ciclo:
@@ -5122,14 +5124,14 @@ def health():
             ),
         "estrategia":
             (
-                "R25 OTC: tendencia M15 + pullback EMA20 M5 + entrada no inicio da proxima M5 + melhor classificada | SEM RESTRICAO DE HORARIO"
+                "AUTONOMO KNN OTC: aprendizado historico por ativo + adaptacao online + multiativo simultaneo | 24H"
             ),
         "fonte_candles": "Bullex",
         "execucao_automatica": BULLEX_AUTO_TRADE,
         "modo_execucao": "DEMO",
         "valor_entrada_atual": _valor_entrada_atual(),
         "nivel_progressao": _nivel_progressao,
-        "operacao_global_ativa": _operacao_global_ativa,
+        "operacoes_ativas_por_symbol": _operacoes_ativas_por_symbol,
         "balance_id_disponivel": _bullex_balance_id is not None,
         "balance_id_fonte": _bullex_balance_source,
         "websocket_conectado":
