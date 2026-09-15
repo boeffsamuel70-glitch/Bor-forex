@@ -120,7 +120,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OTC-AUTONOMO-KNN-R1-20260915-MULTIATIVO"
+BULLEX_DIAGNOSTIC_VERSION = "OTC-AUTONOMO-KNN-R2-20260915-ADAPTATIVO"
 
 _bullex_diag = {
     "messages": 0,
@@ -202,6 +202,14 @@ AUTONOMO_MIN_AMOSTRAS = 45
 AUTONOMO_K_VIZINHOS = 17
 AUTONOMO_CONFIANCA_MIN = 0.62
 AUTONOMO_MARGEM_MIN = 0.12
+
+# R2 - segunda camada de aprendizado: aprende quando NÃO operar.
+# O KNN continua escolhendo CALL/PUT; esta camada mede o desempenho REAL
+# por faixa de confiança e por ativo. Só bloqueia depois de ter amostra mínima.
+AUTONOMO_ADAPTATIVO_ATIVO_MIN = 6
+AUTONOMO_ADAPTATIVO_FAIXA_MIN = 12
+AUTONOMO_ADAPTATIVO_TAXA_BLOQUEIO = 0.48
+AUTONOMO_ADAPTATIVO_ULTIMAS = 80
 
 _intravela_lock = threading.RLock()
 _intravela_estado = {}
@@ -3560,6 +3568,39 @@ def _autonomo_ajuste_online(symbol, sinal):
     return max(-0.08,min(0.08,(taxa-0.5)*0.20)), len(itens)
 
 
+def _autonomo_faixa_confianca(confianca):
+    pct=float(confianca or 0.0)*100.0
+    if pct < 65: return "62-64.9"
+    if pct < 70: return "65-69.9"
+    if pct < 75: return "70-74.9"
+    return "75+"
+
+
+def _autonomo_desempenho(itens):
+    decididos=[x for x in itens if x.get("resultado") in ("WIN","LOSS")]
+    wins=sum(1 for x in decididos if x.get("resultado")=="WIN")
+    total=len(decididos)
+    return wins,total,(wins/total if total else None)
+
+
+def _autonomo_filtro_adaptativo(symbol, sinal, confianca):
+    """Retorna (permitir, motivo, diagnostico). Nunca aprende com ordem recusada."""
+    faixa=_autonomo_faixa_confianca(confianca)
+    base=[x for x in _historico_resultados
+          if x.get("resultado") in ("WIN","LOSS")
+          and x.get("estrategia")=="AUTONOMO_KNN_M5"][-AUTONOMO_ADAPTATIVO_ULTIMAS:]
+    por_faixa=[x for x in base if x.get("faixa_confianca")==faixa and x.get("sinal")==sinal]
+    por_ativo=[x for x in por_faixa if x.get("symbol")==symbol]
+    wa,na,ta=_autonomo_desempenho(por_ativo)
+    wf,nf,tf=_autonomo_desempenho(por_faixa)
+    diag={"faixa":faixa,"ativo_n":na,"ativo_taxa":ta,"faixa_n":nf,"faixa_taxa":tf}
+    if na >= AUTONOMO_ADAPTATIVO_ATIVO_MIN and ta is not None and ta < AUTONOMO_ADAPTATIVO_TAXA_BLOQUEIO:
+        return False, f"NAO_OPERAR ativo+faixa {symbol} {sinal} {faixa}: {wa}/{na} WIN ({ta*100:.1f}%)", diag
+    if nf >= AUTONOMO_ADAPTATIVO_FAIXA_MIN and tf is not None and tf < AUTONOMO_ADAPTATIVO_TAXA_BLOQUEIO:
+        return False, f"NAO_OPERAR faixa {sinal} {faixa}: {wf}/{nf} WIN ({tf*100:.1f}%)", diag
+    return True, "LIBERADO_ADAPTATIVO", diag
+
+
 def _resultado_retracao_intravela(msg, active_id):
     """Motor autônomo R1: aprende padrões do próprio histórico M5 do ativo.
 
@@ -3618,6 +3659,14 @@ def _resultado_retracao_intravela(msg, active_id):
     if confianca_ajustada < AUTONOMO_CONFIANCA_MIN or margem < AUTONOMO_MARGEM_MIN:
         return None
 
+    symbol_atual=_symbol_por_active_id(active_id)[1]
+    permitir_adaptativo,motivo_adaptativo,diag_adaptativo=_autonomo_filtro_adaptativo(
+        symbol_atual,sinal,confianca_ajustada
+    )
+    if not permitir_adaptativo:
+        log(f"[AUTONOMO][NAO OPERAR] {motivo_adaptativo}")
+        return None
+
     c=closes(m5); a=atr(m5,14); rv=rsi(c,14)
     e5,e13,e21=ema(c,5),ema(c,13),ema(c,21)
     tendencia='ALTA' if e5 and e13 and e21 and e5>e13>e21 else 'BAIXA' if e5 and e13 and e21 and e5<e13<e21 else 'NEUTRA'
@@ -3639,6 +3688,8 @@ def _resultado_retracao_intravela(msg, active_id):
         'toques_nivel':0,'distancia_abertura_nivel':0.0,'adx5':0.0,'adx15':0.0,
         'confianca':confianca_ajustada,'amostras_modelo':len(exemplos),
         'vizinhos':len(vizinhos),'ajuste_online':ajuste,
+        'faixa_confianca':_autonomo_faixa_confianca(confianca_ajustada),
+        'adaptativo':diag_adaptativo,'filtro_adaptativo':motivo_adaptativo,
     }
 
 def _atualizar_dashboard_intravela(symbol, resultado):
@@ -4145,6 +4196,10 @@ def registrar_operacao_intravela(symbol, resultado):
         "mercado": _mercado_do_symbol(symbol),
         "sinal": sinal,
         "score": resultado.get("score", 0),
+        "confianca": float(resultado.get("confianca", 0.0) or 0.0),
+        "faixa_confianca": resultado.get("faixa_confianca") or _autonomo_faixa_confianca(resultado.get("confianca", 0.0)),
+        "ajuste_online": resultado.get("ajuste_online", 0.0),
+        "adaptativo": resultado.get("adaptativo", {}),
         "estrategia": "AUTONOMO_KNN_M5",
         "regime": resultado.get("regime", "AUTONOMO"),
         "preco_sinal": float(resultado["preco"]),
@@ -4228,10 +4283,12 @@ def avaliar_operacao(symbol, candles):
 
         estatisticas = calcular_estatisticas()
 
+        faixa=operacao.get("faixa_confianca", "-")
+        conf=float(operacao.get("confianca",0.0) or 0.0)*100.0
         log(
             f"[RESULTADO INTRAVELA] {symbol} {operacao['sinal']} -> {resultado} | "
             f"entrada={entrada:.5f} | fechamento_mesma_vela={saida:.5f} | "
-            f"taxa_total={estatisticas['taxa']:.2f}%"
+            f"confiança={conf:.1f}% faixa={faixa} | taxa_total={estatisticas['taxa']:.2f}%"
         )
 
         enviar_resultado_telegram(operacao, estatisticas)
