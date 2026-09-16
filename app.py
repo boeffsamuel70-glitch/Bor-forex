@@ -226,7 +226,6 @@ _intravela_velas_tentadas = set()
 
 ATIVOS = {
     "EURUSD_OTC": "EUR/USD OTC",
-    "EURJPY_OTC": "EUR/JPY OTC",
     "GBPUSD_OTC": "GBP/USD OTC",
     "USDJPY_OTC": "USD/JPY OTC",
     "GBPJPY_OTC": "GBP/JPY OTC",
