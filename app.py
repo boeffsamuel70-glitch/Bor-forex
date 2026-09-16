@@ -119,7 +119,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OTC-AUTONOMO-KNN-R7-20260916-BLOQUEIO-POR-LOSS"
+BULLEX_DIAGNOSTIC_VERSION = "OTC-AUTONOMO-KNN-GALE-OBRIGATORIO-20260916"
 
 _bullex_diag = {
     "messages": 0,
@@ -4022,24 +4022,21 @@ def _tentar_gale_na_proxima_vela(active_id, msg):
     if gale.get("tentado"):
         return True
 
-    # R6: Gale deixou de ser obrigatório. Reanalisa a nova vela; só executa se
-    # o modelo ainda enxergar a MESMA direção e o seletor de ciclo continuar forte.
-    reanalise = _resultado_retracao_intravela(msg, active_id)
-    if reanalise is None or reanalise.get("sinal") != gale["sinal"]:
-        gale["tentado"] = True
-        _gales_pendentes.pop(symbol, None)
-        log(f"[GALE SELETIVO] {symbol}: Gale cancelado; nova análise não confirmou {gale['sinal']}.")
-        return True
+    # Gale 1 obrigatório: toda PRIMEIRA entrada que fechar em LOSS agenda
+    # exatamente um Gale de R$6 na vela M5 imediatamente seguinte, mantendo
+    # a MESMA direção. O KNN/seletor de ciclos NÃO pode cancelar este Gale.
     gale["tentado"] = True
     preco = float(msg.get("close", msg.get("open", gale.get("entrada_anterior", 0.0))))
-    resultado = dict(reanalise)
-    resultado.update({
-        "sinal": gale["sinal"], "preco": preco,
-        "candle_from": candle_from, "candle_to": candle_to,
-        "regime": "GALE_SELETIVO_APOS_LOSS",
+    resultado = {
+        "sinal": gale["sinal"],
+        "preco": preco,
+        "candle_from": candle_from,
+        "candle_to": candle_to,
+        "regime": "GALE_OBRIGATORIO_APOS_LOSS",
         "faixa_confianca": "GALE",
         "vela": datetime.fromtimestamp(candle_from, TZ),
-    })
+    }
+    log(f"[GALE OBRIGATORIO] {symbol}: executando Gale 1 R${_valor_gale_atual():.2f} na mesma direção {gale['sinal']}.")
     valor_gale = _valor_gale_atual()
     status = executar_ordem_intravela(symbol, gale["sinal"], resultado, valor_override=valor_gale, tipo_entrada="GALE")
     if status == "CONFIRMADA":
@@ -4050,7 +4047,7 @@ def _tentar_gale_na_proxima_vela(active_id, msg):
             "id": chave, "symbol": symbol, "mercado": _mercado_do_symbol(symbol),
             "sinal": gale["sinal"], "score": 0, "confianca": 0.0,
             "faixa_confianca": "GALE", "ajuste_online": 0.0, "adaptativo": {},
-            "estrategia": "AUTONOMO_KNN_M5", "regime": "GALE_SELETIVO_APOS_LOSS",
+            "estrategia": "AUTONOMO_KNN_M5", "regime": "GALE_OBRIGATORIO_APOS_LOSS",
             "preco_sinal": preco, "vela_sinal": datetime.fromtimestamp(candle_from, TZ),
             "vela_entrada": datetime.fromtimestamp(candle_from, TZ),
             "vela_expiracao": datetime.fromtimestamp(candle_from, TZ),
