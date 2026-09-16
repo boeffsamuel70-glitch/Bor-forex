@@ -69,7 +69,6 @@ BULLEX_USER_AGENT = os.getenv(
 # após autenticar, a Traderoom pode atualizar os ids/tickers dinamicamente.
 ATIVO_BULLEX = {
     "EURUSD_OTC": {"symbol": "EUR/USD OTC", "active_id": 76, "ticker": "EURUSD-OTC", "is_otc": True, "mercado": "OTC"},
-    "EURJPY_OTC": {"symbol": "EUR/JPY OTC", "active_id": 79, "ticker": "EURJPY-OTC", "is_otc": True, "mercado": "OTC"},
     "GBPUSD_OTC": {"symbol": "GBP/USD OTC", "active_id": 81, "ticker": "GBPUSD-OTC", "is_otc": True, "mercado": "OTC"},
     "USDJPY_OTC": {"symbol": "USD/JPY OTC", "active_id": 85, "ticker": "USDJPY-OTC", "is_otc": True, "mercado": "OTC"},
     "GBPJPY_OTC": {"symbol": "GBP/JPY OTC", "active_id": 84, "ticker": "GBPJPY-OTC", "is_otc": True, "mercado": "OTC"},
