@@ -120,7 +120,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OTC-AUTONOMO-KNN-R3-20260916-GALE6-DASHBOARD"
+BULLEX_DIAGNOSTIC_VERSION = "OTC-AUTONOMO-KNN-R4-20260916-PAYOUT-RECUPERACAO10-22"
 
 _bullex_diag = {
     "messages": 0,
@@ -173,6 +173,10 @@ BULLEX_USER_BALANCE_ID = os.getenv(
 
 VALORES_ENTRADA = [5.00]
 VALOR_GALE = 6.00
+VALOR_ENTRADA_RECUPERACAO = 10.00
+VALOR_GALE_RECUPERACAO = 22.00
+# Se a Bullex não devolver o payout no retorno da ordem, usa este valor apenas como fallback.
+BULLEX_PAYOUT_FALLBACK = float(os.getenv("BULLEX_PAYOUT_FALLBACK", "87").strip() or "87")
 EXPIRACAO_MINUTOS = 5
 # A antiga janela de 3 segundos foi removida.
 # Esta estratégia entra DURANTE a vela atual e expira no fechamento da MESMA vela.
@@ -301,6 +305,7 @@ _operacao_global_em_envIO_LEGACY = False
 _operacoes_ativas_por_symbol = {}
 _operacoes_em_envio = set()
 _gales_pendentes = {}  # symbol -> dados do Gale 1 para a próxima vela M5
+_modo_recuperacao_10_22 = False  # após qualquer LOSS em Gale: próximas sequências usam R$10 + Gale R$22
 
 # R24: candidatos da mesma abertura M5 são comparados antes da execução.
 # Uma pequena janela de coleta permite escolher o setup mais forte sem atrasar
@@ -679,9 +684,54 @@ def _montar_send_message(nome, version, body=None):
 # ============================================================
 
 def _valor_entrada_atual():
-    global _nivel_progressao
-    _nivel_progressao = max(0, min(_nivel_progressao, len(VALORES_ENTRADA) - 1))
-    return float(VALORES_ENTRADA[_nivel_progressao])
+    # Antes de perder um Gale: entrada R$5. Após qualquer Gale LOSS: entrada R$10.
+    return float(VALOR_ENTRADA_RECUPERACAO if _modo_recuperacao_10_22 else VALORES_ENTRADA[0])
+
+def _valor_gale_atual():
+    return float(VALOR_GALE_RECUPERACAO if _modo_recuperacao_10_22 else VALOR_GALE)
+
+def _extrair_payout_percent(obj):
+    """Procura um percentual de payout/profit retornado pela Bullex."""
+    chaves = {"payout", "payout_percent", "payout_percentage", "profit_percent", "profit_percentage"}
+    def walk(x):
+        if isinstance(x, dict):
+            for k, v in x.items():
+                if str(k).lower() in chaves:
+                    try:
+                        n = float(v)
+                        if 0 < n <= 1:
+                            n *= 100.0
+                        if 1 <= n <= 100:
+                            return n
+                    except Exception:
+                        pass
+            for v in x.values():
+                r = walk(v)
+                if r is not None:
+                    return r
+        elif isinstance(x, list):
+            for v in x:
+                r = walk(v)
+                if r is not None:
+                    return r
+        return None
+    return walk(obj)
+
+def calcular_financeiro():
+    lucro = 0.0
+    wins = losses = 0
+    for op in _historico_resultados:
+        r = op.get("resultado")
+        valor = float(op.get("valor", 0.0) or 0.0)
+        payout = float(op.get("payout_percent", BULLEX_PAYOUT_FALLBACK) or BULLEX_PAYOUT_FALLBACK)
+        if r == "WIN":
+            lucro += valor * payout / 100.0
+            wins += 1
+        elif r == "LOSS":
+            lucro -= valor
+            losses += 1
+    return {"lucro_total": round(lucro, 2), "wins": wins, "losses": losses}
+
 
 
 def _atualizar_estado_execucao():
@@ -816,6 +866,9 @@ def _registrar_ordem_confirmada(symbol, ticker, sinal, valor, active_id, balance
         'fonte_horario':janela['source'],'enviada_em':agora_brt().isoformat(),'resultado':'PENDENTE',
         'response':resposta,
     }
+    payout_detectado = _extrair_payout_percent(resposta)
+    info['payout_percent'] = round(float(payout_detectado if payout_detectado is not None else BULLEX_PAYOUT_FALLBACK), 2)
+    info['payout_source'] = 'BULLEX' if payout_detectado is not None else 'FALLBACK'
     with _execucao_lock:
         _operacoes_ativas_por_symbol[symbol]=info
         _operacoes_em_envio.discard(symbol)
@@ -3913,7 +3966,8 @@ def _tentar_gale_na_proxima_vela(active_id, msg):
         "faixa_confianca": "GALE", "ajuste_online": 0.0, "adaptativo": {},
         "score": 0, "vela": datetime.fromtimestamp(candle_from, TZ),
     }
-    status = executar_ordem_intravela(symbol, gale["sinal"], resultado, valor_override=VALOR_GALE, tipo_entrada="GALE")
+    valor_gale = _valor_gale_atual()
+    status = executar_ordem_intravela(symbol, gale["sinal"], resultado, valor_override=valor_gale, tipo_entrada="GALE")
     if status == "CONFIRMADA":
         with _execucao_lock:
             info = _operacoes_ativas_por_symbol.get(symbol, {}).copy()
@@ -3927,13 +3981,14 @@ def _tentar_gale_na_proxima_vela(active_id, msg):
             "vela_entrada": datetime.fromtimestamp(candle_from, TZ),
             "vela_expiracao": datetime.fromtimestamp(candle_from, TZ),
             "entrada": preco, "saida": None, "resultado": "PENDENTE",
-            "ordem_automatica": True, "valor": VALOR_GALE, "balance_id": info.get("balance_id"),
+            "ordem_automatica": True, "valor": valor_gale, "balance_id": info.get("balance_id"),
+            "payout_percent": info.get("payout_percent", BULLEX_PAYOUT_FALLBACK), "payout_source": info.get("payout_source", "FALLBACK"),
             "produto": info.get("produto", "BINARIA_INTRAVELA"), "option_id": info.get("option_id"),
             "tipo_entrada": "GALE", "candle_to": candle_to,
         }
         _ultimas_operacoes_registradas[symbol] = chave
         _gales_pendentes.pop(symbol, None)
-        log(f"[GALE] {symbol}: Gale 1 registrado {gale['sinal']} R${VALOR_GALE:.2f} | expira={datetime.fromtimestamp(candle_to,TZ).strftime('%H:%M:%S')}")
+        log(f"[GALE] {symbol}: Gale 1 registrado {gale['sinal']} R${valor_gale:.2f} | expira={datetime.fromtimestamp(candle_to,TZ).strftime('%H:%M:%S')}")
     else:
         log(f"[GALE] {symbol}: Gale não foi aberto ({status}); ciclo encerrado.")
         _gales_pendentes.pop(symbol, None)
@@ -4039,7 +4094,7 @@ def calcular_estatisticas_por_par():
         resumo[symbol] = {
             "symbol": symbol, "total": 0, "wins": 0, "losses": 0, "dojis": 0,
             "primeira_wins": 0, "primeira_losses": 0,
-            "gale_wins": 0, "gale_losses": 0, "taxa": 0.0,
+            "gale_wins": 0, "gale_losses": 0, "taxa": 0.0, "lucro": 0.0,
         }
     for op in _historico_resultados:
         symbol = op.get("symbol")
@@ -4047,7 +4102,7 @@ def calcular_estatisticas_por_par():
             resumo[symbol] = {
                 "symbol": symbol, "total": 0, "wins": 0, "losses": 0, "dojis": 0,
                 "primeira_wins": 0, "primeira_losses": 0,
-                "gale_wins": 0, "gale_losses": 0, "taxa": 0.0,
+                "gale_wins": 0, "gale_losses": 0, "taxa": 0.0, "lucro": 0.0,
             }
         r = op.get("resultado")
         tipo = op.get("tipo_entrada", "PRIMEIRA")
@@ -4061,6 +4116,7 @@ def calcular_estatisticas_por_par():
             x["gale_losses" if tipo == "GALE" else "primeira_losses"] += 1
         elif r == "DOJI":
             x["dojis"] += 1
+        x["lucro"] = round(float(x.get("lucro", 0.0)) + float(op.get("lucro_operacao", 0.0) or 0.0), 2)
         decididos = x["wins"] + x["losses"]
         x["taxa"] = round(x["wins"] / decididos * 100 if decididos else 0.0, 2)
     return list(resumo.values())
@@ -4299,6 +4355,8 @@ def registrar_operacao_intravela(symbol, resultado):
         "balance_id": info.get("balance_id"),
         "produto": info.get("produto", "BINARIA_INTRAVELA"),
         "option_id": info.get("option_id"),
+        "payout_percent": info.get("payout_percent", BULLEX_PAYOUT_FALLBACK),
+        "payout_source": info.get("payout_source", "FALLBACK"),
         "tipo_entrada": info.get("tipo_entrada", "PRIMEIRA"),
         "candle_to": int(resultado["candle_to"]),
         "retracao_ratio": resultado.get("retracao_ratio"),
@@ -4327,6 +4385,7 @@ def registrar_operacao_intravela(symbol, resultado):
 # ============================================================
 
 def avaliar_operacao(symbol, candles):
+    global _modo_recuperacao_10_22
 
     operacao = _operacoes_pendentes.get(symbol)
     if not operacao:
@@ -4365,7 +4424,13 @@ def avaliar_operacao(symbol, candles):
                 "entrada_anterior": entrada,
                 "tentado": False,
             }
-            log(f"[GALE] {symbol}: LOSS na primeira entrada; Gale 1 R${VALOR_GALE:.2f} programado para a próxima vela, mesma direção {operacao['sinal']}.")
+            log(f"[GALE] {symbol}: LOSS na primeira entrada; Gale 1 R${_valor_gale_atual():.2f} programado para a próxima vela, mesma direção {operacao['sinal']}.")
+        payout = float(operacao.get("payout_percent", BULLEX_PAYOUT_FALLBACK) or BULLEX_PAYOUT_FALLBACK)
+        valor_op = float(operacao.get("valor", 0.0) or 0.0)
+        operacao["lucro_operacao"] = round(valor_op * payout / 100.0 if resultado == "WIN" else -valor_op if resultado == "LOSS" else 0.0, 2)
+        if resultado == "LOSS" and operacao.get("tipo_entrada") == "GALE":
+            _modo_recuperacao_10_22 = True
+            log(f"[RECUPERACAO] Gale LOSS em {symbol}; próximas entradas serão R${VALOR_ENTRADA_RECUPERACAO:.2f} e, se perderem, Gale único de R${VALOR_GALE_RECUPERACAO:.2f}.")
         _historico_resultados.append(operacao.copy())
         del _operacoes_pendentes[symbol]
 
@@ -5120,13 +5185,21 @@ Taxa de acerto
 
 </div>
 
+
+<div class="card">
+<h3>Financeiro</h3>
+<div class="linha"><span>Lucro / perda total</span><span class="valor">R$ {{ '%.2f'|format(financeiro.lucro_total) }}</span></div>
+<div class="linha"><span>Entrada atual</span><span class="valor">R$ {{ '%.2f'|format(valor_entrada_atual) }}</span></div>
+<div class="linha"><span>Gale atual</span><span class="valor">R$ {{ '%.2f'|format(valor_gale_atual) }}</span></div>
+</div>
+
 <div class="card">
 <h3>Resultados por par</h3>
 <div class="tabela-wrap">
 <table class="tabela-pares">
-<tr><th>Ativo</th><th>WIN</th><th>LOSS</th><th>WIN 1ª</th><th>LOSS 1ª</th><th>Gale WIN</th><th>Gale LOSS</th><th>Taxa</th></tr>
+<tr><th>Ativo</th><th>WIN</th><th>LOSS</th><th>WIN 1ª</th><th>LOSS 1ª</th><th>Gale WIN</th><th>Gale LOSS</th><th>Lucro</th><th>Taxa</th></tr>
 {% for p in estatisticas_pares %}
-<tr><td>{{ p.symbol }}</td><td>{{ p.wins }}</td><td>{{ p.losses }}</td><td>{{ p.primeira_wins }}</td><td>{{ p.primeira_losses }}</td><td>{{ p.gale_wins }}</td><td>{{ p.gale_losses }}</td><td>{{ p.taxa }}%</td></tr>
+<tr><td>{{ p.symbol }}</td><td>{{ p.wins }}</td><td>{{ p.losses }}</td><td>{{ p.primeira_wins }}</td><td>{{ p.primeira_losses }}</td><td>{{ p.gale_wins }}</td><td>{{ p.gale_losses }}</td><td>R$ {{ '%.2f'|format(p.lucro) }}</td><td>{{ p.taxa }}%</td></tr>
 {% endfor %}
 </table>
 </div>
@@ -5227,7 +5300,10 @@ def index():
     return render_template_string(
         HTML,
         estado=estado,
-        estatisticas_pares=calcular_estatisticas_por_par()
+        estatisticas_pares=calcular_estatisticas_por_par(),
+        financeiro=calcular_financeiro(),
+        valor_entrada_atual=_valor_entrada_atual(),
+        valor_gale_atual=_valor_gale_atual()
     )
 
 
@@ -5282,7 +5358,10 @@ def health():
         "operacoes_pendentes":
             len(_operacoes_pendentes),
         "entrada_fixa": 5.00,
-        "gale_valor": VALOR_GALE,
+        "gale_valor": _valor_gale_atual(),
+        "entrada_valor": _valor_entrada_atual(),
+        "modo_recuperacao_10_22": _modo_recuperacao_10_22,
+        "financeiro": calcular_financeiro(),
         "gale_maximo": 1,
         "gales_pendentes": list(_gales_pendentes.keys()),
         "progressao_ativa": True,
