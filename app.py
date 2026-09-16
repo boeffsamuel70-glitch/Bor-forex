@@ -119,7 +119,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OTC-AUTONOMO-KNN-R6-20260916-SELETOR-CICLO"
+BULLEX_DIAGNOSTIC_VERSION = "OTC-AUTONOMO-KNN-R7-20260916-BLOQUEIO-POR-LOSS"
 
 _bullex_diag = {
     "messages": 0,
@@ -208,6 +208,10 @@ AUTONOMO_MARGEM_MIN = 0.12
 # boa chance de encerrar o ciclo em WIN na primeira ou no único Gale.
 AUTONOMO_CICLO_CONFIANCA_MIN = 0.70
 AUTONOMO_CICLO_MIN_VIZINHOS = 12
+
+# R7: 2 ciclos completos perdedores seguidos bloqueiam somente o ativo por 1 hora.
+BLOQUEIO_ATIVO_CICLOS_LOSS = 2
+BLOQUEIO_ATIVO_SEGUNDOS = 60 * 60
 
 # R2 - segunda camada de aprendizado: aprende quando NÃO operar.
 # O KNN continua escolhendo CALL/PUT; esta camada mede o desempenho REAL
@@ -306,6 +310,8 @@ _operacao_global_em_envIO_LEGACY = False
 _operacoes_ativas_por_symbol = {}
 _operacoes_em_envio = set()
 _gales_pendentes = {}  # symbol -> dados do Gale 1 para a próxima vela M5
+_bloqueios_por_symbol = {}  # symbol -> {ate_ts, motivo, sequencia}
+_sequencia_ciclos_loss = {}  # symbol -> ciclos completos perdidos em sequência
 
 # R24: candidatos da mesma abertura M5 são comparados antes da execução.
 # Uma pequena janela de coleta permite escolher o setup mais forte sem atrasar
@@ -3951,6 +3957,39 @@ def _r24_despachar_melhor(candle_from):
     registrar_operacao_intravela(symbol, resultado)
 
 
+def _status_bloqueio_ativo(symbol):
+    info = _bloqueios_por_symbol.get(symbol)
+    if not info:
+        return None
+    if time.time() >= float(info.get("ate_ts", 0) or 0):
+        _bloqueios_por_symbol.pop(symbol, None)
+        _sequencia_ciclos_loss[symbol] = 0
+        log(f"[BLOQUEIO ATIVO] {symbol}: 1 hora concluída; ativo LIBERADO.")
+        return None
+    return info
+
+
+def _registrar_fim_de_ciclo(symbol, operacao, resultado):
+    tipo = operacao.get("tipo_entrada", "PRIMEIRA")
+    if resultado == "WIN":
+        _sequencia_ciclos_loss[symbol] = 0
+        return
+    # LOSS da primeira ainda não encerra o ciclo porque pode haver Gale.
+    if resultado != "LOSS" or tipo != "GALE":
+        return
+    seq = int(_sequencia_ciclos_loss.get(symbol, 0) or 0) + 1
+    _sequencia_ciclos_loss[symbol] = seq
+    log(f"[PROTEÇÃO ATIVO] {symbol}: {seq} ciclo(s) LOSS consecutivo(s).")
+    if seq >= BLOQUEIO_ATIVO_CICLOS_LOSS:
+        _bloqueios_por_symbol[symbol] = {
+            "ate_ts": time.time() + BLOQUEIO_ATIVO_SEGUNDOS,
+            "motivo": f"{seq} ciclos LOSS consecutivos",
+            "sequencia": seq,
+        }
+        _gales_pendentes.pop(symbol, None)
+        log(f"[BLOQUEIO ATIVO] {symbol}: BLOQUEADO por 1 hora após {seq} ciclos LOSS consecutivos.")
+
+
 def _tentar_gale_na_proxima_vela(active_id, msg):
     """Executa no máximo 1 Gale de R$6 na vela M5 imediatamente seguinte ao LOSS."""
     codigo, symbol = _symbol_por_active_id(active_id)
@@ -4031,10 +4070,14 @@ def _tentar_gale_na_proxima_vela(active_id, msg):
 
 
 def _processar_sinal_intravela(active_id, msg):
+    codigo, symbol = _symbol_por_active_id(active_id)
+    if not codigo or not symbol:
+        return
+    if _status_bloqueio_ativo(symbol):
+        return
     if _tentar_gale_na_proxima_vela(active_id, msg):
         return
-    codigo, symbol = _symbol_por_active_id(active_id)
-    if not codigo or not symbol or not dentro_do_horario() or not _historico_pronto_event.is_set():
+    if not dentro_do_horario() or not _historico_pronto_event.is_set():
         return
     resultado = _resultado_retracao_intravela(msg, active_id)
     if resultado is None:
@@ -4468,6 +4511,7 @@ def avaliar_operacao(symbol, candles):
             _operacoes_ativas_por_symbol.pop(symbol, None)
             _operacoes_em_envio.discard(symbol)
 
+        _registrar_fim_de_ciclo(symbol, operacao, resultado)
         _atualizar_progressao(resultado)
         _atualizar_estado_execucao()
 
@@ -4801,6 +4845,19 @@ def garantir_robo_iniciado():
 @app.before_request
 def iniciar_robo():
     garantir_robo_iniciado()
+
+
+def calcular_bloqueios_por_par():
+    agora_ts = time.time()
+    saida = {}
+    for symbol in ATIVOS.values():
+        info = _status_bloqueio_ativo(symbol)
+        if info:
+            restante = max(0, int(float(info.get("ate_ts", 0)) - agora_ts))
+            saida[symbol] = {"bloqueado": True, "minutos_restantes": (restante + 59) // 60, "sequencia": int(info.get("sequencia", 0) or 0)}
+        else:
+            saida[symbol] = {"bloqueado": False, "minutos_restantes": 0, "sequencia": int(_sequencia_ciclos_loss.get(symbol, 0) or 0)}
+    return saida
 
 
 # ============================================================
@@ -5227,9 +5284,9 @@ Taxa de acerto
 <h3>Resultados por par</h3>
 <div class="tabela-wrap">
 <table class="tabela-pares">
-<tr><th>Ativo</th><th>WIN</th><th>LOSS</th><th>WIN 1ª</th><th>LOSS 1ª</th><th>Gale WIN</th><th>Gale LOSS</th><th>Lucro</th><th>Taxa</th></tr>
+<tr><th>Ativo</th><th>Status</th><th>WIN</th><th>LOSS</th><th>WIN 1ª</th><th>LOSS 1ª</th><th>Gale WIN</th><th>Gale LOSS</th><th>Lucro</th><th>Taxa</th></tr>
 {% for p in estatisticas_pares %}
-<tr><td>{{ p.symbol }}</td><td>{{ p.wins }}</td><td>{{ p.losses }}</td><td>{{ p.primeira_wins }}</td><td>{{ p.primeira_losses }}</td><td>{{ p.gale_wins }}</td><td>{{ p.gale_losses }}</td><td>R$ {{ '%.2f'|format(p.lucro) }}</td><td>{{ p.taxa }}%</td></tr>
+<tr><td>{{ p.symbol }}</td><td>{% set b = bloqueios_pares.get(p.symbol, {}) %}{% if b.get('bloqueado') %}BLOQUEADO {{ b.get('minutos_restantes') }} min{% else %}ATIVO{% endif %}</td><td>{{ p.wins }}</td><td>{{ p.losses }}</td><td>{{ p.primeira_wins }}</td><td>{{ p.primeira_losses }}</td><td>{{ p.gale_wins }}</td><td>{{ p.gale_losses }}</td><td>R$ {{ '%.2f'|format(p.lucro) }}</td><td>{{ p.taxa }}%</td></tr>
 {% endfor %}
 </table>
 </div>
@@ -5333,7 +5390,8 @@ def index():
         estatisticas_pares=calcular_estatisticas_por_par(),
         financeiro=calcular_financeiro(),
         valor_entrada_atual=_valor_entrada_atual(),
-        valor_gale_atual=_valor_gale_atual()
+        valor_gale_atual=_valor_gale_atual(),
+        bloqueios_pares=calcular_bloqueios_por_par()
     )
 
 
@@ -5393,6 +5451,9 @@ def health():
         "financeiro": calcular_financeiro(),
         "gale_maximo": 1,
         "gales_pendentes": list(_gales_pendentes.keys()),
+        "bloqueios_por_ativo": calcular_bloqueios_por_par(),
+        "bloqueio_apos_ciclos_loss": BLOQUEIO_ATIVO_CICLOS_LOSS,
+        "bloqueio_minutos": BLOQUEIO_ATIVO_SEGUNDOS // 60,
         "progressao_ativa": True,
         "historico_preload_pronto": _historico_pronto_event.is_set(),
         "historico_preload_ultima_tentativa": _historico_preload_ultima_tentativa,
