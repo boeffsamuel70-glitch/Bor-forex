@@ -72,7 +72,7 @@ ATIVO_BULLEX = {
     "GBPUSD_OTC": {"symbol": "GBP/USD OTC", "active_id": 81, "ticker": "GBPUSD-OTC", "is_otc": True, "mercado": "OTC"},
     "USDJPY_OTC": {"symbol": "USD/JPY OTC", "active_id": 85, "ticker": "USDJPY-OTC", "is_otc": True, "mercado": "OTC"},
     "GBPJPY_OTC": {"symbol": "GBP/JPY OTC", "active_id": 84, "ticker": "GBPJPY-OTC", "is_otc": True, "mercado": "OTC"},
-    "EURGBP_OTC": {"symbol": "EUR/GBP OTC", "active_id": 77, "ticker": "EURGBP-OTC", "is_otc": True, "mercado": "OTC"},
+    "AUDCAD_OTC": {"symbol": "AUD/CAD OTC", "active_id": 86, "ticker": "AUDCAD-OTC", "is_otc": True, "mercado": "OTC"},
     "USDCHF_OTC": {"symbol": "USD/CHF OTC", "active_id": 78, "ticker": "USDCHF-OTC", "is_otc": True, "mercado": "OTC"},
 }
 
@@ -83,7 +83,8 @@ PARES_OTC_ALVO = {
     "GBPUSD": "GBP/USD OTC",
     "USDJPY": "USD/JPY OTC",
     "GBPJPY": "GBP/JPY OTC",
-    "EURGBP": "EUR/GBP OTC",
+    "AUDCAD": "AUD/CAD OTC",
+    "AUDNZD": "AUD/NZD OTC",
     "USDCHF": "USD/CHF OTC",
 }
 
@@ -91,7 +92,7 @@ _bullex_assets_lock = threading.RLock()
 _bullex_assets_detected = True
 _bullex_assets_last_error = None
 _bullex_assets_updated_at = None
-_bullex_assets_source = "OTC_STATIC_FALLBACK_76_79_81_85_84_77_78"
+_bullex_assets_source = "OTC_STATIC_FALLBACK_WITH_DYNAMIC_AUDNZD"
 _bullex_assets_ready_event = threading.Event()
 _bullex_assets_init_lock = threading.Lock()
 
@@ -229,7 +230,8 @@ ATIVOS = {
     "GBPUSD_OTC": "GBP/USD OTC",
     "USDJPY_OTC": "USD/JPY OTC",
     "GBPJPY_OTC": "GBP/JPY OTC",
-    "EURGBP_OTC": "EUR/GBP OTC",
+    "AUDCAD_OTC": "AUD/CAD OTC",
+    "AUDNZD_OTC": "AUD/NZD OTC",
     "USDCHF_OTC": "USD/CHF OTC",
 }
 
