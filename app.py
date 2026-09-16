@@ -120,7 +120,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OTC-AUTONOMO-KNN-R5-20260916-PAYOUT-GALE6"
+BULLEX_DIAGNOSTIC_VERSION = "OTC-AUTONOMO-KNN-R6-20260916-SELETOR-CICLO"
 
 _bullex_diag = {
     "messages": 0,
@@ -205,6 +205,10 @@ AUTONOMO_MIN_AMOSTRAS = 45
 AUTONOMO_K_VIZINHOS = 17
 AUTONOMO_CONFIANCA_MIN = 0.62
 AUTONOMO_MARGEM_MIN = 0.12
+# R6: só abre a primeira entrada quando padrões históricos semelhantes mostram
+# boa chance de encerrar o ciclo em WIN na primeira ou no único Gale.
+AUTONOMO_CICLO_CONFIANCA_MIN = 0.70
+AUTONOMO_CICLO_MIN_VIZINHOS = 12
 
 # R2 - segunda camada de aprendizado: aprende quando NÃO operar.
 # O KNN continua escolhendo CALL/PUT; esta camada mede o desempenho REAL
@@ -3666,21 +3670,25 @@ def _resultado_retracao_intravela(msg, active_id):
         return None
 
     exemplos=[]
-    # O alvo é a direção da vela imediatamente seguinte ao estado observado.
-    for i in range(22, len(m5)-1):
+    # R6: além da direção da primeira vela, guarda também o movimento da vela
+    # seguinte. Isso permite aprender quais contextos historicamente encerraram
+    # o ciclo em WIN na primeira entrada OU, se a primeira perdeu, no Gale 1.
+    for i in range(22, len(m5)-2):
         feat=_autonomo_features(m5, i)
         if feat is None: continue
-        entrada=float(m5[i]['close']); saida=float(m5[i+1]['close'])
-        if saida == entrada: continue
-        label='CALL' if saida > entrada else 'PUT'
-        exemplos.append((_autonomo_distancia(atual,feat),label))
+        entrada=float(m5[i]['close'])
+        saida1=float(m5[i+1]['close'])
+        saida2=float(m5[i+2]['close'])
+        if saida1 == entrada: continue
+        label='CALL' if saida1 > entrada else 'PUT'
+        exemplos.append((_autonomo_distancia(atual,feat),label,entrada,saida1,saida2))
     if len(exemplos) < AUTONOMO_MIN_AMOSTRAS:
         return None
     exemplos.sort(key=lambda x:x[0])
     vizinhos=exemplos[:min(AUTONOMO_K_VIZINHOS,len(exemplos))]
     # Vizinhos mais próximos pesam mais; evita que um padrão distante domine.
     call_w=put_w=0.0
-    for dist,label in vizinhos:
+    for dist,label,entrada_hist,saida1_hist,saida2_hist in vizinhos:
         peso=1.0/(0.10+dist)
         if label=='CALL': call_w+=peso
         else: put_w+=peso
@@ -3689,6 +3697,28 @@ def _resultado_retracao_intravela(msg, active_id):
     p_call=call_w/total; p_put=put_w/total
     sinal='CALL' if p_call>=p_put else 'PUT'
     confianca=max(p_call,p_put)
+
+    # Probabilidade histórica ponderada do CICLO: primeira entrada ou Gale 1.
+    ciclo_win_w=ciclo_total_w=0.0
+    ciclo_n=0
+    for dist,label,entrada_hist,saida1_hist,saida2_hist in vizinhos:
+        peso=1.0/(0.10+dist)
+        primeira_win = (saida1_hist > entrada_hist) if sinal == 'CALL' else (saida1_hist < entrada_hist)
+        if primeira_win:
+            ciclo_win=True
+        else:
+            # Aproxima o Gale entrando no início da vela seguinte pelo fechamento
+            # da primeira; compara o fechamento da segunda vela na mesma direção.
+            gale_win = (saida2_hist > saida1_hist) if sinal == 'CALL' else (saida2_hist < saida1_hist)
+            ciclo_win=gale_win
+        ciclo_total_w += peso
+        ciclo_n += 1
+        if ciclo_win:
+            ciclo_win_w += peso
+    ciclo_confianca=(ciclo_win_w/ciclo_total_w) if ciclo_total_w>0 else 0.0
+    if ciclo_n < AUTONOMO_CICLO_MIN_VIZINHOS or ciclo_confianca < AUTONOMO_CICLO_CONFIANCA_MIN:
+        return None
+
     ajuste,amostras_online=_autonomo_ajuste_online(_symbol_por_active_id(active_id)[1],sinal)
     confianca_ajustada=max(0.0,min(1.0,confianca+ajuste))
     margem=abs(p_call-p_put)
@@ -3717,12 +3747,12 @@ def _resultado_retracao_intravela(msg, active_id):
         'lateral':'N/A','atr':a,'rsi':rv,'ema5':e5,'ema13':e13,'ema21':e21,
         'tendencia_5m':tendencia,'tendencia_15m':'MULTIESCALA_M5',
         'zona_fibonacci':'N/A','bloqueio':'SINAL_AUTONOMO',
-        'mensagem':f'{sinal} autonomo | confiança {confianca_ajustada*100:.1f}% | histórico {len(exemplos)} | online {amostras_online}',
+        'mensagem':f'{sinal} autonomo | sinal {confianca_ajustada*100:.1f}% | ciclo {ciclo_confianca*100:.1f}% | histórico {len(exemplos)} | online {amostras_online}',
         'candle_from':candle_from,'candle_to':candle_to,
         'segundos_decorridos':decorridos,'segundos_restantes':restantes,
         'impulso':0.0,'retracao_ratio':0.0,'nivel_sr':None,'tipo_nivel':'MODELO_AUTONOMO',
         'toques_nivel':0,'distancia_abertura_nivel':0.0,'adx5':0.0,'adx15':0.0,
-        'confianca':confianca_ajustada,'amostras_modelo':len(exemplos),
+        'confianca':confianca_ajustada,'confianca_ciclo':ciclo_confianca,'amostras_ciclo':ciclo_n,'amostras_modelo':len(exemplos),
         'vizinhos':len(vizinhos),'ajuste_online':ajuste,
         'faixa_confianca':_autonomo_faixa_confianca(confianca_ajustada),
         'adaptativo':diag_adaptativo,'filtro_adaptativo':motivo_adaptativo,
@@ -3953,15 +3983,25 @@ def _tentar_gale_na_proxima_vela(active_id, msg):
         return True
     if gale.get("tentado"):
         return True
+
+    # R6: Gale deixou de ser obrigatório. Reanalisa a nova vela; só executa se
+    # o modelo ainda enxergar a MESMA direção e o seletor de ciclo continuar forte.
+    reanalise = _resultado_retracao_intravela(msg, active_id)
+    if reanalise is None or reanalise.get("sinal") != gale["sinal"]:
+        gale["tentado"] = True
+        _gales_pendentes.pop(symbol, None)
+        log(f"[GALE SELETIVO] {symbol}: Gale cancelado; nova análise não confirmou {gale['sinal']}.")
+        return True
     gale["tentado"] = True
     preco = float(msg.get("close", msg.get("open", gale.get("entrada_anterior", 0.0))))
-    resultado = {
+    resultado = dict(reanalise)
+    resultado.update({
         "sinal": gale["sinal"], "preco": preco,
         "candle_from": candle_from, "candle_to": candle_to,
-        "regime": "GALE_APOS_LOSS", "confianca": 0.0,
-        "faixa_confianca": "GALE", "ajuste_online": 0.0, "adaptativo": {},
-        "score": 0, "vela": datetime.fromtimestamp(candle_from, TZ),
-    }
+        "regime": "GALE_SELETIVO_APOS_LOSS",
+        "faixa_confianca": "GALE",
+        "vela": datetime.fromtimestamp(candle_from, TZ),
+    })
     valor_gale = _valor_gale_atual()
     status = executar_ordem_intravela(symbol, gale["sinal"], resultado, valor_override=valor_gale, tipo_entrada="GALE")
     if status == "CONFIRMADA":
@@ -3972,7 +4012,7 @@ def _tentar_gale_na_proxima_vela(active_id, msg):
             "id": chave, "symbol": symbol, "mercado": _mercado_do_symbol(symbol),
             "sinal": gale["sinal"], "score": 0, "confianca": 0.0,
             "faixa_confianca": "GALE", "ajuste_online": 0.0, "adaptativo": {},
-            "estrategia": "AUTONOMO_KNN_M5", "regime": "GALE_APOS_LOSS",
+            "estrategia": "AUTONOMO_KNN_M5", "regime": "GALE_SELETIVO_APOS_LOSS",
             "preco_sinal": preco, "vela_sinal": datetime.fromtimestamp(candle_from, TZ),
             "vela_entrada": datetime.fromtimestamp(candle_from, TZ),
             "vela_expiracao": datetime.fromtimestamp(candle_from, TZ),
@@ -4006,7 +4046,7 @@ def _processar_sinal_intravela(active_id, msg):
             return
         _intravela_velas_tentadas.add(candle_key)
     _atualizar_dashboard_intravela(symbol, resultado)
-    log(f"[AUTONOMO] {symbol} -> {resultado['sinal']} | confiança={resultado.get('confianca',0)*100:.1f}% | amostras={resultado.get('amostras_modelo',0)}")
+    log(f"[AUTONOMO] {symbol} -> {resultado['sinal']} | confiança={resultado.get('confianca',0)*100:.1f}% | ciclo={resultado.get('confianca_ciclo',0)*100:.1f}% | amostras={resultado.get('amostras_modelo',0)}")
     registrar_operacao_intravela(symbol, resultado)
 
 def calcular_estatisticas_por_estrategia():
