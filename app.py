@@ -120,7 +120,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OTC-AUTONOMO-KNN-R2-20260915-ADAPTATIVO"
+BULLEX_DIAGNOSTIC_VERSION = "OTC-AUTONOMO-KNN-R3-20260916-GALE6-DASHBOARD"
 
 _bullex_diag = {
     "messages": 0,
@@ -172,6 +172,7 @@ BULLEX_USER_BALANCE_ID = os.getenv(
 ).strip()
 
 VALORES_ENTRADA = [5.00]
+VALOR_GALE = 6.00
 EXPIRACAO_MINUTOS = 5
 # A antiga janela de 3 segundos foi removida.
 # Esta estratégia entra DURANTE a vela atual e expira no fechamento da MESMA vela.
@@ -299,6 +300,7 @@ _operacao_global_ativa = None
 _operacao_global_em_envIO_LEGACY = False
 _operacoes_ativas_por_symbol = {}
 _operacoes_em_envio = set()
+_gales_pendentes = {}  # symbol -> dados do Gale 1 para a próxima vela M5
 
 # R24: candidatos da mesma abertura M5 são comparados antes da execução.
 # Uma pequena janela de coleta permite escolher o setup mais forte sem atrasar
@@ -823,7 +825,8 @@ def _registrar_ordem_confirmada(symbol, ticker, sinal, valor, active_id, balance
     log(f"[AUTO] ORDEM CONFIRMADA via {produto}: {symbol} {sinal} R${valor:.2f} id={option_id}")
     return 'CONFIRMADA'
 
-def executar_ordem_intravela(symbol, sinal, resultado):
+def executar_ordem_intravela(symbol, sinal, resultado, valor_override=None, tipo_entrada="PRIMEIRA"):
+    """Envia uma ordem. valor_override é usado pelo Gale 1 (R$ 6,00)."""
     global _bullex_last_error
 
     if not BULLEX_AUTO_TRADE:
@@ -860,7 +863,7 @@ def executar_ordem_intravela(symbol, sinal, resultado):
 
     active_id = int(config["active_id"])
     ticker = config.get("ticker")
-    valor = _valor_entrada_atual()
+    valor = float(valor_override) if valor_override is not None else _valor_entrada_atual()
 
     server_ts, source = _horario_servidor_atual()
     candle_from = int(resultado["candle_from"])
@@ -937,17 +940,6 @@ def executar_ordem_intravela(symbol, sinal, resultado):
                 "[AUTO INTRAVELA] Ordem não confirmada: "
                 + json.dumps(resposta, ensure_ascii=False)
             )
-            threading.Thread(
-                target=enviar_status_ordem_telegram,
-                args=(
-                    symbol,
-                    sinal,
-                    "NÃO ABERTA",
-                    _mensagem_erro_ordem(resposta) or str(resposta),
-                ),
-                daemon=True,
-                name=f"telegram-ordem-recusada-{active_id}",
-            ).start()
             with _execucao_lock:
                 _operacoes_em_envio.discard(symbol)
             return "SEM_CONFIRMACAO"
@@ -970,24 +962,19 @@ def executar_ordem_intravela(symbol, sinal, resultado):
         with _execucao_lock:
             _operacoes_em_envio.discard(symbol)
 
-        threading.Thread(
-            target=enviar_status_ordem_telegram,
-            args=(
-                symbol,
-                sinal,
-                "CONFIRMADA",
-                f"R${valor:.2f} | expira "
-                f"{datetime.fromtimestamp(candle_to, TZ).strftime('%H:%M:%S')}",
-            ),
-            daemon=True,
-            name=f"telegram-ordem-confirmada-{active_id}",
-        ).start()
-
         with _execucao_lock:
             if symbol in _operacoes_ativas_por_symbol:
                 _operacoes_ativas_por_symbol[symbol]["preco_entrada_estimado"] = float(resultado["preco"])
                 _operacoes_ativas_por_symbol[symbol]["estrategia"] = "AUTONOMO_KNN_M5"
                 _operacoes_ativas_por_symbol[symbol]["regime"] = resultado.get("regime", "AUTONOMO")
+                _operacoes_ativas_por_symbol[symbol]["tipo_entrada"] = tipo_entrada
+
+        threading.Thread(
+            target=enviar_status_ordem_telegram,
+            args=(symbol, sinal, "CONFIRMADA", ""),
+            daemon=True,
+            name=f"telegram-ordem-confirmada-{active_id}",
+        ).start()
 
         return status
 
@@ -3886,7 +3873,76 @@ def _r24_despachar_melhor(candle_from):
     registrar_operacao_intravela(symbol, resultado)
 
 
+def _tentar_gale_na_proxima_vela(active_id, msg):
+    """Executa no máximo 1 Gale de R$6 na vela M5 imediatamente seguinte ao LOSS."""
+    codigo, symbol = _symbol_por_active_id(active_id)
+    if not symbol:
+        return False
+    gale = _gales_pendentes.get(symbol)
+    if not gale:
+        return False
+    try:
+        candle_from = int(msg.get("from"))
+        candle_to = int(msg.get("to") or (candle_from + 300))
+        alvo_from = int(gale["candle_from_alvo"])
+    except Exception:
+        return True
+    if candle_from < alvo_from:
+        return True
+    if candle_from > alvo_from:
+        log(f"[GALE] {symbol}: perdeu a vela imediatamente seguinte; Gale cancelado.")
+        _gales_pendentes.pop(symbol, None)
+        return False
+    server_ts, _ = _horario_servidor_atual()
+    decorridos = server_ts - candle_from
+    if decorridos < INTRAVELA_MIN_SEGUNDOS_DECORRIDOS:
+        return True
+    if decorridos > INTRAVELA_MAX_SEGUNDOS_DECORRIDOS:
+        if not gale.get("tentado"):
+            log(f"[GALE] {symbol}: janela 2-8s perdida; Gale cancelado.")
+            _gales_pendentes.pop(symbol, None)
+        return True
+    if gale.get("tentado"):
+        return True
+    gale["tentado"] = True
+    preco = float(msg.get("close", msg.get("open", gale.get("entrada_anterior", 0.0))))
+    resultado = {
+        "sinal": gale["sinal"], "preco": preco,
+        "candle_from": candle_from, "candle_to": candle_to,
+        "regime": "GALE_APOS_LOSS", "confianca": 0.0,
+        "faixa_confianca": "GALE", "ajuste_online": 0.0, "adaptativo": {},
+        "score": 0, "vela": datetime.fromtimestamp(candle_from, TZ),
+    }
+    status = executar_ordem_intravela(symbol, gale["sinal"], resultado, valor_override=VALOR_GALE, tipo_entrada="GALE")
+    if status == "CONFIRMADA":
+        with _execucao_lock:
+            info = _operacoes_ativas_por_symbol.get(symbol, {}).copy()
+        chave = f"{symbol}|GALE|{candle_from}"
+        _operacoes_pendentes[symbol] = {
+            "id": chave, "symbol": symbol, "mercado": _mercado_do_symbol(symbol),
+            "sinal": gale["sinal"], "score": 0, "confianca": 0.0,
+            "faixa_confianca": "GALE", "ajuste_online": 0.0, "adaptativo": {},
+            "estrategia": "AUTONOMO_KNN_M5", "regime": "GALE_APOS_LOSS",
+            "preco_sinal": preco, "vela_sinal": datetime.fromtimestamp(candle_from, TZ),
+            "vela_entrada": datetime.fromtimestamp(candle_from, TZ),
+            "vela_expiracao": datetime.fromtimestamp(candle_from, TZ),
+            "entrada": preco, "saida": None, "resultado": "PENDENTE",
+            "ordem_automatica": True, "valor": VALOR_GALE, "balance_id": info.get("balance_id"),
+            "produto": info.get("produto", "BINARIA_INTRAVELA"), "option_id": info.get("option_id"),
+            "tipo_entrada": "GALE", "candle_to": candle_to,
+        }
+        _ultimas_operacoes_registradas[symbol] = chave
+        _gales_pendentes.pop(symbol, None)
+        log(f"[GALE] {symbol}: Gale 1 registrado {gale['sinal']} R${VALOR_GALE:.2f} | expira={datetime.fromtimestamp(candle_to,TZ).strftime('%H:%M:%S')}")
+    else:
+        log(f"[GALE] {symbol}: Gale não foi aberto ({status}); ciclo encerrado.")
+        _gales_pendentes.pop(symbol, None)
+    return True
+
+
 def _processar_sinal_intravela(active_id, msg):
+    if _tentar_gale_na_proxima_vela(active_id, msg):
+        return
     codigo, symbol = _symbol_por_active_id(active_id)
     if not codigo or not symbol or not dentro_do_horario() or not _historico_pronto_event.is_set():
         return
@@ -3899,8 +3955,6 @@ def _processar_sinal_intravela(active_id, msg):
             return
         _intravela_velas_tentadas.add(candle_key)
     _atualizar_dashboard_intravela(symbol, resultado)
-    threading.Thread(target=enviar_sinal_telegram,args=(symbol,resultado),daemon=True,
-                     name=f"telegram-autonomo-{active_id}-{resultado['candle_from']}").start()
     log(f"[AUTONOMO] {symbol} -> {resultado['sinal']} | confiança={resultado.get('confianca',0)*100:.1f}% | amostras={resultado.get('amostras_modelo',0)}")
     registrar_operacao_intravela(symbol, resultado)
 
@@ -3976,6 +4030,40 @@ def calcular_estatisticas():
             2
         ),
     }
+
+
+def calcular_estatisticas_por_par():
+    """Resumo por ativo, separando primeira entrada e Gale 1."""
+    resumo = {}
+    for symbol in ATIVOS.values():
+        resumo[symbol] = {
+            "symbol": symbol, "total": 0, "wins": 0, "losses": 0, "dojis": 0,
+            "primeira_wins": 0, "primeira_losses": 0,
+            "gale_wins": 0, "gale_losses": 0, "taxa": 0.0,
+        }
+    for op in _historico_resultados:
+        symbol = op.get("symbol")
+        if symbol not in resumo:
+            resumo[symbol] = {
+                "symbol": symbol, "total": 0, "wins": 0, "losses": 0, "dojis": 0,
+                "primeira_wins": 0, "primeira_losses": 0,
+                "gale_wins": 0, "gale_losses": 0, "taxa": 0.0,
+            }
+        r = op.get("resultado")
+        tipo = op.get("tipo_entrada", "PRIMEIRA")
+        x = resumo[symbol]
+        x["total"] += 1
+        if r == "WIN":
+            x["wins"] += 1
+            x["gale_wins" if tipo == "GALE" else "primeira_wins"] += 1
+        elif r == "LOSS":
+            x["losses"] += 1
+            x["gale_losses" if tipo == "GALE" else "primeira_losses"] += 1
+        elif r == "DOJI":
+            x["dojis"] += 1
+        decididos = x["wins"] + x["losses"]
+        x["taxa"] = round(x["wins"] / decididos * 100 if decididos else 0.0, 2)
+    return list(resumo.values())
 
 
 # ============================================================
@@ -4154,18 +4242,15 @@ def enviar_sinal_telegram(
 
 
 def enviar_status_ordem_telegram(symbol, sinal, status, detalhe=""):
-    mercado = _mercado_do_symbol(symbol)
-    icone = "✅" if status == "CONFIRMADA" else "⚠️"
-    texto = (
-        f"{icone} STATUS DA ORDEM\n\n"
-        f"Ativo: {symbol}\n"
-        f"Mercado: {mercado}\n"
-        f"Direcao: {sinal}\n"
-        f"Status: {status}\n"
-    )
-    if detalhe:
-        texto += f"Detalhe: {detalhe}\n"
-    enviar_telegram(texto)
+    # Telegram enxuto: somente ordem realmente aberta.
+    if status != "CONFIRMADA":
+        return
+    with _execucao_lock:
+        info = _operacoes_ativas_por_symbol.get(symbol, {})
+        tipo = info.get("tipo_entrada", "PRIMEIRA")
+        valor = float(info.get("valor", 0.0) or 0.0)
+    rotulo = "GALE" if tipo == "GALE" else "ENTRADA"
+    enviar_telegram(f"📥 {rotulo} ABERTO | {symbol} | {sinal} | R$ {valor:.2f}")
 
 
 def registrar_operacao_intravela(symbol, resultado):
@@ -4214,6 +4299,7 @@ def registrar_operacao_intravela(symbol, resultado):
         "balance_id": info.get("balance_id"),
         "produto": info.get("produto", "BINARIA_INTRAVELA"),
         "option_id": info.get("option_id"),
+        "tipo_entrada": info.get("tipo_entrada", "PRIMEIRA"),
         "candle_to": int(resultado["candle_to"]),
         "retracao_ratio": resultado.get("retracao_ratio"),
         "impulso": resultado.get("impulso"),
@@ -4271,6 +4357,15 @@ def avaliar_operacao(symbol, candles):
 
         operacao["resultado"] = resultado
         operacao["finalizado_em"] = agora
+        # Apenas a primeira entrada gera Gale 1. Gale nunca gera Gale 2.
+        if resultado == "LOSS" and operacao.get("tipo_entrada", "PRIMEIRA") != "GALE":
+            _gales_pendentes[symbol] = {
+                "sinal": operacao["sinal"],
+                "candle_from_alvo": int(operacao["candle_to"]),
+                "entrada_anterior": entrada,
+                "tentado": False,
+            }
+            log(f"[GALE] {symbol}: LOSS na primeira entrada; Gale 1 R${VALOR_GALE:.2f} programado para a próxima vela, mesma direção {operacao['sinal']}.")
         _historico_resultados.append(operacao.copy())
         del _operacoes_pendentes[symbol]
 
@@ -4301,50 +4396,11 @@ def avaliar_operacao(symbol, candles):
 # TELEGRAM - RESULTADO
 # ============================================================
 
-def enviar_resultado_telegram(
-    operacao,
-    estatisticas
-):
-    resultado = operacao[
-        "resultado"
-    ]
-
-    if resultado == "WIN":
-        emoji = "✅"
-    elif resultado == "LOSS":
-        emoji = "❌"
-    else:
-        emoji = "➖"
-
-    def fmt(valor):
-        if isinstance(
-            valor,
-            (float, int)
-        ):
-            return f"{valor:.5f}"
-
-        return "-"
-
-    texto = (
-        f"{emoji} RESULTADO DA OPERACAO\n\n"
-        f"Ativo: {operacao['symbol']}\n"
-        f"Mercado: {_mercado_do_symbol(operacao['symbol'])}\n"
-        f"Direcao: {operacao['sinal']}\n"
-        f"Estrategia: {operacao.get('estrategia', '-')}\n"
-        f"Regime: {operacao.get('regime', '-')}\n"
-        f"Resultado: {resultado}\n\n"
-        f"Entrada: {fmt(operacao.get('entrada'))}\n"
-        f"Saida: {fmt(operacao.get('saida'))}\n"
-        f"Fonte da vela: Bullex\n\n"
-        f"📊 ESTATISTICAS\n"
-        f"Operacoes: {estatisticas['total']}\n"
-        f"Wins: {estatisticas['wins']}\n"
-        f"Losses: {estatisticas['losses']}\n"
-        f"Dojis: {estatisticas['dojis']}\n"
-        f"Taxa: {estatisticas['taxa']:.2f}%"
-    )
-
-    enviar_telegram(texto)
+def enviar_resultado_telegram(operacao, estatisticas):
+    resultado = operacao.get("resultado", "-")
+    emoji = "✅" if resultado == "WIN" else "❌" if resultado == "LOSS" else "➖"
+    tipo = "GALE" if operacao.get("tipo_entrada") == "GALE" else "ENTRADA"
+    enviar_telegram(f"{emoji} {operacao['symbol']} | {tipo} | {resultado}")
 
 
 # ============================================================
@@ -4670,7 +4726,7 @@ content="width=device-width,
 initial-scale=1.0">
 
 <title>
-Robo Forex Pullback PRO
+Robô OTC Autônomo KNN
 </title>
 
 <style>
@@ -4818,6 +4874,11 @@ h1 {
     margin-top: 15px;
 }
 
+
+.tabela-pares { width:100%; border-collapse:collapse; font-size:13px; }
+.tabela-pares th,.tabela-pares td { padding:8px 5px; border-bottom:1px solid #444; text-align:center; }
+.tabela-pares th:first-child,.tabela-pares td:first-child { text-align:left; }
+.tabela-wrap { overflow-x:auto; }
 </style>
 
 </head>
@@ -4827,12 +4888,12 @@ h1 {
 <div class="container">
 
 <h1>
-Robo Forex Pullback PRO
+Robô OTC Autônomo KNN
 </h1>
 
 <div class="subtitulo">
 
-Estratégia única: S/R M5 + retração intravela na mesma vela
+Autônomo KNN OTC + Gale 1 de R$ 6 após LOSS
 
 </div>
 
@@ -4841,7 +4902,7 @@ Estratégia única: S/R M5 + retração intravela na mesma vela
 <div class="linha"><span>Modo</span><span class="valor">{{ estado.execucao.modo }}</span></div>
 <div class="linha"><span>Automática</span><span class="valor">{{ "ATIVA" if estado.execucao.automatica else "DESATIVADA" }}</span></div>
 <div class="linha"><span>Entrada atual</span><span class="valor">R$ {{ "%.2f"|format(estado.execucao.valor_atual) }}</span></div>
-<div class="linha"><span>Progressão</span><span class="valor">DESATIVADA (R$ 5,00 FIXO)</span></div>
+<div class="linha"><span>Progressão</span><span class="valor">R$ 5,00 normal | Gale 1 R$ 6,00</span></div>
 <div class="linha"><span>Operação ativa</span><span class="valor">{{ "SIM" if estado.execucao.operacao_ativa else "NÃO" }}</span></div>
 <div class="linha"><span>Balance DEMO</span><span class="valor">{{ "ENCONTRADO" if estado.execucao.balance_id_disponivel else "AGUARDANDO" }}</span></div>
 <div class="linha"><span>Último erro</span><span class="valor">{{ estado.execucao.ultimo_erro or "-" }}</span></div>
@@ -5060,6 +5121,18 @@ Taxa de acerto
 </div>
 
 <div class="card">
+<h3>Resultados por par</h3>
+<div class="tabela-wrap">
+<table class="tabela-pares">
+<tr><th>Ativo</th><th>WIN</th><th>LOSS</th><th>WIN 1ª</th><th>LOSS 1ª</th><th>Gale WIN</th><th>Gale LOSS</th><th>Taxa</th></tr>
+{% for p in estatisticas_pares %}
+<tr><td>{{ p.symbol }}</td><td>{{ p.wins }}</td><td>{{ p.losses }}</td><td>{{ p.primeira_wins }}</td><td>{{ p.primeira_losses }}</td><td>{{ p.gale_wins }}</td><td>{{ p.gale_losses }}</td><td>{{ p.taxa }}%</td></tr>
+{% endfor %}
+</table>
+</div>
+</div>
+
+<div class="card">
 
 <div class="observacao">
 
@@ -5153,7 +5226,8 @@ def index():
 
     return render_template_string(
         HTML,
-        estado=estado
+        estado=estado,
+        estatisticas_pares=calcular_estatisticas_por_par()
     )
 
 
@@ -5208,7 +5282,10 @@ def health():
         "operacoes_pendentes":
             len(_operacoes_pendentes),
         "entrada_fixa": 5.00,
-        "progressao_ativa": False,
+        "gale_valor": VALOR_GALE,
+        "gale_maximo": 1,
+        "gales_pendentes": list(_gales_pendentes.keys()),
+        "progressao_ativa": True,
         "historico_preload_pronto": _historico_pronto_event.is_set(),
         "historico_preload_ultima_tentativa": _historico_preload_ultima_tentativa,
         "historico_preload_status": dict(_historico_preload_status),
