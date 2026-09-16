@@ -120,7 +120,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OTC-AUTONOMO-KNN-R4-20260916-PAYOUT-RECUPERACAO10-22"
+BULLEX_DIAGNOSTIC_VERSION = "OTC-AUTONOMO-KNN-R5-20260916-PAYOUT-GALE6"
 
 _bullex_diag = {
     "messages": 0,
@@ -173,8 +173,6 @@ BULLEX_USER_BALANCE_ID = os.getenv(
 
 VALORES_ENTRADA = [5.00]
 VALOR_GALE = 6.00
-VALOR_ENTRADA_RECUPERACAO = 10.00
-VALOR_GALE_RECUPERACAO = 22.00
 # Se a Bullex não devolver o payout no retorno da ordem, usa este valor apenas como fallback.
 BULLEX_PAYOUT_FALLBACK = float(os.getenv("BULLEX_PAYOUT_FALLBACK", "87").strip() or "87")
 EXPIRACAO_MINUTOS = 5
@@ -305,7 +303,6 @@ _operacao_global_em_envIO_LEGACY = False
 _operacoes_ativas_por_symbol = {}
 _operacoes_em_envio = set()
 _gales_pendentes = {}  # symbol -> dados do Gale 1 para a próxima vela M5
-_modo_recuperacao_10_22 = False  # após qualquer LOSS em Gale: próximas sequências usam R$10 + Gale R$22
 
 # R24: candidatos da mesma abertura M5 são comparados antes da execução.
 # Uma pequena janela de coleta permite escolher o setup mais forte sem atrasar
@@ -684,11 +681,10 @@ def _montar_send_message(nome, version, body=None):
 # ============================================================
 
 def _valor_entrada_atual():
-    # Antes de perder um Gale: entrada R$5. Após qualquer Gale LOSS: entrada R$10.
-    return float(VALOR_ENTRADA_RECUPERACAO if _modo_recuperacao_10_22 else VALORES_ENTRADA[0])
+    return float(VALORES_ENTRADA[0])
 
 def _valor_gale_atual():
-    return float(VALOR_GALE_RECUPERACAO if _modo_recuperacao_10_22 else VALOR_GALE)
+    return float(VALOR_GALE)
 
 def _extrair_payout_percent(obj):
     """Procura um percentual de payout/profit retornado pela Bullex."""
@@ -4385,8 +4381,6 @@ def registrar_operacao_intravela(symbol, resultado):
 # ============================================================
 
 def avaliar_operacao(symbol, candles):
-    global _modo_recuperacao_10_22
-
     operacao = _operacoes_pendentes.get(symbol)
     if not operacao:
         return
@@ -4428,9 +4422,6 @@ def avaliar_operacao(symbol, candles):
         payout = float(operacao.get("payout_percent", BULLEX_PAYOUT_FALLBACK) or BULLEX_PAYOUT_FALLBACK)
         valor_op = float(operacao.get("valor", 0.0) or 0.0)
         operacao["lucro_operacao"] = round(valor_op * payout / 100.0 if resultado == "WIN" else -valor_op if resultado == "LOSS" else 0.0, 2)
-        if resultado == "LOSS" and operacao.get("tipo_entrada") == "GALE":
-            _modo_recuperacao_10_22 = True
-            log(f"[RECUPERACAO] Gale LOSS em {symbol}; próximas entradas serão R${VALOR_ENTRADA_RECUPERACAO:.2f} e, se perderem, Gale único de R${VALOR_GALE_RECUPERACAO:.2f}.")
         _historico_resultados.append(operacao.copy())
         del _operacoes_pendentes[symbol]
 
@@ -5360,7 +5351,6 @@ def health():
         "entrada_fixa": 5.00,
         "gale_valor": _valor_gale_atual(),
         "entrada_valor": _valor_entrada_atual(),
-        "modo_recuperacao_10_22": _modo_recuperacao_10_22,
         "financeiro": calcular_financeiro(),
         "gale_maximo": 1,
         "gales_pendentes": list(_gales_pendentes.keys()),
