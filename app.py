@@ -327,6 +327,8 @@ _bullex_balance_source = None
 _bullex_instrument_cache = {}
 _bullex_instrument_event = threading.Event()
 _bullex_digital_position_events = {}
+_digital_raw_diag_count = 0
+DIGITAL_RAW_DIAG_MAX = 4
 
 # ============================================================
 # R22 - PRELOAD OBRIGATÓRIO M5 + M15
@@ -791,6 +793,47 @@ def _instrument_time():
     agora = agora_brt()
     minuto = (agora.minute // 5) * 5
     return agora.replace(minute=minuto, second=0, microsecond=0)
+
+
+def _sanitizar_digital_raw(obj, profundidade=0):
+    """Remove segredos antes de registrar uma amostra do catálogo DIGITAL."""
+    if profundidade > 7:
+        return "<max-depth>"
+    segredos = {
+        "ssid", "cookie", "authorization", "token", "access_token",
+        "refresh_token", "session", "session_id", "client_session_id",
+        "password", "passwd", "secret", "api_key", "apikey",
+    }
+    if isinstance(obj, dict):
+        saida = {}
+        for k, v in list(obj.items())[:40]:
+            chave = str(k)
+            if chave.lower() in segredos or any(x in chave.lower() for x in ("token", "secret", "password", "cookie")):
+                saida[chave] = "<redacted>"
+            else:
+                saida[chave] = _sanitizar_digital_raw(v, profundidade + 1)
+        return saida
+    if isinstance(obj, list):
+        return [_sanitizar_digital_raw(v, profundidade + 1) for v in obj[:8]]
+    if isinstance(obj, str) and len(obj) > 500:
+        return obj[:500] + "...<truncated>"
+    return obj
+
+
+def _log_digital_raw(data):
+    """Mostra poucas respostas reais de instruments para ajustar o parser sem vazar sessão."""
+    global _digital_raw_diag_count
+    if _digital_raw_diag_count >= DIGITAL_RAW_DIAG_MAX:
+        return
+    _digital_raw_diag_count += 1
+    try:
+        seguro = _sanitizar_digital_raw(data)
+        texto = json.dumps(seguro, ensure_ascii=False, separators=(",", ":"))
+        if len(texto) > 7000:
+            texto = texto[:7000] + "...<truncated>"
+        log(f"[DIGITAL RAW {_digital_raw_diag_count}/{DIGITAL_RAW_DIAG_MAX}] {texto}")
+    except Exception as e:
+        log(f"[DIGITAL RAW] falha ao serializar diagnóstico: {e}")
 
 
 def _armazenar_instrumentos_digitais(data):
@@ -1638,6 +1681,7 @@ def _on_bullex_message(ws, raw_message):
     # ========================================================
 
     if nome == "instruments":
+        _log_digital_raw(data)
         qtd = _armazenar_instrumentos_digitais(data)
         if request_id is not None:
             with _bullex_cv:
