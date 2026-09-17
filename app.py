@@ -119,7 +119,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OTC-AUTONOMO-KNN-R11A-20260917-FIX-TICKER-DINAMICO"
+BULLEX_DIAGNOSTIC_VERSION = "OTC-AUTONOMO-KNN-R11B-20260917-ONE-DISPATCHER-PER-M5"
 
 _bullex_diag = {
     "messages": 0,
@@ -319,7 +319,8 @@ _sequencia_ciclos_loss = {}  # symbol -> ciclos completos perdidos em sequência
 _r24_candidatos_lock = threading.RLock()
 _r24_candidatos = {}
 _r24_dispatchers = set()
-R24_JANELA_CLASSIFICACAO_SEGUNDOS = 3.00
+_r24_velas_finalizadas = set()
+R24_JANELA_CLASSIFICACAO_SEGUNDOS = 7.00
 _nivel_progressao = 0
 _bullex_balance_id = None
 _bullex_balance_source = None
@@ -4010,66 +4011,83 @@ def _ticker_por_symbol(symbol):
 
 
 def _r24_despachar_melhor(candle_from):
-    """Compara os sinais OTC da mesma abertura e executa somente o melhor."""
-    time.sleep(R24_JANELA_CLASSIFICACAO_SEGUNDOS)
+    """Compara uma única vez os sinais OTC da abertura M5 e executa no máximo um."""
+    candle_from = int(candle_from)
+
+    # Coleta ancorada na abertura da vela: todos os candidatos que surgirem
+    # até ~7s participam do mesmo ranking global.
+    server_ts, _ = _horario_servidor_atual()
+    alvo = candle_from + float(R24_JANELA_CLASSIFICACAO_SEGUNDOS)
+    espera = max(0.0, alvo - float(server_ts))
+    if espera > 0:
+        time.sleep(espera)
+
     with _r24_candidatos_lock:
-        candidatos = _r24_candidatos.pop(int(candle_from), [])
-        _r24_dispatchers.discard(int(candle_from))
+        candidatos = list(_r24_candidatos.pop(candle_from, []))
 
-    if not candidatos:
-        return
-
-    # Gale pendente tem prioridade absoluta: não inicia outro ciclo até ele resolver.
-    if _gales_pendentes:
-        log(f"[SELETOR GLOBAL] vela={candle_from}: novas entradas ignoradas; existe Gale pendente.")
-        return
-
-    with _execucao_lock:
-        if _operacoes_ativas_por_symbol or _operacoes_em_envio or _operacoes_pendentes:
-            log(f"[SELETOR GLOBAL] vela={candle_from}: candidatos ignorados; já existe uma operação ativa/em envio.")
+    try:
+        if not candidatos:
             return
 
-    candidatos.sort(key=lambda x: _r24_chave_classificacao(x[2]), reverse=True)
-    ranking = ", ".join(
-        f"{sym}:{res.get('sinal')} conf={res.get('confianca',0)*100:.1f}% ciclo={res.get('confianca_ciclo',0)*100:.1f}%"
-        for _, sym, res in candidatos
-    )
-    log(f"[SELETOR GLOBAL] candidatos={ranking}")
+        if _gales_pendentes:
+            log(f"[SELETOR GLOBAL] vela={candle_from}: novas entradas ignoradas; existe Gale pendente.")
+            return
 
-    # R11: nem todo ativo OTC disponibiliza contrato DIGITAL M5 naquele instante.
-    # Portanto o melhor candidato técnico só vira entrada se a própria Bullex
-    # fornecer um SPT M5 REAL (instrument_id + instrument_index). Se não houver,
-    # tenta o próximo candidato do ranking sem registrar falsa operação.
-    escolhido = None
-    for active_id, symbol, resultado in candidatos:
-        ticker = _ticker_por_symbol(symbol)
-        if not ticker:
-            log(f"[SELETOR GLOBAL] {symbol}: ticker não encontrado; pulando candidato.")
-            continue
-        candle_to = int(resultado.get("candle_from", candle_from)) + 300
-        instrumento = _buscar_instrumento(
-            int(active_id), resultado.get("sinal"), ticker, candle_to, symbol
+        with _execucao_lock:
+            if _operacoes_ativas_por_symbol or _operacoes_em_envio or _operacoes_pendentes:
+                log(f"[SELETOR GLOBAL] vela={candle_from}: candidatos ignorados; já existe uma operação ativa/em envio.")
+                return
+
+        candidatos.sort(key=lambda x: _r24_chave_classificacao(x[2]), reverse=True)
+        ranking = ", ".join(
+            f"{sym}:{res.get('sinal')} conf={res.get('confianca',0)*100:.1f}% ciclo={res.get('confianca_ciclo',0)*100:.1f}%"
+            for _, sym, res in candidatos
         )
-        if not instrumento:
-            log(f"[SELETOR GLOBAL] {symbol}: sem DIGITAL M5 SPT; tentando próximo candidato.")
-            continue
-        resultado["instrumento_digital_preselecionado"] = dict(instrumento)
-        escolhido = (active_id, symbol, resultado)
-        break
+        log(f"[SELETOR GLOBAL] candidatos={ranking}")
 
-    if not escolhido:
-        log(f"[SELETOR GLOBAL] vela={candle_from}: nenhum candidato possui DIGITAL M5 SPT disponível; sem entrada.")
-        return
+        escolhido = None
+        for active_id, symbol, resultado in candidatos:
+            # Se outra rotina abriu uma ordem enquanto consultávamos contratos,
+            # encerra esta seleção sem continuar testando candidatos.
+            with _execucao_lock:
+                if _operacoes_ativas_por_symbol or _operacoes_em_envio or _operacoes_pendentes:
+                    log(f"[SELETOR GLOBAL] vela={candle_from}: operação já iniciada; seleção encerrada.")
+                    return
 
-    active_id, symbol, resultado = escolhido
-    log(
-        f"[SELETOR GLOBAL] MELHOR DIGITAL={symbol} {resultado.get('sinal')} | "
-        f"index={resultado['instrumento_digital_preselecionado'].get('instrument_index')}"
-    )
+            ticker = _ticker_por_symbol(symbol)
+            if not ticker:
+                log(f"[SELETOR GLOBAL] {symbol}: ticker não encontrado; pulando candidato.")
+                continue
+            candle_to = int(resultado.get("candle_from", candle_from)) + 300
+            instrumento = _buscar_instrumento(
+                int(active_id), resultado.get("sinal"), ticker, candle_to, symbol
+            )
+            if not instrumento:
+                log(f"[SELETOR GLOBAL] {symbol}: sem DIGITAL M5 SPT; tentando próximo candidato.")
+                continue
+            resultado["instrumento_digital_preselecionado"] = dict(instrumento)
+            escolhido = (active_id, symbol, resultado)
+            break
 
-    # O dashboard só registra entrada depois que a Bullex CONFIRMAR a ordem.
-    registrar_operacao_intravela(symbol, resultado)
+        if not escolhido:
+            log(f"[SELETOR GLOBAL] vela={candle_from}: nenhum candidato possui DIGITAL M5 SPT disponível; sem entrada.")
+            return
 
+        active_id, symbol, resultado = escolhido
+        log(
+            f"[SELETOR GLOBAL] MELHOR DIGITAL={symbol} {resultado.get('sinal')} | "
+            f"index={resultado['instrumento_digital_preselecionado'].get('instrument_index')}"
+        )
+        registrar_operacao_intravela(symbol, resultado)
+
+    finally:
+        with _r24_candidatos_lock:
+            _r24_dispatchers.discard(candle_from)
+            _r24_velas_finalizadas.add(candle_from)
+            limite = candle_from - 3600
+            antigos = [v for v in _r24_velas_finalizadas if v < limite]
+            for v in antigos:
+                _r24_velas_finalizadas.discard(v)
 
 def _status_bloqueio_ativo(symbol):
     info = _bloqueios_por_symbol.get(symbol)
@@ -4217,6 +4235,10 @@ def _processar_sinal_intravela(active_id, msg):
 
     candle_from = int(resultado['candle_from'])
     with _r24_candidatos_lock:
+        # Depois que a vela já foi classificada, candidatos tardios não podem
+        # criar um segundo dispatcher nem uma segunda tentativa de entrada.
+        if candle_from in _r24_velas_finalizadas:
+            return
         _r24_candidatos.setdefault(candle_from, []).append((int(active_id), symbol, resultado))
         if candle_from not in _r24_dispatchers:
             _r24_dispatchers.add(candle_from)
