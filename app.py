@@ -92,7 +92,7 @@ _bullex_assets_lock = threading.RLock()
 _bullex_assets_detected = True
 _bullex_assets_last_error = None
 _bullex_assets_updated_at = None
-_bullex_assets_source = "OTC_STATIC_FALLBACK_WITH_DYNAMIC_AUDNZD"
+_bullex_assets_source = "DIGITAL_OTC_DYNAMIC_ALL"
 _bullex_assets_ready_event = threading.Event()
 _bullex_assets_init_lock = threading.Lock()
 
@@ -119,7 +119,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OTC-AUTONOMO-KNN-GALE-OBRIGATORIO-20260916"
+BULLEX_DIAGNOSTIC_VERSION = "OTC-AUTONOMO-KNN-R8-20260916-ALL-OTC-DIGITAL"
 
 _bullex_diag = {
     "messages": 0,
@@ -198,7 +198,7 @@ INTRAVELA_RETRACAO_MAX = 0.68
 INTRAVELA_REJEICAO_ATR_MIN = 0.10
 INTRAVELA_PAVIO_MIN_FRACAO_MOVIMENTO = 0.10
 
-UMA_OPERACAO_GLOBAL = False
+UMA_OPERACAO_GLOBAL = True
 MAX_OPERACOES_POR_ATIVO = 1
 AUTONOMO_MIN_AMOSTRAS = 45
 AUTONOMO_K_VIZINHOS = 17
@@ -283,7 +283,7 @@ estado = {
 
 estado["execucao"] = {
     "automatica": BULLEX_AUTO_TRADE,
-    "modo": "DEMO",
+    "modo": "DEMO DIGITAL",
     "valor_atual": VALORES_ENTRADA[0],
     "nivel_progressao": 0,
     "operacao_ativa": False,
@@ -319,7 +319,7 @@ _sequencia_ciclos_loss = {}  # symbol -> ciclos completos perdidos em sequência
 _r24_candidatos_lock = threading.RLock()
 _r24_candidatos = {}
 _r24_dispatchers = set()
-R24_JANELA_CLASSIFICACAO_SEGUNDOS = 0.45
+R24_JANELA_CLASSIFICACAO_SEGUNDOS = 0.80
 _nivel_progressao = 0
 _bullex_balance_id = None
 _bullex_balance_source = None
@@ -484,6 +484,8 @@ def _ordem_option_confirmada(resposta):
     return (
         '"success":true' in bruto
         or "digital-option-placed" in bruto
+        or "digital-options.place-digital-option" in bruto
+        or "position_id" in bruto
         or "option-placed" in bruto
     )
 
@@ -742,7 +744,7 @@ def calcular_financeiro():
 def _atualizar_estado_execucao():
     estado["execucao"].update({
         "automatica": BULLEX_AUTO_TRADE,
-        "modo": "DEMO",
+        "modo": "DEMO DIGITAL",
         "valor_atual": _valor_entrada_atual(),
         "nivel_progressao": _nivel_progressao,
         "operacao_ativa": bool(_operacoes_ativas_por_symbol),
@@ -794,51 +796,81 @@ def _montar_instrument_id(active_id, dt=None):
     return f"do{int(active_id)}{dt.strftime('%Y%m%d')}D{dt.strftime('%H%M')}T5MPSPT"
 
 
-def _extrair_instrumentos_recursivo(obj, active_id, out=None):
+def _extrair_instrumentos_recursivo(obj, active_id, out=None, direcao_contexto=None):
+    """Extrai instrument_id digitais, preservando CALL/PUT quando a resposta indicar."""
     if out is None:
         out = []
     if isinstance(obj, dict):
+        contexto = direcao_contexto
+        for k in ("direction", "side", "action", "type"):
+            v = obj.get(k)
+            if isinstance(v, str) and v.lower() in ("call", "put"):
+                contexto = v.lower()
+                break
         aid = obj.get("asset_id", obj.get("active_id", obj.get("underlying_id")))
-        iid = obj.get("instrument_id", obj.get("instrumentId", obj.get("id")))
+        iid = obj.get("instrument_id", obj.get("instrumentId"))
+        # Não usa qualquer campo id genérico como instrument_id: em respostas digitais
+        # há muitos IDs que não são instrumentos negociáveis.
         idx = obj.get("instrument_index", obj.get("instrumentIndex", obj.get("index")))
         if iid is not None and (aid is None or str(aid) == str(active_id)):
-            out.append({"instrument_id": str(iid), "instrument_index": idx, "asset_id": aid or active_id})
-        for v in obj.values():
-            _extrair_instrumentos_recursivo(v, active_id, out)
+            out.append({"instrument_id": str(iid), "instrument_index": idx,
+                        "asset_id": aid or active_id, "direction": contexto})
+        for k, v in obj.items():
+            ctx = contexto
+            kl = str(k).lower()
+            if kl in ("call", "put"):
+                ctx = kl
+            _extrair_instrumentos_recursivo(v, active_id, out, ctx)
     elif isinstance(obj, list):
         for v in obj:
-            _extrair_instrumentos_recursivo(v, active_id, out)
+            _extrair_instrumentos_recursivo(v, active_id, out, direcao_contexto)
     return out
 
 
-def _instrumento_eh_5m(item, expected_id):
+def _instrumento_eh_5m(item, expected_id=None):
     iid = str(item.get("instrument_id", ""))
-    return iid == expected_id or "T5M" in iid.upper()
+    return (expected_id and iid == expected_id) or "T5M" in iid.upper() or "PT5M" in iid.upper()
 
 
-def _buscar_instrumento(active_id, dt=None):
-    expected = _montar_instrument_id(active_id, dt)
-    cache_key = (int(active_id), expected)
+def _buscar_instrumento(active_id, sinal, ticker, candle_to):
+    """Busca o instrument_id DIGITAL de 5 minutos para CALL/PUT."""
+    direcao = _direcao_instrumento(sinal)
+    cache_key = (int(active_id), int(candle_to), direcao)
     cached = _bullex_instrument_cache.get(cache_key)
     if cached:
         return cached
 
-    for version, body in (("3.0", {"asset_id": int(active_id), "instrument_type": "digital"}),
-                          ("2.0", {"asset_id": int(active_id)})):
+    # A lista de strikes é a fonte preferida para Digital porque devolve
+    # instrument_id específico de CALL/PUT e expiração.
+    underlying = str(ticker or "").strip()
+    tentativas = [
+        ("get-strike-list", "4.0", {
+            "type": "digital-option", "underlying": underlying,
+            "expiration": int(candle_to) * 1000, "period": 300,
+        }),
+        ("digital-options.get-instruments", "3.0", {
+            "asset_id": int(active_id), "instrument_type": "digital-option",
+        }),
+        ("digital-options.get-instruments", "2.0", {"asset_id": int(active_id)}),
+    ]
+    for nome, version, body in tentativas:
         try:
-            resposta = _enviar_e_aguardar("digital-options.get-instruments", version, body, timeout=0.9)
-            candidatos = [x for x in _extrair_instrumentos_recursivo(resposta, active_id)
-                          if _instrumento_eh_5m(x, expected)]
-            if not candidatos:
+            resposta = _enviar_e_aguardar(nome, version, body, timeout=2.0)
+            candidatos = _extrair_instrumentos_recursivo(resposta, active_id)
+            # Primeiro exige direção explícita; depois usa marcador no próprio ID.
+            dirigidos = [x for x in candidatos if x.get("direction") == direcao]
+            if not dirigidos:
+                marca = "C" if direcao == "call" else "P"
+                dirigidos = [x for x in candidatos if marca in str(x.get("instrument_id", "")).upper()]
+            if not dirigidos:
                 continue
-            escolhido = next((x for x in candidatos if x["instrument_id"] == expected), candidatos[0])
+            cinco = [x for x in dirigidos if _instrumento_eh_5m(x)]
+            escolhido = (cinco or dirigidos)[0]
             _bullex_instrument_cache[cache_key] = escolhido
             return escolhido
         except Exception as e:
-            log(f"[INSTRUMENT] Falha get-instruments v{version} active_id={active_id}: {e}")
-
+            log(f"[DIGITAL INSTRUMENT] Falha {nome} v{version} active_id={active_id}: {e}")
     return None
-
 
 def _direcao_instrumento(sinal):
     return "call" if sinal == "CALL" else "put"
@@ -861,7 +893,7 @@ def _registrar_ordem_confirmada(symbol, ticker, sinal, valor, active_id, balance
     candle_open_dt=datetime.fromtimestamp(janela['candle_open'],TZ)
     candle_close_dt=datetime.fromtimestamp(janela['candle_close'],TZ)
     msg=resposta.get('msg') if isinstance(resposta,dict) else None
-    option_id=msg.get('id') if isinstance(msg,dict) else None
+    option_id=(msg.get('id') or msg.get('position_id') or msg.get('positionId')) if isinstance(msg,dict) else None
     info={
         'symbol':symbol,'ticker':ticker,'sinal':sinal,'valor':valor,'asset_id':active_id,
         'balance_id':str(balance_id),'produto':produto,'option_id':option_id,
@@ -902,6 +934,11 @@ def executar_ordem_intravela(symbol, sinal, resultado, valor_override=None, tipo
         if symbol in _operacoes_ativas_por_symbol or symbol in _operacoes_em_envio or symbol in _operacoes_pendentes:
             log(f"[AUTONOMO] {symbol}: já existe operação deste ativo ativa/em envio.")
             return "BLOQUEADA_ATIVO"
+        if UMA_OPERACAO_GLOBAL and (
+            _operacoes_ativas_por_symbol or _operacoes_em_envio or _operacoes_pendentes
+        ):
+            log(f"[AUTONOMO GLOBAL] {symbol}: outra operação já está ativa/em envio; entrada ignorada.")
+            return "BLOQUEADA_GLOBAL"
         _operacoes_em_envio.add(symbol)
 
     balance_id = _obter_balance_id()
@@ -958,21 +995,25 @@ def executar_ordem_intravela(symbol, sinal, resultado, valor_override=None, tipo
         "permitida": True,
     }
 
+    # R8: execução exclusivamente em DIGITAL. Nunca chama binary-options.open-option.
+    instrumento = _buscar_instrumento(active_id, sinal, ticker, candle_to)
+    if not instrumento or not instrumento.get("instrument_id"):
+        with _execucao_lock:
+            _operacoes_em_envio.discard(symbol)
+        log(f"[DIGITAL] {symbol}: instrument_id {sinal} M5 não encontrado; ordem não enviada.")
+        return "SEM_INSTRUMENTO_DIGITAL"
+    instrument_id = str(instrumento["instrument_id"])
+    instrument_index = instrumento.get("instrument_index")
     body = {
         "user_balance_id": int(balance_id),
-        "active_id": active_id,
-        "option_type_id": 3,
-        "direction": _direcao_instrumento(sinal),
-        "expired": candle_to,
-        "price": float(valor),
-        "refund_value": 0,
+        "instrument_id": instrument_id,
+        "amount": str(float(valor)),
     }
 
     log(
-        f"[AUTO INTRAVELA] Enviando {symbol} {sinal} R${valor:.2f} | "
-        f"entrada_estimada={resultado['preco']:.5f} | "
-        f"expira_na_mesma_vela={datetime.fromtimestamp(candle_to, TZ).strftime('%H:%M:%S')} | "
-        f"restam={restantes:.1f}s"
+        f"[AUTO DIGITAL] Enviando {symbol} {sinal} R${valor:.2f} | "
+        f"instrument_id={instrument_id} | entrada_estimada={resultado['preco']:.5f} | "
+        f"expira={datetime.fromtimestamp(candle_to, TZ).strftime('%H:%M:%S')} | restam={restantes:.1f}s"
     )
 
     try:
@@ -980,7 +1021,7 @@ def executar_ordem_intravela(symbol, sinal, resultado, valor_override=None, tipo
             _bullex_diag["orders_sent"] += 1
 
         resposta = _enviar_e_aguardar(
-            "binary-options.open-option",
+            "digital-options.place-digital-option",
             "1.0",
             body,
             timeout=20,
@@ -1012,9 +1053,11 @@ def executar_ordem_intravela(symbol, sinal, resultado, valor_override=None, tipo
             valor,
             active_id,
             balance_id,
-            "BINARIA_INTRAVELA",
+            "DIGITAL_INTRAVELA",
             resposta,
             janela,
+            instrument_id=instrument_id,
+            instrument_index=instrument_index,
         )
 
         with _execucao_lock:
@@ -1952,17 +1995,16 @@ def _normalizar_par_mercado_aberto(item):
     par = base[:6]
 
     if is_otc:
-        if par not in PARES_OTC_ALVO:
+        # R8: aceita dinamicamente TODOS os pares OTC devolvidos pela lista DIGITAL
+        # da Bullex. Não depende mais de PARES_OTC_ALVO para decidir o universo.
+        if len(par) != 6 or not par.isalpha():
             return None
         codigo = f"{par}_OTC"
-        symbol_final = PARES_OTC_ALVO[par]
+        symbol_final = f"{par[:3]}/{par[3:]} OTC"
         mercado = "OTC"
     else:
-        if par not in PARES_MERCADO_ABERTO:
-            return None
-        codigo = par
-        symbol_final = PARES_MERCADO_ABERTO[par]
-        mercado = "ABERTO"
+        # Esta versão opera SOMENTE Digital OTC. Mercado aberto é ignorado.
+        return None
 
     return {
         "codigo": codigo,
@@ -1993,11 +2035,8 @@ def _extrair_mercado_aberto_da_resposta(resposta):
         score_atual = int(raw_atual.get("is_visible") is True) + int(raw_atual.get("is_active") is True)
         if score_novo > score_atual:
             encontrados[codigo] = normalizado
-    ordem = (
-        list(PARES_MERCADO_ABERTO.keys())
-        + [f"{c}_OTC" for c in PARES_OTC_ALVO.keys()]
-    )
-    return [encontrados[c] for c in ordem if c in encontrados]
+    # R8: lista dinâmica; devolve todos os OTC digitais encontrados.
+    return sorted(encontrados.values(), key=lambda x: x.get("codigo", ""))
 
 
 def _corpo_lista_instrumentos(nome):
@@ -2007,7 +2046,7 @@ def _corpo_lista_instrumentos(nome):
 
 
 def _consultar_lista_mercado_aberto(nome, versoes=("2.0", "1.0")):
-    """Consulta e agrega somente os OTC configurados.
+    """Consulta e agrega todos os pares OTC retornados pela lista digital.
 
     Algumas respostas da Traderoom podem variar conforme versão/body.
     A R17 não para na primeira resposta parcial: junta todos os ativos
@@ -2055,15 +2094,7 @@ def _consultar_lista_mercado_aberto(nome, versoes=("2.0", "1.0")):
                 )
 
     if encontrados:
-        ordem = (
-            list(PARES_MERCADO_ABERTO.keys())
-            + [f"{c}_OTC" for c in PARES_OTC_ALVO.keys()]
-        )
-        ativos_finais = [
-            encontrados[c]
-            for c in ordem
-            if c in encontrados
-        ]
+        ativos_finais = sorted(encontrados.values(), key=lambda x: x.get("codigo", ""))
         return ultima_resposta, ativos_finais
 
     if ultimo_erro:
@@ -2122,19 +2153,11 @@ def _atualizar_ativos_mercado_aberto(ativos, origem):
         )
     )
 
-    desejados = set(PARES_MERCADO_ABERTO.keys()) | {
-        f"{c}_OTC" for c in PARES_OTC_ALVO.keys()
-    }
-    faltantes = sorted(desejados - set(novos_bullex.keys()))
-    if faltantes:
-        log(
-            "[ATIVOS] Configurados mas não retornados pela Traderoom: "
-            + ", ".join(faltantes)
-        )
+    # R8: universo OTC é descoberto dinamicamente; não há lista fixa de faltantes.
 
 
 def _inicializar_ativos_mercado_aberto():
-    """Descobre somente os OTC configurados automaticamente.
+    """Descobre automaticamente todos os pares OTC disponíveis na lista DIGITAL.
 
     A inicialização é serializada para impedir duas descobertas concorrentes
     após reconexões rápidas do WebSocket.
@@ -2153,7 +2176,7 @@ def _inicializar_ativos_mercado_aberto():
             _, ativos = _consultar_lista_mercado_aberto(fonte_digital)
             if not ativos:
                 raise RuntimeError(
-                    "Lista digital não retornou os pares configurados."
+                    "Lista digital não retornou pares OTC disponíveis."
                 )
 
             _atualizar_ativos_mercado_aberto(ativos, fonte_digital)
@@ -3897,22 +3920,16 @@ def _log_diagnostico_r22(active_id, symbol, msg):
 
 
 def _r24_chave_classificacao(resultado):
-    """Quanto maior, melhor. Prioriza score e depois força/qualidade do setup."""
-    score = float(resultado.get("score") or 0)
-    adx15 = float(resultado.get("adx15") or 0)
-    adx5 = float(resultado.get("adx5") or 0)
-    rsi_v = float(resultado.get("rsi") or 50)
-    sinal = resultado.get("sinal")
-    # Centro preferido das faixas usadas pela própria estratégia.
-    rsi_alvo = 59.0 if sinal == "CALL" else 41.0
-    qualidade_rsi = max(0.0, 10.0 - abs(rsi_v - rsi_alvo))
-    retracao = float(resultado.get("retracao_ratio") or 99)
-    # Menor distância normalizada da EMA20 é melhor, por isso entra negativa.
-    return (score, adx15 + adx5, qualidade_rsi, -retracao)
+    """Ranking do modo global: prioriza qualidade do ciclo e confiança KNN."""
+    ciclo = float(resultado.get("confianca_ciclo") or 0.0)
+    confianca = float(resultado.get("confianca") or 0.0)
+    margem = float(resultado.get("margem") or 0.0)
+    amostras = float(resultado.get("amostras_modelo") or 0.0)
+    return (ciclo, confianca, margem, amostras)
 
 
 def _r24_despachar_melhor(candle_from):
-    """Coleta por fração de segundo e envia somente o melhor setup da abertura."""
+    """Compara os sinais OTC da mesma abertura e executa somente o melhor."""
     time.sleep(R24_JANELA_CLASSIFICACAO_SEGUNDOS)
     with _r24_candidatos_lock:
         candidatos = _r24_candidatos.pop(int(candle_from), [])
@@ -3921,39 +3938,25 @@ def _r24_despachar_melhor(candle_from):
     if not candidatos:
         return
 
-    # Se já existe uma operação (ou uma ordem em envio), nenhum candidato entra.
-    with _execucao_lock:
-        ocupado = UMA_OPERACAO_GLOBAL and (
-            _operacao_global_ativa is not None or _operacao_global_em_envio
-        )
-    if ocupado:
-        log(f"[R24 RANK] vela={candle_from}: candidatos ignorados; já existe operação global ativa/em envio.")
+    # Gale pendente tem prioridade absoluta: não inicia outro ciclo até ele resolver.
+    if _gales_pendentes:
+        log(f"[SELETOR GLOBAL] vela={candle_from}: novas entradas ignoradas; existe Gale pendente.")
         return
+
+    with _execucao_lock:
+        if _operacoes_ativas_por_symbol or _operacoes_em_envio or _operacoes_pendentes:
+            log(f"[SELETOR GLOBAL] vela={candle_from}: candidatos ignorados; já existe uma operação ativa/em envio.")
+            return
 
     candidatos.sort(key=lambda x: _r24_chave_classificacao(x[2]), reverse=True)
     active_id, symbol, resultado = candidatos[0]
     ranking = ", ".join(
-        f"{sym}:{res.get('sinal')} score={res.get('score')} ADX15={res.get('adx15',0):.1f} ADX5={res.get('adx5',0):.1f}"
+        f"{sym}:{res.get('sinal')} conf={res.get('confianca',0)*100:.1f}% ciclo={res.get('confianca_ciclo',0)*100:.1f}%"
         for _, sym, res in candidatos
     )
-    log(f"[R24 RANK] candidatos={ranking} | ESCOLHIDO={symbol} {resultado.get('sinal')}")
+    log(f"[SELETOR GLOBAL] candidatos={ranking} | MELHOR={symbol} {resultado.get('sinal')}")
 
     _atualizar_dashboard_intravela(symbol, resultado)
-
-    threading.Thread(
-        target=enviar_sinal_telegram,
-        args=(symbol, resultado),
-        daemon=True,
-        name=f"telegram-sinal-r24-{active_id}-{resultado['candle_from']}",
-    ).start()
-
-    log(
-        f"[R24 ENTRADA] {symbol} [{_mercado_do_symbol(symbol)}] -> {resultado['sinal']} | "
-        f"score={resultado['score']} | ADX5={resultado.get('adx5', 0):.1f} | "
-        f"ADX15={resultado.get('adx15', 0):.1f} | decorridos={resultado['segundos_decorridos']:.1f}s | "
-        f"preco={resultado['preco']:.5f}"
-    )
-
     registrar_operacao_intravela(symbol, resultado)
 
 
@@ -4054,7 +4057,7 @@ def _tentar_gale_na_proxima_vela(active_id, msg):
             "entrada": preco, "saida": None, "resultado": "PENDENTE",
             "ordem_automatica": True, "valor": valor_gale, "balance_id": info.get("balance_id"),
             "payout_percent": info.get("payout_percent", BULLEX_PAYOUT_FALLBACK), "payout_source": info.get("payout_source", "FALLBACK"),
-            "produto": info.get("produto", "BINARIA_INTRAVELA"), "option_id": info.get("option_id"),
+            "produto": info.get("produto", "DIGITAL_INTRAVELA"), "option_id": info.get("option_id"),
             "tipo_entrada": "GALE", "candle_to": candle_to,
         }
         _ultimas_operacoes_registradas[symbol] = chave
@@ -4072,8 +4075,22 @@ def _processar_sinal_intravela(active_id, msg):
         return
     if _status_bloqueio_ativo(symbol):
         return
+
+    # Se este ativo tem Gale pendente, ele tem prioridade e tenta o Gale obrigatório.
     if _tentar_gale_na_proxima_vela(active_id, msg):
         return
+
+    # Enquanto existir qualquer Gale pendente, nenhum outro ativo pode iniciar ciclo.
+    if _gales_pendentes:
+        return
+
+    # Apenas uma operação/ciclo por vez no robô inteiro.
+    with _execucao_lock:
+        if UMA_OPERACAO_GLOBAL and (
+            _operacoes_ativas_por_symbol or _operacoes_em_envio or _operacoes_pendentes
+        ):
+            return
+
     if not dentro_do_horario() or not _historico_pronto_event.is_set():
         return
     resultado = _resultado_retracao_intravela(msg, active_id)
@@ -4084,9 +4101,21 @@ def _processar_sinal_intravela(active_id, msg):
         if candle_key in _intravela_velas_tentadas:
             return
         _intravela_velas_tentadas.add(candle_key)
-    _atualizar_dashboard_intravela(symbol, resultado)
-    log(f"[AUTONOMO] {symbol} -> {resultado['sinal']} | confiança={resultado.get('confianca',0)*100:.1f}% | ciclo={resultado.get('confianca_ciclo',0)*100:.1f}% | amostras={resultado.get('amostras_modelo',0)}")
-    registrar_operacao_intravela(symbol, resultado)
+
+    log(f"[AUTONOMO CANDIDATO] {symbol} -> {resultado['sinal']} | confiança={resultado.get('confianca',0)*100:.1f}% | ciclo={resultado.get('confianca_ciclo',0)*100:.1f}% | amostras={resultado.get('amostras_modelo',0)}")
+
+    candle_from = int(resultado['candle_from'])
+    with _r24_candidatos_lock:
+        _r24_candidatos.setdefault(candle_from, []).append((int(active_id), symbol, resultado))
+        if candle_from not in _r24_dispatchers:
+            _r24_dispatchers.add(candle_from)
+            threading.Thread(
+                target=_r24_despachar_melhor,
+                args=(candle_from,),
+                daemon=True,
+                name=f"seletor-global-{candle_from}",
+            ).start()
+
 
 def calcular_estatisticas_por_estrategia():
     wins = losses = dojis = 0
@@ -4428,7 +4457,7 @@ def registrar_operacao_intravela(symbol, resultado):
         "ordem_automatica": True,
         "valor": info.get("valor", _valor_entrada_atual()),
         "balance_id": info.get("balance_id"),
-        "produto": info.get("produto", "BINARIA_INTRAVELA"),
+        "produto": info.get("produto", "DIGITAL_INTRAVELA"),
         "option_id": info.get("option_id"),
         "payout_percent": info.get("payout_percent", BULLEX_PAYOUT_FALLBACK),
         "payout_source": info.get("payout_source", "FALLBACK"),
@@ -5042,7 +5071,7 @@ Robô OTC Autônomo KNN
 
 <div class="subtitulo">
 
-Autônomo KNN OTC + Gale 1 de R$ 6 após LOSS
+Autônomo KNN DIGITAL OTC + melhor par global + Gale 1 R$ 6
 
 </div>
 
