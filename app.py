@@ -119,7 +119,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OTC-AUTONOMO-KNN-R11-20260917-DIGITAL-INSTRUMENTS-REAL"
+BULLEX_DIAGNOSTIC_VERSION = "OTC-AUTONOMO-KNN-R11A-20260917-FIX-TICKER-DINAMICO"
 
 _bullex_diag = {
     "messages": 0,
@@ -3996,6 +3996,17 @@ def _r24_chave_classificacao(resultado):
     margem = float(resultado.get("margem") or 0.0)
     amostras = float(resultado.get("amostras_modelo") or 0.0)
     return (ciclo, confianca, margem, amostras)
+
+
+def _ticker_por_symbol(symbol):
+    """Retorna o ticker atual do ativo a partir do mapa dinâmico da Bullex."""
+    with _bullex_assets_lock:
+        for cfg in ATIVO_BULLEX.values():
+            if cfg.get("symbol") == symbol:
+                ticker = cfg.get("ticker")
+                if ticker:
+                    return str(ticker)
+    return None
 
 
 def _r24_despachar_melhor(candle_from):
