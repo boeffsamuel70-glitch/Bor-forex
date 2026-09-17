@@ -2,7 +2,7 @@ import os
 import time
 import threading
 import secrets
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 import json
 import re
@@ -119,7 +119,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OTC-AUTONOMO-KNN-R8-20260916-ALL-OTC-DIGITAL"
+BULLEX_DIAGNOSTIC_VERSION = "OTC-AUTONOMO-KNN-R9-20260916-DIGITAL-SPOT-GLOBAL"
 
 _bullex_diag = {
     "messages": 0,
@@ -790,87 +790,58 @@ def _instrument_time():
     return agora.replace(minute=minuto, second=0, microsecond=0)
 
 
-def _montar_instrument_id(active_id, dt=None):
-    if dt is None:
-        dt = _instrument_time()
-    return f"do{int(active_id)}{dt.strftime('%Y%m%d')}D{dt.strftime('%H%M')}T5MPSPT"
+def _normalizar_underlying_digital(ticker, symbol=None):
+    """Converte o nome exibido pela lista Digital no underlying usado no instrument_id."""
+    bruto = str(ticker or symbol or "").strip().upper()
+    bruto = bruto.replace("/", "").replace(" ", "")
+    bruto = bruto.replace("_OTC", "-OTC")
+    if bruto.endswith("OTC") and not bruto.endswith("-OTC"):
+        bruto = bruto[:-3].rstrip("-_") + "-OTC"
+    return bruto
 
 
-def _extrair_instrumentos_recursivo(obj, active_id, out=None, direcao_contexto=None):
-    """Extrai instrument_id digitais, preservando CALL/PUT quando a resposta indicar."""
-    if out is None:
-        out = []
-    if isinstance(obj, dict):
-        contexto = direcao_contexto
-        for k in ("direction", "side", "action", "type"):
-            v = obj.get(k)
-            if isinstance(v, str) and v.lower() in ("call", "put"):
-                contexto = v.lower()
-                break
-        aid = obj.get("asset_id", obj.get("active_id", obj.get("underlying_id")))
-        iid = obj.get("instrument_id", obj.get("instrumentId"))
-        # Não usa qualquer campo id genérico como instrument_id: em respostas digitais
-        # há muitos IDs que não são instrumentos negociáveis.
-        idx = obj.get("instrument_index", obj.get("instrumentIndex", obj.get("index")))
-        if iid is not None and (aid is None or str(aid) == str(active_id)):
-            out.append({"instrument_id": str(iid), "instrument_index": idx,
-                        "asset_id": aid or active_id, "direction": contexto})
-        for k, v in obj.items():
-            ctx = contexto
-            kl = str(k).lower()
-            if kl in ("call", "put"):
-                ctx = kl
-            _extrair_instrumentos_recursivo(v, active_id, out, ctx)
-    elif isinstance(obj, list):
-        for v in obj:
-            _extrair_instrumentos_recursivo(v, active_id, out, direcao_contexto)
-    return out
+def _montar_instrument_id_digital_spot(ticker, sinal, candle_to, symbol=None):
+    """Monta o instrument_id do Digital Spot M5 no formato da Traderoom.
+
+    Ex.: doEURUSD202609170100PT5MPSPT. A expiração é sempre formatada em UTC.
+    Para OTC, o underlying mantém o sufixo -OTC.
+    """
+    underlying = _normalizar_underlying_digital(ticker, symbol)
+    if not underlying:
+        return None
+    lado = "C" if sinal == "CALL" else "P"
+    expiracao_utc = datetime.fromtimestamp(int(candle_to), timezone.utc)
+    return f"do{underlying}{expiracao_utc.strftime('%Y%m%d%H%M')}PT5M{lado}SPT"
 
 
-def _instrumento_eh_5m(item, expected_id=None):
-    iid = str(item.get("instrument_id", ""))
-    return (expected_id and iid == expected_id) or "T5M" in iid.upper() or "PT5M" in iid.upper()
+def _buscar_instrumento(active_id, sinal, ticker, candle_to, symbol=None):
+    """Obtém o instrumento Digital Spot M5 sem bloquear a janela de entrada.
 
-
-def _buscar_instrumento(active_id, sinal, ticker, candle_to):
-    """Busca o instrument_id DIGITAL de 5 minutos para CALL/PUT."""
+    A versão anterior tentava get-strike-list e aguardava request_id; na Bullex
+    observada essas consultas expiravam por timeout. Para Digital Spot, o próprio
+    instrument_id é determinístico a partir do underlying, expiração UTC, duração
+    e direção, portanto não é necessário esperar a lista de strikes.
+    """
     direcao = _direcao_instrumento(sinal)
     cache_key = (int(active_id), int(candle_to), direcao)
     cached = _bullex_instrument_cache.get(cache_key)
     if cached:
         return cached
 
-    # A lista de strikes é a fonte preferida para Digital porque devolve
-    # instrument_id específico de CALL/PUT e expiração.
-    underlying = str(ticker or "").strip()
-    tentativas = [
-        ("get-strike-list", "4.0", {
-            "type": "digital-option", "underlying": underlying,
-            "expiration": int(candle_to) * 1000, "period": 300,
-        }),
-        ("digital-options.get-instruments", "3.0", {
-            "asset_id": int(active_id), "instrument_type": "digital-option",
-        }),
-        ("digital-options.get-instruments", "2.0", {"asset_id": int(active_id)}),
-    ]
-    for nome, version, body in tentativas:
-        try:
-            resposta = _enviar_e_aguardar(nome, version, body, timeout=2.0)
-            candidatos = _extrair_instrumentos_recursivo(resposta, active_id)
-            # Primeiro exige direção explícita; depois usa marcador no próprio ID.
-            dirigidos = [x for x in candidatos if x.get("direction") == direcao]
-            if not dirigidos:
-                marca = "C" if direcao == "call" else "P"
-                dirigidos = [x for x in candidatos if marca in str(x.get("instrument_id", "")).upper()]
-            if not dirigidos:
-                continue
-            cinco = [x for x in dirigidos if _instrumento_eh_5m(x)]
-            escolhido = (cinco or dirigidos)[0]
-            _bullex_instrument_cache[cache_key] = escolhido
-            return escolhido
-        except Exception as e:
-            log(f"[DIGITAL INSTRUMENT] Falha {nome} v{version} active_id={active_id}: {e}")
-    return None
+    instrument_id = _montar_instrument_id_digital_spot(ticker, sinal, candle_to, symbol)
+    if not instrument_id:
+        return None
+    item = {
+        "instrument_id": instrument_id,
+        "instrument_index": None,
+        "asset_id": int(active_id),
+        "direction": direcao,
+        "source": "DIGITAL_SPOT_ID",
+    }
+    _bullex_instrument_cache[cache_key] = item
+    log(f"[DIGITAL INSTRUMENT] {symbol or ticker}: {sinal} M5 -> {instrument_id}")
+    return item
+
 
 def _direcao_instrumento(sinal):
     return "call" if sinal == "CALL" else "put"
@@ -996,7 +967,7 @@ def executar_ordem_intravela(symbol, sinal, resultado, valor_override=None, tipo
     }
 
     # R8: execução exclusivamente em DIGITAL. Nunca chama binary-options.open-option.
-    instrumento = _buscar_instrumento(active_id, sinal, ticker, candle_to)
+    instrumento = _buscar_instrumento(active_id, sinal, ticker, candle_to, symbol)
     if not instrumento or not instrumento.get("instrument_id"):
         with _execucao_lock:
             _operacoes_em_envio.discard(symbol)
@@ -3956,7 +3927,7 @@ def _r24_despachar_melhor(candle_from):
     )
     log(f"[SELETOR GLOBAL] candidatos={ranking} | MELHOR={symbol} {resultado.get('sinal')}")
 
-    _atualizar_dashboard_intravela(symbol, resultado)
+    # O dashboard só registra entrada depois que a Bullex CONFIRMAR a ordem.
     registrar_operacao_intravela(symbol, resultado)
 
 
@@ -4432,6 +4403,9 @@ def registrar_operacao_intravela(symbol, resultado):
     if status != "CONFIRMADA":
         return
 
+    # Só agora o dashboard passa a mostrar a entrada: a Bullex confirmou a ordem.
+    _atualizar_dashboard_intravela(symbol, resultado)
+
     with _execucao_lock:
         info = _operacoes_ativas_por_symbol.get(symbol, {}).copy()
 
@@ -4720,7 +4694,7 @@ def executar_leitura():
     log(
         f"[MONITOR] ativos mapeados={len(ativos_ciclo)} | "
         f"ABERTO={qtd_aberto} | OTC={qtd_otc} | "
-        "sinais=AUTONOMO KNN OTC | entrada 2-8s | 1 por ativo | multiativo simultaneo | 24H"
+        "sinais=AUTONOMO KNN OTC | entrada 2-8s | 1 operação GLOBAL | melhor OTC Digital | 24H"
     )
 
     for chave, symbol in ativos_ciclo:
@@ -5445,7 +5419,7 @@ def health():
             ),
         "estrategia":
             (
-                "AUTONOMO KNN OTC: aprendizado historico por ativo + adaptacao online + multiativo simultaneo | 24H"
+                "AUTONOMO KNN OTC: aprendizado por ativo + seletor GLOBAL do melhor OTC Digital | 24H"
             ),
         "fonte_candles": "Bullex",
         "execucao_automatica": BULLEX_AUTO_TRADE,
