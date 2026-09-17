@@ -926,25 +926,27 @@ def _solicitar_instrumentos_digitais(active_id, timeout=3.0):
     O envelope/namespace segue a família observada na Traderoom. O parser não
     inventa index nem instrument_id: ambos precisam vir da resposta `instruments`.
     """
-    # A resposta capturada possui `not_found`, indicando consulta por lista de assets.
-    tentativas = (
-        ("3.0", {"asset_ids": [int(active_id)]}),
-        ("3.0", {"asset_id": int(active_id)}),
+    # A API v3 exige o campo singular `asset_id` dentro de msg.body.
+    # O diagnóstico RAW da Bullex confirmou explicitamente esse nome de campo.
+    body = {"asset_id": int(active_id)}
+    resposta = _enviar_e_aguardar(
+        "digital-option-instruments.get-instruments",
+        "3.0",
+        body,
+        timeout=timeout,
     )
-    ultimo_erro = None
-    for version, body in tentativas:
-        try:
-            resposta = _enviar_e_aguardar(
-                "digital-option-instruments.get-instruments",
-                version, body, timeout=timeout
-            )
-            _armazenar_instrumentos_digitais(resposta)
-            return resposta
-        except Exception as e:
-            ultimo_erro = e
-    if ultimo_erro:
-        raise ultimo_erro
-    return None
+
+    # Não tratar uma resposta de erro como se fosse um catálogo vazio.
+    status = resposta.get("status") if isinstance(resposta, dict) else None
+    if status not in (None, 0, 200, 2000):
+        msg = resposta.get("msg") if isinstance(resposta, dict) else None
+        reason = msg.get("reason") if isinstance(msg, dict) else None
+        raise RuntimeError(
+            f"get-instruments rejeitado pela Bullex status={status}: {reason or resposta}"
+        )
+
+    _armazenar_instrumentos_digitais(resposta)
+    return resposta
 
 
 def _buscar_instrumento(active_id, sinal, ticker, candle_to, symbol=None):
