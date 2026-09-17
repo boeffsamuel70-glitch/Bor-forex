@@ -119,7 +119,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OTC-AUTONOMO-KNN-R11C-20260917-TELEGRAM-PRO-HOURLY"
+BULLEX_DIAGNOSTIC_VERSION = "OTC-AUTONOMO-KNN-R12-SR-M15-FORCA-REAL-20260917"
 
 _bullex_diag = {
     "messages": 0,
@@ -220,6 +220,17 @@ AUTONOMO_ADAPTATIVO_ATIVO_MIN = 6
 AUTONOMO_ADAPTATIVO_FAIXA_MIN = 12
 AUTONOMO_ADAPTATIVO_TAXA_BLOQUEIO = 0.48
 AUTONOMO_ADAPTATIVO_ULTIMAS = 80
+
+# R12 - confirmação adicional sem alterar a execução DIGITAL/Gale.
+# Tendência M15 só bloqueia quando estiver FORTE e contra o sinal.
+AUTONOMO_M15_ADX_FORTE = 25.0
+AUTONOMO_M15_PENALIDADE_CONTRA_FRACA = 0.04
+# Força mínima do M5: evita mercado praticamente parado.
+AUTONOMO_M5_ADX_MIN = 12.0
+# Resultados REAIS dos ciclos encerrados passam a calibrar a confiança de ciclo.
+AUTONOMO_REAL_CICLOS_MIN = 10
+AUTONOMO_REAL_CICLO_BLOQUEIO = 0.48
+AUTONOMO_REAL_AJUSTE_MAX = 0.15
 
 _intravela_lock = threading.RLock()
 _intravela_estado = {}
@@ -3831,6 +3842,45 @@ def _autonomo_filtro_adaptativo(symbol, sinal, confianca):
     return True, "LIBERADO_ADAPTATIVO", diag
 
 
+def _autonomo_contexto_m15_forca(active_id, candle_from, sinal):
+    """Confirma contexto sem olhar o futuro: M15 fechado + força M5/M15."""
+    m15 = _fechadas_antes(_candles_cache(active_id, 900), candle_from, 900)[-100:]
+    m5 = _fechadas_antes(_candles_cache(active_id, 300), candle_from, 300)[-100:]
+    if len(m15) < 30 or len(m5) < 30:
+        return False, "SEM_CONTEXTO_M15", {}
+    c15 = closes(m15)
+    e5 = ema(c15, 5); e13 = ema(c15, 13); e21 = ema(c15, 21)
+    if None in (e5, e13, e21):
+        return False, "SEM_EMA_M15", {}
+    t15 = "ALTA" if e5 > e13 > e21 else "BAIXA" if e5 < e13 < e21 else "NEUTRA"
+    adx15 = _adx_candles(m15, 14)
+    adx5 = _adx_candles(m5, 14)
+    if adx5 is not None and adx5 < AUTONOMO_M5_ADX_MIN:
+        return False, f"M5_SEM_FORCA adx={adx5:.1f}", {"t15":t15,"adx5":adx5,"adx15":adx15}
+    contra = (sinal == "CALL" and t15 == "BAIXA") or (sinal == "PUT" and t15 == "ALTA")
+    if contra and adx15 is not None and adx15 >= AUTONOMO_M15_ADX_FORTE:
+        return False, f"M15_FORTE_CONTRA {t15} adx={adx15:.1f}", {"t15":t15,"adx5":adx5,"adx15":adx15}
+    penalidade = AUTONOMO_M15_PENALIDADE_CONTRA_FRACA if contra else 0.0
+    return True, "CONTEXTO_OK", {"t15":t15,"adx5":adx5,"adx15":adx15,"penalidade":penalidade}
+
+
+def _autonomo_ciclos_reais(symbol, sinal):
+    """Mede ciclos reais: WIN primeira ou resultado final do Gale; LOSS inicial não conta duas vezes."""
+    itens=[x for x in _historico_resultados if x.get("symbol")==symbol and x.get("sinal")==sinal and x.get("resultado") in ("WIN","LOSS")]
+    wins=losses=0
+    for x in itens[-160:]:
+        tipo=x.get("tipo_entrada","PRIMEIRA")
+        r=x.get("resultado")
+        if tipo == "GALE":
+            wins += int(r == "WIN"); losses += int(r == "LOSS")
+        elif r == "WIN":
+            wins += 1
+        # LOSS da primeira é ignorada aqui: o ciclo termina no Gale.
+    n=wins+losses
+    taxa=wins/n if n else None
+    return wins,losses,n,taxa
+
+
 def _resultado_retracao_intravela(msg, active_id):
     """Motor autônomo R1: aprende padrões do próprio histórico M5 do ativo.
 
@@ -3909,13 +3959,32 @@ def _resultado_retracao_intravela(msg, active_id):
     if ciclo_n < AUTONOMO_CICLO_MIN_VIZINHOS or ciclo_confianca < AUTONOMO_CICLO_CONFIANCA_MIN:
         return None
 
-    ajuste,amostras_online=_autonomo_ajuste_online(_symbol_por_active_id(active_id)[1],sinal)
-    confianca_ajustada=max(0.0,min(1.0,confianca+ajuste))
+    symbol_atual=_symbol_por_active_id(active_id)[1]
+    ajuste,amostras_online=_autonomo_ajuste_online(symbol_atual,sinal)
+
+    # R12: tendência M15 + força do movimento. Tendência contrária só bloqueia
+    # quando o ADX M15 confirma força; conflito fraco apenas reduz a confiança.
+    contexto_ok,motivo_contexto,ctx=_autonomo_contexto_m15_forca(active_id,candle_from,sinal)
+    if not contexto_ok:
+        log(f"[AUTONOMO][FILTRO CONTEXTO] {symbol_atual} {sinal}: {motivo_contexto}")
+        return None
+    penalidade=float(ctx.get("penalidade",0.0) or 0.0)
+    confianca_ajustada=max(0.0,min(1.0,confianca+ajuste-penalidade))
+
+    # R12: calibra a estimativa histórica de ciclo com os CICLOS REAIS do robô.
+    rw,rl,rn,rtaxa=_autonomo_ciclos_reais(symbol_atual,sinal)
+    ciclo_real_ajuste=0.0
+    if rn >= AUTONOMO_REAL_CICLOS_MIN and rtaxa is not None:
+        if rtaxa < AUTONOMO_REAL_CICLO_BLOQUEIO:
+            log(f"[AUTONOMO][NAO OPERAR REAL] {symbol_atual} {sinal}: ciclos reais {rw}/{rn} WIN ({rtaxa*100:.1f}%)")
+            return None
+        ciclo_real_ajuste=max(-AUTONOMO_REAL_AJUSTE_MAX,min(AUTONOMO_REAL_AJUSTE_MAX,(rtaxa-0.50)*0.30))
+        ciclo_confianca=max(0.0,min(1.0,ciclo_confianca+ciclo_real_ajuste))
+
     margem=abs(p_call-p_put)
     if confianca_ajustada < AUTONOMO_CONFIANCA_MIN or margem < AUTONOMO_MARGEM_MIN:
         return None
 
-    symbol_atual=_symbol_por_active_id(active_id)[1]
     permitir_adaptativo,motivo_adaptativo,diag_adaptativo=_autonomo_filtro_adaptativo(
         symbol_atual,sinal,confianca_ajustada
     )
@@ -3935,17 +4004,18 @@ def _resultado_retracao_intravela(msg, active_id):
         'pullback':f'APRENDIZADO: {len(exemplos)} exemplos; {len(vizinhos)} vizinhos',
         'rejeicao':f'confianca={confianca_ajustada*100:.1f}% margem={margem*100:.1f}%',
         'lateral':'N/A','atr':a,'rsi':rv,'ema5':e5,'ema13':e13,'ema21':e21,
-        'tendencia_5m':tendencia,'tendencia_15m':'MULTIESCALA_M5',
+        'tendencia_5m':tendencia,'tendencia_15m':ctx.get('t15','NEUTRA'),
         'zona_fibonacci':'N/A','bloqueio':'SINAL_AUTONOMO',
         'mensagem':f'{sinal} autonomo | sinal {confianca_ajustada*100:.1f}% | ciclo {ciclo_confianca*100:.1f}% | histórico {len(exemplos)} | online {amostras_online}',
         'candle_from':candle_from,'candle_to':candle_to,
         'segundos_decorridos':decorridos,'segundos_restantes':restantes,
         'impulso':0.0,'retracao_ratio':0.0,'nivel_sr':None,'tipo_nivel':'MODELO_AUTONOMO',
-        'toques_nivel':0,'distancia_abertura_nivel':0.0,'adx5':0.0,'adx15':0.0,
+        'toques_nivel':0,'distancia_abertura_nivel':0.0,'adx5':ctx.get('adx5'),'adx15':ctx.get('adx15'),
         'confianca':confianca_ajustada,'confianca_ciclo':ciclo_confianca,'amostras_ciclo':ciclo_n,'amostras_modelo':len(exemplos),
         'vizinhos':len(vizinhos),'ajuste_online':ajuste,
         'faixa_confianca':_autonomo_faixa_confianca(confianca_ajustada),
         'adaptativo':diag_adaptativo,'filtro_adaptativo':motivo_adaptativo,
+        'ciclos_reais':rn,'taxa_ciclos_reais':rtaxa,'ajuste_ciclo_real':ciclo_real_ajuste,'filtro_contexto':motivo_contexto,
     }
 
 def _atualizar_dashboard_intravela(symbol, resultado):
