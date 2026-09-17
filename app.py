@@ -3842,12 +3842,65 @@ def _autonomo_filtro_adaptativo(symbol, sinal, confianca):
     return True, "LIBERADO_ADAPTATIVO", diag
 
 
+def _agregar_m15_desde_m5(active_id, candle_from, limite=100):
+    """Monta candles M15 fechados a partir do M5 quando o feed M15 nativo ainda não chegou.
+
+    Usa somente grupos completos de 3 candles M5 já fechados antes de candle_from,
+    portanto não olha a vela atual nem informação futura.
+    """
+    m5 = _fechadas_antes(_candles_cache(active_id, 300), candle_from, 300)
+    grupos = {}
+    for c in m5:
+        dt = c.get("_dt")
+        if dt is None:
+            continue
+        ts = int(dt.timestamp())
+        inicio15 = ts - (ts % 900)
+        grupos.setdefault(inicio15, []).append(c)
+
+    saida = []
+    for inicio15 in sorted(grupos):
+        # O M15 inteiro precisa estar encerrado antes da abertura da vela analisada.
+        if inicio15 + 900 > candle_from + 0.001:
+            continue
+        itens = ordenar_candles(grupos[inicio15])
+        # Exige exatamente a estrutura temporal M5 00/05/10 dentro do bloco M15.
+        por_ts = {int(x["_dt"].timestamp()): x for x in itens if x.get("_dt") is not None}
+        esperados = [inicio15, inicio15 + 300, inicio15 + 600]
+        if not all(t in por_ts for t in esperados):
+            continue
+        trio = [por_ts[t] for t in esperados]
+        dt15 = datetime.fromtimestamp(inicio15, tz=TZ)
+        saida.append({
+            "id": f"M15_FROM_M5_{active_id}_{inicio15}",
+            "datetime": dt15.isoformat(),
+            "_dt": dt15,
+            "open": float(trio[0]["open"]),
+            "high": max(float(x["high"]) for x in trio),
+            "low": min(float(x["low"]) for x in trio),
+            "close": float(trio[-1]["close"]),
+            "volume": sum(float(x.get("volume", 0) or 0) for x in trio),
+            "phase": "C",
+        })
+    return saida[-int(limite):]
+
+
 def _autonomo_contexto_m15_forca(active_id, candle_from, sinal):
-    """Confirma contexto sem olhar o futuro: M15 fechado + força M5/M15."""
+    """Confirma contexto sem olhar o futuro: M15 fechado + força M5/M15.
+
+    Prefere M15 nativo da Bullex. Se ainda não houver histórico M15 suficiente
+    para um ativo dinâmico, reconstrói M15 com os candles M5 já fechados.
+    """
     m15 = _fechadas_antes(_candles_cache(active_id, 900), candle_from, 900)[-100:]
     m5 = _fechadas_antes(_candles_cache(active_id, 300), candle_from, 300)[-100:]
+    fonte_m15 = "NATIVO"
+    if len(m15) < 30:
+        m15_agregado = _agregar_m15_desde_m5(active_id, candle_from, 100)
+        if len(m15_agregado) >= 30:
+            m15 = m15_agregado
+            fonte_m15 = "AGREGADO_M5"
     if len(m15) < 30 or len(m5) < 30:
-        return False, "SEM_CONTEXTO_M15", {}
+        return False, f"SEM_CONTEXTO_M15 m15={len(m15)} m5={len(m5)}", {"fonte_m15": fonte_m15, "m15_n": len(m15), "m5_n": len(m5)}
     c15 = closes(m15)
     e5 = ema(c15, 5); e13 = ema(c15, 13); e21 = ema(c15, 21)
     if None in (e5, e13, e21):
@@ -3856,12 +3909,12 @@ def _autonomo_contexto_m15_forca(active_id, candle_from, sinal):
     adx15 = _adx_candles(m15, 14)
     adx5 = _adx_candles(m5, 14)
     if adx5 is not None and adx5 < AUTONOMO_M5_ADX_MIN:
-        return False, f"M5_SEM_FORCA adx={adx5:.1f}", {"t15":t15,"adx5":adx5,"adx15":adx15}
+        return False, f"M5_SEM_FORCA adx={adx5:.1f}", {"t15":t15,"adx5":adx5,"adx15":adx15,"fonte_m15":fonte_m15}
     contra = (sinal == "CALL" and t15 == "BAIXA") or (sinal == "PUT" and t15 == "ALTA")
     if contra and adx15 is not None and adx15 >= AUTONOMO_M15_ADX_FORTE:
-        return False, f"M15_FORTE_CONTRA {t15} adx={adx15:.1f}", {"t15":t15,"adx5":adx5,"adx15":adx15}
+        return False, f"M15_FORTE_CONTRA {t15} adx={adx15:.1f}", {"t15":t15,"adx5":adx5,"adx15":adx15,"fonte_m15":fonte_m15}
     penalidade = AUTONOMO_M15_PENALIDADE_CONTRA_FRACA if contra else 0.0
-    return True, "CONTEXTO_OK", {"t15":t15,"adx5":adx5,"adx15":adx15,"penalidade":penalidade}
+    return True, "CONTEXTO_OK", {"t15":t15,"adx5":adx5,"adx15":adx15,"penalidade":penalidade,"fonte_m15":fonte_m15}
 
 
 def _autonomo_ciclos_reais(symbol, sinal):
