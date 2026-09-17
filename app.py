@@ -119,7 +119,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OTC-AUTONOMO-KNN-R9-20260916-DIGITAL-SPOT-GLOBAL"
+BULLEX_DIAGNOSTIC_VERSION = "OTC-AUTONOMO-KNN-R10-20260917-DIGITAL-INSTRUMENTS-REAL"
 
 _bullex_diag = {
     "messages": 0,
@@ -324,6 +324,8 @@ _nivel_progressao = 0
 _bullex_balance_id = None
 _bullex_balance_source = None
 _bullex_instrument_cache = {}
+_bullex_instrument_event = threading.Event()
+_bullex_digital_position_events = {}
 
 # ============================================================
 # R22 - PRELOAD OBRIGATÓRIO M5 + M15
@@ -790,57 +792,113 @@ def _instrument_time():
     return agora.replace(minute=minuto, second=0, microsecond=0)
 
 
-def _normalizar_underlying_digital(ticker, symbol=None):
-    """Converte o nome exibido pela lista Digital no underlying usado no instrument_id."""
-    bruto = str(ticker or symbol or "").strip().upper()
-    bruto = bruto.replace("/", "").replace(" ", "")
-    bruto = bruto.replace("_OTC", "-OTC")
-    if bruto.endswith("OTC") and not bruto.endswith("-OTC"):
-        bruto = bruto[:-3].rstrip("-_") + "-OTC"
-    return bruto
+def _armazenar_instrumentos_digitais(data):
+    """Armazena a lista REAL `name=instruments` recebida da Traderoom.
 
-
-def _montar_instrument_id_digital_spot(ticker, sinal, candle_to, symbol=None):
-    """Monta o instrument_id do Digital Spot M5 no formato da Traderoom.
-
-    Ex.: doEURUSD202609170100PT5MPSPT. A expiração é sempre formatada em UTC.
-    Para OTC, o underlying mantém o sufixo -OTC.
+    Cada item traz index, asset_id, expiration, period e data[] com os
+    symbols CALL/PUT. Para a estratégia usamos somente period=300 e strike=SPT.
     """
-    underlying = _normalizar_underlying_digital(ticker, symbol)
-    if not underlying:
-        return None
-    lado = "C" if sinal == "CALL" else "P"
-    expiracao_utc = datetime.fromtimestamp(int(candle_to), timezone.utc)
-    return f"do{underlying}{expiracao_utc.strftime('%Y%m%d%H%M')}PT5M{lado}SPT"
+    if not isinstance(data, dict) or data.get("name") != "instruments":
+        return 0
+    msg = data.get("msg")
+    if not isinstance(msg, dict):
+        return 0
+    instrumentos = msg.get("instruments")
+    if not isinstance(instrumentos, list):
+        return 0
+    gravados = 0
+    with _bullex_cv:
+        for inst in instrumentos:
+            if not isinstance(inst, dict):
+                continue
+            try:
+                asset_id = int(inst.get("asset_id"))
+                expiration = int(inst.get("expiration"))
+                period = int(inst.get("period"))
+                index = int(inst.get("index"))
+            except (TypeError, ValueError):
+                continue
+            for opcao in inst.get("data") or []:
+                if not isinstance(opcao, dict) or str(opcao.get("strike")) != "SPT":
+                    continue
+                direction = str(opcao.get("direction") or "").lower()
+                symbol = opcao.get("symbol")
+                if direction not in ("call", "put") or not symbol:
+                    continue
+                key = (asset_id, expiration, period, direction)
+                _bullex_instrument_cache[key] = {
+                    "instrument_id": str(symbol),
+                    "instrument_index": index,
+                    "asset_id": asset_id,
+                    "expiration": expiration,
+                    "period": period,
+                    "direction": direction,
+                    "source": "BULLEX_INSTRUMENTS_REAL",
+                }
+                gravados += 1
+        if gravados:
+            _bullex_instrument_event.set()
+            _bullex_cv.notify_all()
+    return gravados
+
+
+def _instrumento_digital_cache(active_id, sinal, candle_to):
+    direction = _direcao_instrumento(sinal)
+    key = (int(active_id), int(candle_to), 300, direction)
+    return _bullex_instrument_cache.get(key)
+
+
+def _solicitar_instrumentos_digitais(active_id, timeout=3.0):
+    """Solicita o catálogo Digital do ativo e deixa `name=instruments` alimentar o cache.
+
+    O envelope/namespace segue a família observada na Traderoom. O parser não
+    inventa index nem instrument_id: ambos precisam vir da resposta `instruments`.
+    """
+    # A resposta capturada possui `not_found`, indicando consulta por lista de assets.
+    tentativas = (
+        ("3.0", {"asset_ids": [int(active_id)]}),
+        ("3.0", {"asset_id": int(active_id)}),
+    )
+    ultimo_erro = None
+    for version, body in tentativas:
+        try:
+            resposta = _enviar_e_aguardar(
+                "digital-option-instruments.get-instruments",
+                version, body, timeout=timeout
+            )
+            _armazenar_instrumentos_digitais(resposta)
+            return resposta
+        except Exception as e:
+            ultimo_erro = e
+    if ultimo_erro:
+        raise ultimo_erro
+    return None
 
 
 def _buscar_instrumento(active_id, sinal, ticker, candle_to, symbol=None):
-    """Obtém o instrumento Digital Spot M5 sem bloquear a janela de entrada.
+    """Obtém index + symbol SPT M5 diretamente do catálogo REAL da Bullex."""
+    item = _instrumento_digital_cache(active_id, sinal, candle_to)
+    if item:
+        return item
 
-    A versão anterior tentava get-strike-list e aguardava request_id; na Bullex
-    observada essas consultas expiravam por timeout. Para Digital Spot, o próprio
-    instrument_id é determinístico a partir do underlying, expiração UTC, duração
-    e direção, portanto não é necessário esperar a lista de strikes.
-    """
-    direcao = _direcao_instrumento(sinal)
-    cache_key = (int(active_id), int(candle_to), direcao)
-    cached = _bullex_instrument_cache.get(cache_key)
-    if cached:
-        return cached
+    try:
+        _solicitar_instrumentos_digitais(active_id, timeout=2.5)
+    except Exception as e:
+        log(f"[DIGITAL INSTRUMENT] {symbol or ticker}: consulta instruments falhou: {e}")
 
-    instrument_id = _montar_instrument_id_digital_spot(ticker, sinal, candle_to, symbol)
-    if not instrument_id:
-        return None
-    item = {
-        "instrument_id": instrument_id,
-        "instrument_index": None,
-        "asset_id": int(active_id),
-        "direction": direcao,
-        "source": "DIGITAL_SPOT_ID",
-    }
-    _bullex_instrument_cache[cache_key] = item
-    log(f"[DIGITAL INSTRUMENT] {symbol or ticker}: {sinal} M5 -> {instrument_id}")
-    return item
+    item = _instrumento_digital_cache(active_id, sinal, candle_to)
+    if item:
+        log(
+            f"[DIGITAL INSTRUMENT] {symbol or ticker}: {sinal} M5 REAL -> "
+            f"index={item['instrument_index']} id={item['instrument_id']}"
+        )
+        return item
+
+    log(
+        f"[DIGITAL INSTRUMENT] {symbol or ticker}: catálogo não trouxe SPT M5 "
+        f"asset_id={active_id} expiration={int(candle_to)}; ordem não enviada."
+    )
+    return None
 
 
 def _direcao_instrumento(sinal):
@@ -975,10 +1033,20 @@ def executar_ordem_intravela(symbol, sinal, resultado, valor_override=None, tipo
         return "SEM_INSTRUMENTO_DIGITAL"
     instrument_id = str(instrumento["instrument_id"])
     instrument_index = instrumento.get("instrument_index")
+    if instrument_index is None:
+        with _execucao_lock:
+            _operacoes_em_envio.discard(symbol)
+        log(f"[DIGITAL] {symbol}: instrument_index ausente; ordem NÃO enviada.")
+        return "SEM_INSTRUMENT_INDEX"
+
+    # Formato confirmado na captura real da Traderoom Digital.
+    amount_txt = str(int(valor)) if float(valor).is_integer() else str(float(valor))
     body = {
         "user_balance_id": int(balance_id),
         "instrument_id": instrument_id,
-        "amount": str(float(valor)),
+        "amount": amount_txt,
+        "instrument_index": int(instrument_index),
+        "asset_id": int(active_id),
     }
 
     log(
@@ -993,7 +1061,7 @@ def executar_ordem_intravela(symbol, sinal, resultado, valor_override=None, tipo
 
         resposta = _enviar_e_aguardar(
             "digital-options.place-digital-option",
-            "1.0",
+            "3.0",
             body,
             timeout=20,
         )
@@ -1514,6 +1582,33 @@ def _on_bullex_message(ws, raw_message):
         _bullex_auth_event.set()
         log("Bullex recusou a autenticacao.")
         return
+
+    # ========================================================
+    # DIGITAL - CATÁLOGO REAL DE INSTRUMENTOS
+    # ========================================================
+
+    if nome == "instruments":
+        qtd = _armazenar_instrumentos_digitais(data)
+        if request_id is not None:
+            with _bullex_cv:
+                _bullex_response_store[str(request_id)] = data
+                _bullex_cv.notify_all()
+        if qtd:
+            log(f"[DIGITAL INSTRUMENTS] {qtd} SPT(s) armazenado(s) do catálogo real.")
+        return
+
+    # Eventos de posição Digital confirmam que a ordem realmente abriu.
+    if nome == "position-changed" and isinstance(msg, dict):
+        instrument_id_evt = msg.get("instrument_id")
+        if not instrument_id_evt and isinstance(msg.get("raw_event"), dict):
+            for raw in msg["raw_event"].values():
+                if isinstance(raw, dict) and raw.get("instrument_id"):
+                    instrument_id_evt = raw.get("instrument_id")
+                    break
+        if instrument_id_evt:
+            with _bullex_cv:
+                _bullex_digital_position_events[str(instrument_id_evt)] = data
+                _bullex_cv.notify_all()
 
     # ========================================================
     # CANDLE-GENERATED
