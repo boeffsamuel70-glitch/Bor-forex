@@ -119,7 +119,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OTC-AUTONOMO-KNN-R11B-20260917-ONE-DISPATCHER-PER-M5"
+BULLEX_DIAGNOSTIC_VERSION = "OTC-AUTONOMO-KNN-R11C-20260917-TELEGRAM-PRO-HOURLY"
 
 _bullex_diag = {
     "messages": 0,
@@ -844,9 +844,37 @@ def _armazenar_instrumentos_digitais(data):
 
 
 def _instrumento_digital_cache(active_id, sinal, candle_to):
+    """Localiza um contrato DIGITAL M5 REAL recebido da Bullex.
+
+    Prioriza o vencimento exato da vela. Se a Traderoom publicar o mesmo
+    contrato M5 com vencimento ligeiramente diferente, aceita somente um
+    vencimento FUTURO real, dentro de uma janela máxima de 5 minutos.
+    Nunca inventa instrument_id/index.
+    """
     direction = _direcao_instrumento(sinal)
-    key = (int(active_id), int(candle_to), 300, direction)
-    return _bullex_instrument_cache.get(key)
+    active_id = int(active_id)
+    candle_to = int(candle_to)
+    key = (active_id, candle_to, 300, direction)
+    item = _bullex_instrument_cache.get(key)
+    if item:
+        return item
+
+    server_ts, _ = _horario_servidor_atual()
+    candidatos = []
+    for (asset_id, expiration, period, direcao), inst in list(_bullex_instrument_cache.items()):
+        if asset_id != active_id or period != 300 or direcao != direction:
+            continue
+        # Não aceita contrato já vencido e não pula mais de um ciclo M5.
+        if expiration <= int(server_ts):
+            continue
+        distancia = abs(int(expiration) - candle_to)
+        if distancia <= 300:
+            candidatos.append((distancia, int(expiration), inst))
+
+    if not candidatos:
+        return None
+    candidatos.sort(key=lambda x: (x[0], x[1]))
+    return candidatos[0][2]
 
 
 def _solicitar_instrumentos_digitais(active_id, timeout=3.0):
@@ -889,15 +917,26 @@ def _buscar_instrumento(active_id, sinal, ticker, candle_to, symbol=None):
 
     item = _instrumento_digital_cache(active_id, sinal, candle_to)
     if item:
+        exp_real = int(item.get("expiration", candle_to))
+        ajuste = exp_real - int(candle_to)
+        extra = f" | ajuste_exp={ajuste:+d}s" if ajuste else ""
         log(
             f"[DIGITAL INSTRUMENT] {symbol or ticker}: {sinal} M5 REAL -> "
-            f"index={item['instrument_index']} id={item['instrument_id']}"
+            f"index={item['instrument_index']} id={item['instrument_id']} "
+            f"expiration={exp_real}{extra}"
         )
         return item
 
+    # Diagnóstico: mostra o que o catálogo REAL trouxe para este ativo.
+    direction = _direcao_instrumento(sinal)
+    disponiveis = []
+    for (asset_id, expiration, period, direcao), inst in list(_bullex_instrument_cache.items()):
+        if int(asset_id) == int(active_id) and direcao == direction:
+            disponiveis.append(f"P{period}/EXP{expiration}/IDX{inst.get('instrument_index')}")
+    resumo = ", ".join(disponiveis[:8]) if disponiveis else "nenhum SPT armazenado"
     log(
-        f"[DIGITAL INSTRUMENT] {symbol or ticker}: catálogo não trouxe SPT M5 "
-        f"asset_id={active_id} expiration={int(candle_to)}; ordem não enviada."
+        f"[DIGITAL INSTRUMENT] {symbol or ticker}: catálogo não trouxe SPT M5 utilizável "
+        f"asset_id={active_id} alvo={int(candle_to)} | disponíveis={resumo}; ordem não enviada."
     )
     return None
 
@@ -1038,11 +1077,17 @@ def executar_ordem_intravela(symbol, sinal, resultado, valor_override=None, tipo
         return "SEM_INSTRUMENTO_DIGITAL"
     instrument_id = str(instrumento["instrument_id"])
     instrument_index = instrumento.get("instrument_index")
+    # O vencimento usado para acompanhamento deve ser o do contrato REAL.
+    expiration_real = int(instrumento.get("expiration") or candle_to)
     if instrument_index is None:
         with _execucao_lock:
             _operacoes_em_envio.discard(symbol)
         log(f"[DIGITAL] {symbol}: instrument_index ausente; ordem NÃO enviada.")
         return "SEM_INSTRUMENT_INDEX"
+
+    # Se o catálogo publicou um vencimento M5 real diferente do alvo teórico,
+    # acompanha o fechamento pelo vencimento efetivamente comprado.
+    janela["candle_close"] = expiration_real
 
     # Formato confirmado na captura real da Traderoom Digital.
     amount_txt = str(int(valor)) if float(valor).is_integer() else str(float(valor))
@@ -1057,7 +1102,7 @@ def executar_ordem_intravela(symbol, sinal, resultado, valor_override=None, tipo
     log(
         f"[AUTO DIGITAL] Enviando {symbol} {sinal} R${valor:.2f} | "
         f"instrument_id={instrument_id} | entrada_estimada={resultado['preco']:.5f} | "
-        f"expira={datetime.fromtimestamp(candle_to, TZ).strftime('%H:%M:%S')} | restam={restantes:.1f}s"
+        f"expira={datetime.fromtimestamp(expiration_real, TZ).strftime('%H:%M:%S')} | restam={restantes:.1f}s"
     )
 
     try:
@@ -4535,15 +4580,31 @@ def enviar_sinal_telegram(
 
 
 def enviar_status_ordem_telegram(symbol, sinal, status, detalhe=""):
-    # Telegram enxuto: somente ordem realmente aberta.
+    # Telegram profissional: só avisa quando a Bullex confirmou a ordem.
+    # Não exibe valor, score, KNN ou outros detalhes internos.
     if status != "CONFIRMADA":
         return
     with _execucao_lock:
         info = _operacoes_ativas_por_symbol.get(symbol, {})
         tipo = info.get("tipo_entrada", "PRIMEIRA")
-        valor = float(info.get("valor", 0.0) or 0.0)
-    rotulo = "GALE" if tipo == "GALE" else "ENTRADA"
-    enviar_telegram(f"📥 {rotulo} ABERTO | {symbol} | {sinal} | R$ {valor:.2f}")
+
+    direcao = "🟢 CALL ⬆️" if sinal == "CALL" else "🔴 PUT ⬇️"
+    if tipo == "GALE":
+        texto = (
+            "🔄 GALE 1 CONFIRMADO\n\n"
+            f"💱 Ativo: {symbol}\n"
+            f"📍 Direção: {direcao}\n"
+            "⏱ Expiração: 5 minutos"
+        )
+    else:
+        texto = (
+            "🚨 SINAL CONFIRMADO\n\n"
+            f"💱 Ativo: {symbol}\n"
+            f"📍 Direção: {direcao}\n"
+            "⏱ Expiração: 5 minutos\n\n"
+            "✅ Entrada confirmada"
+        )
+    enviar_telegram(texto)
 
 
 def registrar_operacao_intravela(symbol, resultado):
@@ -4699,9 +4760,96 @@ def avaliar_operacao(symbol, candles):
 
 def enviar_resultado_telegram(operacao, estatisticas):
     resultado = operacao.get("resultado", "-")
-    emoji = "✅" if resultado == "WIN" else "❌" if resultado == "LOSS" else "➖"
-    tipo = "GALE" if operacao.get("tipo_entrada") == "GALE" else "ENTRADA"
-    enviar_telegram(f"{emoji} {operacao['symbol']} | {tipo} | {resultado}")
+    symbol = operacao.get("symbol", "-")
+    sinal = operacao.get("sinal", "-")
+    tipo = operacao.get("tipo_entrada", "PRIMEIRA")
+    direcao = "🟢 CALL ⬆️" if sinal == "CALL" else "🔴 PUT ⬇️" if sinal == "PUT" else sinal
+
+    if resultado == "WIN" and tipo != "GALE":
+        texto = (
+            "🟢 WIN ✅\n\n"
+            f"💱 {symbol}\n"
+            f"📍 {direcao}\n\n"
+            "🏆 WIN DE PRIMEIRA!"
+        )
+    elif resultado == "LOSS" and tipo != "GALE":
+        texto = (
+            "🔴 LOSS ❌\n\n"
+            f"💱 {symbol}\n"
+            f"📍 {direcao}\n\n"
+            "🔄 Vamos para o Gale 1"
+        )
+    elif resultado == "WIN" and tipo == "GALE":
+        texto = (
+            "🟢 WIN NO GALE 1 ✅\n\n"
+            f"💱 {symbol}\n\n"
+            "🏆 Ciclo finalizado em WIN"
+        )
+    elif resultado == "LOSS" and tipo == "GALE":
+        texto = (
+            "🔴 LOSS NO GALE 1 ❌\n\n"
+            f"💱 {symbol}\n\n"
+            "⛔ Ciclo finalizado em LOSS"
+        )
+    else:
+        texto = f"➖ {symbol} | {resultado}"
+
+    enviar_telegram(texto)
+
+
+def _ciclos_telegram_desde(inicio, fim):
+    """Conta ciclos concluídos no intervalo, sem contar a LOSS inicial duas vezes."""
+    primeira_wins = 0
+    gale_wins = 0
+    ciclos_loss = 0
+
+    with _execucao_lock:
+        historico = list(_historico_resultados)
+
+    for op in historico:
+        finalizado = op.get("finalizado_em")
+        if not isinstance(finalizado, datetime):
+            continue
+        if not (inicio <= finalizado < fim):
+            continue
+
+        resultado = op.get("resultado")
+        tipo = op.get("tipo_entrada", "PRIMEIRA")
+        if tipo == "GALE":
+            if resultado == "WIN":
+                gale_wins += 1
+            elif resultado == "LOSS":
+                ciclos_loss += 1
+        elif resultado == "WIN":
+            primeira_wins += 1
+        # LOSS da primeira não encerra o ciclo e não entra na parcial.
+
+    total = primeira_wins + gale_wins + ciclos_loss
+    wins = primeira_wins + gale_wins
+    taxa = (wins / total * 100.0) if total else 0.0
+    return primeira_wins, gale_wins, ciclos_loss, total, wins, taxa
+
+
+def loop_parcial_horaria_telegram():
+    """Envia uma parcial a cada 1 hora, contando ciclos encerrados naquela hora."""
+    inicio = agora_brt()
+    while True:
+        time.sleep(3600)
+        fim = agora_brt()
+        primeira_wins, gale_wins, ciclos_loss, total, wins, taxa = _ciclos_telegram_desde(inicio, fim)
+
+        texto = (
+            "📊 PARCIAL — ÚLTIMA HORA\n\n"
+            f"🟢 WIN de primeira: {primeira_wins}\n"
+            f"🔄 WIN no Gale 1: {gale_wins}\n"
+            f"🔴 Ciclos LOSS: {ciclos_loss}\n\n"
+            f"📈 Total: {total} ciclos\n"
+            f"🏆 {wins} WIN | {ciclos_loss} LOSS\n"
+            f"🎯 Assertividade: {taxa:.1f}%\n\n"
+            "🤖 Sala de Sinais OTC"
+        )
+        enviar_telegram(texto)
+        inicio = fim
 
 
 # ============================================================
@@ -4999,8 +5147,17 @@ def garantir_robo_iniciado():
 
         thread.start()
 
+        threading.Thread(
+            target=loop_parcial_horaria_telegram,
+            daemon=True,
+            name="telegram-parcial-horaria",
+        ).start()
+
         log(
             "Thread do robo iniciada."
+        )
+        log(
+            "Telegram: parcial por ciclos programada a cada 1 hora de operação."
         )
 
 
