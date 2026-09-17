@@ -119,7 +119,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OTC-AUTONOMO-KNN-R10-20260917-DIGITAL-INSTRUMENTS-REAL"
+BULLEX_DIAGNOSTIC_VERSION = "OTC-AUTONOMO-KNN-R11-20260917-DIGITAL-INSTRUMENTS-REAL"
 
 _bullex_diag = {
     "messages": 0,
@@ -319,7 +319,7 @@ _sequencia_ciclos_loss = {}  # symbol -> ciclos completos perdidos em sequência
 _r24_candidatos_lock = threading.RLock()
 _r24_candidatos = {}
 _r24_dispatchers = set()
-R24_JANELA_CLASSIFICACAO_SEGUNDOS = 0.80
+R24_JANELA_CLASSIFICACAO_SEGUNDOS = 3.00
 _nivel_progressao = 0
 _bullex_balance_id = None
 _bullex_balance_source = None
@@ -1024,8 +1024,12 @@ def executar_ordem_intravela(symbol, sinal, resultado, valor_override=None, tipo
         "permitida": True,
     }
 
-    # R8: execução exclusivamente em DIGITAL. Nunca chama binary-options.open-option.
-    instrumento = _buscar_instrumento(active_id, sinal, ticker, candle_to, symbol)
+    # R11: o seletor global pode ter validado o contrato Digital antes do envio.
+    # Reutiliza exatamente o instrument_id/index recebido da Bullex para evitar
+    # uma segunda consulta e impedir troca de contrato entre seleção e ordem.
+    instrumento = resultado.get("instrumento_digital_preselecionado")
+    if not instrumento:
+        instrumento = _buscar_instrumento(active_id, sinal, ticker, candle_to, symbol)
     if not instrumento or not instrumento.get("instrument_id"):
         with _execucao_lock:
             _operacoes_em_envio.discard(symbol)
@@ -4015,12 +4019,42 @@ def _r24_despachar_melhor(candle_from):
             return
 
     candidatos.sort(key=lambda x: _r24_chave_classificacao(x[2]), reverse=True)
-    active_id, symbol, resultado = candidatos[0]
     ranking = ", ".join(
         f"{sym}:{res.get('sinal')} conf={res.get('confianca',0)*100:.1f}% ciclo={res.get('confianca_ciclo',0)*100:.1f}%"
         for _, sym, res in candidatos
     )
-    log(f"[SELETOR GLOBAL] candidatos={ranking} | MELHOR={symbol} {resultado.get('sinal')}")
+    log(f"[SELETOR GLOBAL] candidatos={ranking}")
+
+    # R11: nem todo ativo OTC disponibiliza contrato DIGITAL M5 naquele instante.
+    # Portanto o melhor candidato técnico só vira entrada se a própria Bullex
+    # fornecer um SPT M5 REAL (instrument_id + instrument_index). Se não houver,
+    # tenta o próximo candidato do ranking sem registrar falsa operação.
+    escolhido = None
+    for active_id, symbol, resultado in candidatos:
+        ticker = _ticker_por_symbol(symbol)
+        if not ticker:
+            log(f"[SELETOR GLOBAL] {symbol}: ticker não encontrado; pulando candidato.")
+            continue
+        candle_to = int(resultado.get("candle_from", candle_from)) + 300
+        instrumento = _buscar_instrumento(
+            int(active_id), resultado.get("sinal"), ticker, candle_to, symbol
+        )
+        if not instrumento:
+            log(f"[SELETOR GLOBAL] {symbol}: sem DIGITAL M5 SPT; tentando próximo candidato.")
+            continue
+        resultado["instrumento_digital_preselecionado"] = dict(instrumento)
+        escolhido = (active_id, symbol, resultado)
+        break
+
+    if not escolhido:
+        log(f"[SELETOR GLOBAL] vela={candle_from}: nenhum candidato possui DIGITAL M5 SPT disponível; sem entrada.")
+        return
+
+    active_id, symbol, resultado = escolhido
+    log(
+        f"[SELETOR GLOBAL] MELHOR DIGITAL={symbol} {resultado.get('sinal')} | "
+        f"index={resultado['instrumento_digital_preselecionado'].get('instrument_index')}"
+    )
 
     # O dashboard só registra entrada depois que a Bullex CONFIRMAR a ordem.
     registrar_operacao_intravela(symbol, resultado)
