@@ -142,7 +142,7 @@ TELEGRAM_CHAT_ID = os.getenv(
     "TELEGRAM_CHAT_ID", ""
 ).strip()
 
-TIMEFRAME = "5min"
+TIMEFRAME = "15min"
 TIMEFRAME_TREND = "15min"
 
 TIMEZONE = "America/Sao_Paulo"
@@ -174,12 +174,12 @@ VALORES_ENTRADA = [5.00]
 VALOR_GALE = 6.00
 # Se a Bullex não devolver o payout no retorno da ordem, usa este valor apenas como fallback.
 BULLEX_PAYOUT_FALLBACK = float(os.getenv("BULLEX_PAYOUT_FALLBACK", "87").strip() or "87")
-EXPIRACAO_MINUTOS = 5
+EXPIRACAO_MINUTOS = 15
 # A antiga janela de 3 segundos foi removida.
 # Esta estratégia entra DURANTE a vela atual e expira no fechamento da MESMA vela.
-INTRAVELA_MIN_SEGUNDOS_DECORRIDOS = 2
-INTRAVELA_MAX_SEGUNDOS_DECORRIDOS = 8
-INTRAVELA_MIN_SEGUNDOS_RESTANTES = 35
+INTRAVELA_MIN_SEGUNDOS_DECORRIDOS = 20
+INTRAVELA_MAX_SEGUNDOS_DECORRIDOS = 600
+INTRAVELA_MIN_SEGUNDOS_RESTANTES = 90
 
 # Estratégia R17: somente suporte/resistência M5.
 # O nível precisa ter pelo menos 3 toques em velas M5 fechadas.
@@ -197,6 +197,19 @@ INTRAVELA_RETRACAO_MIN = 0.20
 INTRAVELA_RETRACAO_MAX = 0.68
 INTRAVELA_REJEICAO_ATR_MIN = 0.10
 INTRAVELA_PAVIO_MIN_FRACAO_MOVIMENTO = 0.10
+
+# R30 - M15: suporte/resistência + LTA/LTB + retração intravela, sem Martingale.
+SR_M15_LOOKBACK = 100
+SR_M15_PIVOT_JANELA = 2
+SR_M15_MIN_TOQUES = 3
+SR_M15_TOLERANCIA_ATR = 0.18
+M15_DISTANCIA_ABERTURA_ATR_MIN = 0.45
+M15_TOQUE_TOLERANCIA_ATR = 0.20
+M15_REJEICAO_ATR_MIN = 0.10
+M15_RETRACAO_MIN = 0.18
+M15_RETRACAO_MAX = 0.72
+M15_LINHA_TOLERANCIA_ATR = 0.22
+MARTINGALE_ATIVO = False
 
 UMA_OPERACAO_GLOBAL = True
 MAX_OPERACOES_POR_ATIVO = 1
@@ -898,17 +911,17 @@ def _armazenar_instrumentos_digitais(data):
 
 
 def _instrumento_digital_cache(active_id, sinal, candle_to):
-    """Localiza um contrato DIGITAL M5 REAL recebido da Bullex.
+    """Localiza um contrato DIGITAL M15 REAL recebido da Bullex.
 
     Prioriza o vencimento exato da vela. Se a Traderoom publicar o mesmo
-    contrato M5 com vencimento ligeiramente diferente, aceita somente um
-    vencimento FUTURO real, dentro de uma janela máxima de 5 minutos.
+    contrato M15 com vencimento ligeiramente diferente, aceita somente um
+    vencimento FUTURO real, dentro de uma janela máxima de 15 minutos.
     Nunca inventa instrument_id/index.
     """
     direction = _direcao_instrumento(sinal)
     active_id = int(active_id)
     candle_to = int(candle_to)
-    key = (active_id, candle_to, 300, direction)
+    key = (active_id, candle_to, 900, direction)
     item = _bullex_instrument_cache.get(key)
     if item:
         return item
@@ -916,13 +929,13 @@ def _instrumento_digital_cache(active_id, sinal, candle_to):
     server_ts, _ = _horario_servidor_atual()
     candidatos = []
     for (asset_id, expiration, period, direcao), inst in list(_bullex_instrument_cache.items()):
-        if asset_id != active_id or period != 300 or direcao != direction:
+        if asset_id != active_id or period != 900 or direcao != direction:
             continue
-        # Não aceita contrato já vencido e não pula mais de um ciclo M5.
+        # Não aceita contrato já vencido e não pula mais de um ciclo M15.
         if expiration <= int(server_ts):
             continue
         distancia = abs(int(expiration) - candle_to)
-        if distancia <= 300:
+        if distancia <= 900:
             candidatos.append((distancia, int(expiration), inst))
 
     if not candidatos:
@@ -961,7 +974,7 @@ def _solicitar_instrumentos_digitais(active_id, timeout=3.0):
 
 
 def _buscar_instrumento(active_id, sinal, ticker, candle_to, symbol=None):
-    """Obtém index + symbol SPT M5 diretamente do catálogo REAL da Bullex."""
+    """Obtém index + symbol SPT M15 diretamente do catálogo REAL da Bullex."""
     item = _instrumento_digital_cache(active_id, sinal, candle_to)
     if item:
         return item
@@ -977,7 +990,7 @@ def _buscar_instrumento(active_id, sinal, ticker, candle_to, symbol=None):
         ajuste = exp_real - int(candle_to)
         extra = f" | ajuste_exp={ajuste:+d}s" if ajuste else ""
         log(
-            f"[DIGITAL INSTRUMENT] {symbol or ticker}: {sinal} M5 REAL -> "
+            f"[DIGITAL INSTRUMENT] {symbol or ticker}: {sinal} M15 REAL -> "
             f"index={item['instrument_index']} id={item['instrument_id']} "
             f"expiration={exp_real}{extra}"
         )
@@ -991,7 +1004,7 @@ def _buscar_instrumento(active_id, sinal, ticker, candle_to, symbol=None):
             disponiveis.append(f"P{period}/EXP{expiration}/IDX{inst.get('instrument_index')}")
     resumo = ", ".join(disponiveis[:8]) if disponiveis else "nenhum SPT armazenado"
     log(
-        f"[DIGITAL INSTRUMENT] {symbol or ticker}: catálogo não trouxe SPT M5 utilizável "
+        f"[DIGITAL INSTRUMENT] {symbol or ticker}: catálogo não trouxe SPT M15 utilizável "
         f"asset_id={active_id} alvo={int(candle_to)} | disponíveis={resumo}; ordem não enviada."
     )
     return None
@@ -1211,7 +1224,7 @@ def executar_ordem_intravela(symbol, sinal, resultado, valor_override=None, tipo
         with _execucao_lock:
             if symbol in _operacoes_ativas_por_symbol:
                 _operacoes_ativas_por_symbol[symbol]["preco_entrada_estimado"] = float(resultado["preco"])
-                _operacoes_ativas_por_symbol[symbol]["estrategia"] = "AUTONOMO_KNN_M5"
+                _operacoes_ativas_por_symbol[symbol]["estrategia"] = resultado.get("estrategia", "M15_SR_LTA_LTB_RETRACAO")
                 _operacoes_ativas_por_symbol[symbol]["regime"] = resultado.get("regime", "AUTONOMO")
                 _operacoes_ativas_por_symbol[symbol]["tipo_entrada"] = tipo_entrada
 
@@ -1733,8 +1746,8 @@ def _on_bullex_message(ws, raw_message):
                 with _bullex_diag_lock:
                     _bullex_diag["stored"] += 1
 
-                # Estratégia única R13: observa a vela de 5M ainda aberta.
-                if int(size) == 300:
+                # Estratégia R30: observa a vela M15 ainda aberta.
+                if int(size) == 900:
                     threading.Thread(
                         target=_processar_sinal_intravela,
                         args=(active_id, dict(msg)),
@@ -3934,141 +3947,101 @@ def _autonomo_ciclos_reais(symbol, sinal):
     return wins,losses,n,taxa
 
 
-def _resultado_retracao_intravela(msg, active_id):
-    """Motor autônomo R1: aprende padrões do próprio histórico M5 do ativo.
+def _linha_tendencia_m15(fechadas, lado, atr15):
+    """Projeta LTA pelos 2 últimos pivôs de mínima ou LTB pelos 2 últimos pivôs de máxima."""
+    j = SR_M15_PIVOT_JANELA
+    pts=[]
+    for i in range(j, len(fechadas)-j):
+        if lado == "LTA":
+            v=float(fechadas[i]["low"])
+            if all(v <= float(fechadas[k]["low"]) for k in range(i-j,i+j+1) if k != i): pts.append((i,v))
+        else:
+            v=float(fechadas[i]["high"])
+            if all(v >= float(fechadas[k]["high"]) for k in range(i-j,i+j+1) if k != i): pts.append((i,v))
+    if len(pts)<2: return None
+    p1,p2=pts[-2],pts[-1]
+    if p2[0] == p1[0]: return None
+    slope=(p2[1]-p1[1])/(p2[0]-p1[0])
+    # LTA precisa subir; LTB precisa cair.
+    if lado == "LTA" and slope <= 0: return None
+    if lado == "LTB" and slope >= 0: return None
+    nivel=p2[1] + slope*(len(fechadas)-p2[0])
+    return {"nivel":float(nivel),"slope":float(slope),"toques":2,"timeframe":"M15","tipo":lado}
 
-    Não recebe uma regra CALL/PUT fixa. Para cada nova M5, compara o estado
-    recente com estados históricos semelhantes e observa o que aconteceu na
-    vela seguinte. Se não houver amostras ou vantagem suficiente, NÃO opera.
-    """
-    if not isinstance(msg, dict):
-        return None
+
+def _resultado_retracao_intravela(msg, active_id):
+    """R30: M15, suporte/resistência + LTA/LTB, entrada na retração e expiração na mesma vela."""
+    if not isinstance(msg,dict) or int(msg.get("size",900) or 900) != 900: return None
     try:
         abertura=float(msg['open']); preco=float(msg['close'])
-        candle_from=int(float(msg['from'])); candle_to=int(float(msg.get('to') or candle_from+300))
-    except Exception:
-        return None
+        maxima=float(msg.get('max',msg.get('high'))); minima=float(msg.get('min',msg.get('low')))
+        candle_from=int(float(msg['from'])); candle_to=int(float(msg.get('to') or candle_from+900))
+    except Exception: return None
     server_ts,_=_horario_servidor_atual()
     decorridos=max(0.0,server_ts-candle_from); restantes=max(0.0,candle_to-server_ts)
-    if decorridos < INTRAVELA_MIN_SEGUNDOS_DECORRIDOS or decorridos > INTRAVELA_MAX_SEGUNDOS_DECORRIDOS:
-        return None
-    if restantes < INTRAVELA_MIN_SEGUNDOS_RESTANTES:
-        return None
+    if decorridos < INTRAVELA_MIN_SEGUNDOS_DECORRIDOS or decorridos > INTRAVELA_MAX_SEGUNDOS_DECORRIDOS: return None
+    if restantes < INTRAVELA_MIN_SEGUNDOS_RESTANTES: return None
 
-    m5=_fechadas_antes(_candles_cache(active_id,300),candle_from,300)[-150:]
-    if len(m5) < AUTONOMO_MIN_AMOSTRAS + 24:
-        return None
-    atual=_autonomo_features(m5, len(m5)-1)
-    if atual is None:
-        return None
+    m15=_fechadas_antes(_candles_cache(active_id,900),candle_from,900)[-SR_M15_LOOKBACK:]
+    if len(m15)<45: return None
+    a=atr(m15,14)
+    if not a or a<=0: return None
+    c=closes(m15); e5,e13,e21=ema(c,5),ema(c,13),ema(c,21); rv=rsi(c,14); adx15=_adx_candles(m15,14)
+    if None in (e5,e13,e21,rv): return None
+    tendencia='ALTA' if e5>e13>e21 else 'BAIXA' if e5<e13<e21 else 'NEUTRA'
 
-    exemplos=[]
-    # R6: além da direção da primeira vela, guarda também o movimento da vela
-    # seguinte. Isso permite aprender quais contextos historicamente encerraram
-    # o ciclo em WIN na primeira entrada OU, se a primeira perdeu, no Gale 1.
-    for i in range(22, len(m5)-2):
-        feat=_autonomo_features(m5, i)
-        if feat is None: continue
-        entrada=float(m5[i]['close'])
-        saida1=float(m5[i+1]['close'])
-        saida2=float(m5[i+2]['close'])
-        if saida1 == entrada: continue
-        label='CALL' if saida1 > entrada else 'PUT'
-        exemplos.append((_autonomo_distancia(atual,feat),label,entrada,saida1,saida2))
-    if len(exemplos) < AUTONOMO_MIN_AMOSTRAS:
-        return None
-    exemplos.sort(key=lambda x:x[0])
-    vizinhos=exemplos[:min(AUTONOMO_K_VIZINHOS,len(exemplos))]
-    # Vizinhos mais próximos pesam mais; evita que um padrão distante domine.
-    call_w=put_w=0.0
-    for dist,label,entrada_hist,saida1_hist,saida2_hist in vizinhos:
-        peso=1.0/(0.10+dist)
-        if label=='CALL': call_w+=peso
-        else: put_w+=peso
-    total=call_w+put_w
-    if total<=0: return None
-    p_call=call_w/total; p_put=put_w/total
-    sinal='CALL' if p_call>=p_put else 'PUT'
-    confianca=max(p_call,p_put)
+    sup,res,_=_niveis_sr_m15(active_id)
+    lta=_linha_tendencia_m15(m15,'LTA',a); ltb=_linha_tendencia_m15(m15,'LTB',a)
+    candidatos=[]
+    for g in sup:
+        candidatos.append(('CALL','SUPORTE',float(g['nivel']),int(g.get('toques',0))))
+    for g in res:
+        candidatos.append(('PUT','RESISTENCIA',float(g['nivel']),int(g.get('toques',0))))
+    if lta: candidatos.append(('CALL','LTA',lta['nivel'],2))
+    if ltb: candidatos.append(('PUT','LTB',ltb['nivel'],2))
+    if not candidatos: return None
 
-    # Probabilidade histórica ponderada do CICLO: primeira entrada ou Gale 1.
-    ciclo_win_w=ciclo_total_w=0.0
-    ciclo_n=0
-    for dist,label,entrada_hist,saida1_hist,saida2_hist in vizinhos:
-        peso=1.0/(0.10+dist)
-        primeira_win = (saida1_hist > entrada_hist) if sinal == 'CALL' else (saida1_hist < entrada_hist)
-        if primeira_win:
-            ciclo_win=True
+    amplitude=max(maxima-minima,1e-12)
+    movimento_alta=maxima-abertura; movimento_baixa=abertura-minima
+    aprovados=[]
+    for sinal,tipo,nivel,toques in candidatos:
+        # Opera retração a favor da estrutura/tendência; neutro é aceito só em S/R forte.
+        if sinal=='CALL' and tendencia=='BAIXA': continue
+        if sinal=='PUT' and tendencia=='ALTA': continue
+        dist_abertura=abs(abertura-nivel)/a
+        if dist_abertura < M15_DISTANCIA_ABERTURA_ATR_MIN: continue
+        tol=a*(M15_LINHA_TOLERANCIA_ATR if tipo in ('LTA','LTB') else M15_TOQUE_TOLERANCIA_ATR)
+        tocou = minima <= nivel+tol if sinal=='CALL' else maxima >= nivel-tol
+        if not tocou: continue
+        if sinal=='CALL':
+            impulso=max(movimento_baixa,1e-12); rejeicao=preco-minima; retracao=rejeicao/impulso
+            if preco <= nivel-a*0.03: continue
         else:
-            # Aproxima o Gale entrando no início da vela seguinte pelo fechamento
-            # da primeira; compara o fechamento da segunda vela na mesma direção.
-            gale_win = (saida2_hist > saida1_hist) if sinal == 'CALL' else (saida2_hist < saida1_hist)
-            ciclo_win=gale_win
-        ciclo_total_w += peso
-        ciclo_n += 1
-        if ciclo_win:
-            ciclo_win_w += peso
-    ciclo_confianca=(ciclo_win_w/ciclo_total_w) if ciclo_total_w>0 else 0.0
-    if ciclo_n < AUTONOMO_CICLO_MIN_VIZINHOS or ciclo_confianca < AUTONOMO_CICLO_CONFIANCA_MIN:
-        return None
-
-    symbol_atual=_symbol_por_active_id(active_id)[1]
-    ajuste,amostras_online=_autonomo_ajuste_online(symbol_atual,sinal)
-
-    # R12: tendência M15 + força do movimento. Tendência contrária só bloqueia
-    # quando o ADX M15 confirma força; conflito fraco apenas reduz a confiança.
-    contexto_ok,motivo_contexto,ctx=_autonomo_contexto_m15_forca(active_id,candle_from,sinal)
-    if not contexto_ok:
-        log(f"[AUTONOMO][FILTRO CONTEXTO] {symbol_atual} {sinal}: {motivo_contexto}")
-        return None
-    penalidade=float(ctx.get("penalidade",0.0) or 0.0)
-    confianca_ajustada=max(0.0,min(1.0,confianca+ajuste-penalidade))
-
-    # R12: calibra a estimativa histórica de ciclo com os CICLOS REAIS do robô.
-    rw,rl,rn,rtaxa=_autonomo_ciclos_reais(symbol_atual,sinal)
-    ciclo_real_ajuste=0.0
-    if rn >= AUTONOMO_REAL_CICLOS_MIN and rtaxa is not None:
-        if rtaxa < AUTONOMO_REAL_CICLO_BLOQUEIO:
-            log(f"[AUTONOMO][NAO OPERAR REAL] {symbol_atual} {sinal}: ciclos reais {rw}/{rn} WIN ({rtaxa*100:.1f}%)")
-            return None
-        ciclo_real_ajuste=max(-AUTONOMO_REAL_AJUSTE_MAX,min(AUTONOMO_REAL_AJUSTE_MAX,(rtaxa-0.50)*0.30))
-        ciclo_confianca=max(0.0,min(1.0,ciclo_confianca+ciclo_real_ajuste))
-
-    margem=abs(p_call-p_put)
-    if confianca_ajustada < AUTONOMO_CONFIANCA_MIN or margem < AUTONOMO_MARGEM_MIN:
-        return None
-
-    permitir_adaptativo,motivo_adaptativo,diag_adaptativo=_autonomo_filtro_adaptativo(
-        symbol_atual,sinal,confianca_ajustada
-    )
-    if not permitir_adaptativo:
-        log(f"[AUTONOMO][NAO OPERAR] {motivo_adaptativo}")
-        return None
-
-    c=closes(m5); a=atr(m5,14); rv=rsi(c,14)
-    e5,e13,e21=ema(c,5),ema(c,13),ema(c,21)
-    tendencia='ALTA' if e5 and e13 and e21 and e5>e13>e21 else 'BAIXA' if e5 and e13 and e21 and e5<e13<e21 else 'NEUTRA'
-    score=round(confianca_ajustada*100,1)
+            impulso=max(movimento_alta,1e-12); rejeicao=maxima-preco; retracao=rejeicao/impulso
+            if preco >= nivel+a*0.03: continue
+        if rejeicao < a*M15_REJEICAO_ATR_MIN: continue
+        if not (M15_RETRACAO_MIN <= retracao <= M15_RETRACAO_MAX): continue
+        confluencia=0
+        for s2,t2,n2,_ in candidatos:
+            if s2==sinal and t2!=tipo and abs(n2-nivel)<=a*0.25: confluencia+=1
+        score=(toques if tipo in ('SUPORTE','RESISTENCIA') else 2) + confluencia*2 + (1 if tendencia!='NEUTRA' else 0) + (1 if adx15 and adx15>=18 else 0)
+        aprovados.append((score,sinal,tipo,nivel,toques,retracao,rejeicao,confluencia))
+    if not aprovados: return None
+    aprovados.sort(reverse=True,key=lambda x:x[0]); score,sinal,tipo,nivel,toques,retracao,rejeicao,confluencia=aprovados[0]
+    # confiança é um indicador interno de qualidade do setup, não probabilidade garantida.
+    confianca=min(0.90,0.58+0.035*score)
+    symbol=_symbol_por_active_id(active_id)[1]
+    log(f"[M15 RETRACAO] {symbol} {sinal} | {tipo}={nivel:.5f} toques={toques} | tendencia={tendencia} ADX={adx15 if adx15 is not None else 0:.1f} | retracao={retracao*100:.1f}% | confluencia={confluencia}")
     return {
-        'sinal':sinal,'score':score,
-        'score_call':round(p_call*100,1),'score_put':round(p_put*100,1),
-        'preco':preco,'vela':datetime.fromtimestamp(candle_from,TZ),
-        'estrategia':'AUTONOMO_KNN_M5','regime':tendencia,
-        'pullback':f'APRENDIZADO: {len(exemplos)} exemplos; {len(vizinhos)} vizinhos',
-        'rejeicao':f'confianca={confianca_ajustada*100:.1f}% margem={margem*100:.1f}%',
-        'lateral':'N/A','atr':a,'rsi':rv,'ema5':e5,'ema13':e13,'ema21':e21,
-        'tendencia_5m':tendencia,'tendencia_15m':ctx.get('t15','NEUTRA'),
-        'zona_fibonacci':'N/A','bloqueio':'SINAL_AUTONOMO',
-        'mensagem':f'{sinal} autonomo | sinal {confianca_ajustada*100:.1f}% | ciclo {ciclo_confianca*100:.1f}% | histórico {len(exemplos)} | online {amostras_online}',
-        'candle_from':candle_from,'candle_to':candle_to,
-        'segundos_decorridos':decorridos,'segundos_restantes':restantes,
-        'impulso':0.0,'retracao_ratio':0.0,'nivel_sr':None,'tipo_nivel':'MODELO_AUTONOMO',
-        'toques_nivel':0,'distancia_abertura_nivel':0.0,'adx5':ctx.get('adx5'),'adx15':ctx.get('adx15'),
-        'confianca':confianca_ajustada,'confianca_ciclo':ciclo_confianca,'amostras_ciclo':ciclo_n,'amostras_modelo':len(exemplos),
-        'vizinhos':len(vizinhos),'ajuste_online':ajuste,
-        'faixa_confianca':_autonomo_faixa_confianca(confianca_ajustada),
-        'adaptativo':diag_adaptativo,'filtro_adaptativo':motivo_adaptativo,
-        'ciclos_reais':rn,'taxa_ciclos_reais':rtaxa,'ajuste_ciclo_real':ciclo_real_ajuste,'filtro_contexto':motivo_contexto,
+      'sinal':sinal,'score':round(confianca*100,1),'score_call':round(confianca*100,1) if sinal=='CALL' else 0,'score_put':round(confianca*100,1) if sinal=='PUT' else 0,
+      'preco':preco,'vela':datetime.fromtimestamp(candle_from,TZ),'estrategia':'M15_SR_LTA_LTB_RETRACAO','regime':tendencia,
+      'pullback':f'RETRACAO {retracao*100:.1f}% EM {tipo}','rejeicao':f'REJEICAO {rejeicao/a:.2f} ATR','atr':a,'rsi':rv,
+      'ema5':e5,'ema13':e13,'ema21':e21,'tendencia_5m':'N/A','tendencia_15m':tendencia,'bloqueio':'SINAL_M15_RETRACAO',
+      'mensagem':f'{sinal} M15 | {tipo} + retração | confluência={confluencia} | qualidade={confianca*100:.1f}%',
+      'candle_from':candle_from,'candle_to':candle_to,'segundos_decorridos':decorridos,'segundos_restantes':restantes,
+      'impulso':impulso,'retracao_ratio':retracao,'nivel_sr':nivel,'tipo_nivel':tipo,'toques_nivel':toques,'distancia_abertura_nivel':dist_abertura,
+      'adx15':adx15,'confianca':confianca,'confianca_ciclo':confianca,'amostras_ciclo':0,'amostras_modelo':len(m15),'margem':0.0,
+      'ajuste_online':0.0,'faixa_confianca':'M15','adaptativo':{},'filtro_adaptativo':'N/A'
     }
 
 def _atualizar_dashboard_intravela(symbol, resultado):
@@ -4225,7 +4198,7 @@ def _ticker_por_symbol(symbol):
 
 
 def _r24_despachar_melhor(candle_from):
-    """Compara uma única vez os sinais OTC da abertura M5 e executa no máximo um."""
+    """Compara uma única vez os sinais OTC da vela M15 e executa no máximo um."""
     candle_from = int(candle_from)
 
     # Coleta ancorada na abertura da vela: todos os candidatos que surgirem
@@ -4272,19 +4245,19 @@ def _r24_despachar_melhor(candle_from):
             if not ticker:
                 log(f"[SELETOR GLOBAL] {symbol}: ticker não encontrado; pulando candidato.")
                 continue
-            candle_to = int(resultado.get("candle_from", candle_from)) + 300
+            candle_to = int(resultado.get("candle_from", candle_from)) + 900
             instrumento = _buscar_instrumento(
                 int(active_id), resultado.get("sinal"), ticker, candle_to, symbol
             )
             if not instrumento:
-                log(f"[SELETOR GLOBAL] {symbol}: sem DIGITAL M5 SPT; tentando próximo candidato.")
+                log(f"[SELETOR GLOBAL] {symbol}: sem DIGITAL M15 SPT; tentando próximo candidato.")
                 continue
             resultado["instrumento_digital_preselecionado"] = dict(instrumento)
             escolhido = (active_id, symbol, resultado)
             break
 
         if not escolhido:
-            log(f"[SELETOR GLOBAL] vela={candle_from}: nenhum candidato possui DIGITAL M5 SPT disponível; sem entrada.")
+            log(f"[SELETOR GLOBAL] vela={candle_from}: nenhum candidato possui DIGITAL M15 SPT disponível; sem entrada.")
             return
 
         active_id, symbol, resultado = escolhido
@@ -4393,7 +4366,7 @@ def _tentar_gale_na_proxima_vela(active_id, msg):
             "id": chave, "symbol": symbol, "mercado": _mercado_do_symbol(symbol),
             "sinal": gale["sinal"], "score": 0, "confianca": 0.0,
             "faixa_confianca": "GALE", "ajuste_online": 0.0, "adaptativo": {},
-            "estrategia": "AUTONOMO_KNN_M5", "regime": "GALE_OBRIGATORIO_APOS_LOSS",
+            "estrategia": resultado.get("estrategia", "M15_SR_LTA_LTB_RETRACAO"), "regime": "GALE_OBRIGATORIO_APOS_LOSS",
             "preco_sinal": preco, "vela_sinal": datetime.fromtimestamp(candle_from, TZ),
             "vela_entrada": datetime.fromtimestamp(candle_from, TZ),
             "vela_expiracao": datetime.fromtimestamp(candle_from, TZ),
@@ -4419,13 +4392,8 @@ def _processar_sinal_intravela(active_id, msg):
     if _status_bloqueio_ativo(symbol):
         return
 
-    # Se este ativo tem Gale pendente, ele tem prioridade e tenta o Gale obrigatório.
-    if _tentar_gale_na_proxima_vela(active_id, msg):
-        return
-
-    # Enquanto existir qualquer Gale pendente, nenhum outro ativo pode iniciar ciclo.
-    if _gales_pendentes:
-        return
+    # R30: Martingale desativado. Cada entrada M15 encerra em WIN/LOSS/DOJI.
+    _gales_pendentes.clear()
 
     # Apenas uma operação/ciclo por vez no robô inteiro.
     with _execucao_lock:
@@ -4445,7 +4413,7 @@ def _processar_sinal_intravela(active_id, msg):
             return
         _intravela_velas_tentadas.add(candle_key)
 
-    log(f"[AUTONOMO CANDIDATO] {symbol} -> {resultado['sinal']} | confiança={resultado.get('confianca',0)*100:.1f}% | ciclo={resultado.get('confianca_ciclo',0)*100:.1f}% | amostras={resultado.get('amostras_modelo',0)}")
+    log(f"[M15 CANDIDATO] {symbol} -> {resultado['sinal']} | qualidade={resultado.get('confianca',0)*100:.1f}% | setup={resultado.get('tipo_nivel')} | histórico={resultado.get('amostras_modelo',0)}")
 
     candle_from = int(resultado['candle_from'])
     with _r24_candidatos_lock:
@@ -4811,7 +4779,7 @@ def registrar_operacao_intravela(symbol, resultado):
         "faixa_confianca": resultado.get("faixa_confianca") or _autonomo_faixa_confianca(resultado.get("confianca", 0.0)),
         "ajuste_online": resultado.get("ajuste_online", 0.0),
         "adaptativo": resultado.get("adaptativo", {}),
-        "estrategia": "AUTONOMO_KNN_M5",
+        "estrategia": resultado.get("estrategia", "M15_SR_LTA_LTB_RETRACAO"),
         "regime": resultado.get("regime", "AUTONOMO"),
         "preco_sinal": float(resultado["preco"]),
         "vela_sinal": candle_dt,
@@ -4867,7 +4835,7 @@ def avaliar_operacao(symbol, candles):
         if dt != alvo_dt:
             continue
 
-        if dt + timedelta(minutes=5) > agora:
+        if dt + timedelta(minutes=EXPIRACAO_MINUTOS) > agora:
             return
 
         info = candle_info(candle)
@@ -4884,15 +4852,7 @@ def avaliar_operacao(symbol, candles):
 
         operacao["resultado"] = resultado
         operacao["finalizado_em"] = agora
-        # Apenas a primeira entrada gera Gale 1. Gale nunca gera Gale 2.
-        if resultado == "LOSS" and operacao.get("tipo_entrada", "PRIMEIRA") != "GALE":
-            _gales_pendentes[symbol] = {
-                "sinal": operacao["sinal"],
-                "candle_from_alvo": int(operacao["candle_to"]),
-                "entrada_anterior": entrada,
-                "tentado": False,
-            }
-            log(f"[GALE] {symbol}: LOSS na primeira entrada; Gale 1 R${_valor_gale_atual():.2f} programado para a próxima vela, mesma direção {operacao['sinal']}.")
+        # R30: sem Martingale; LOSS encerra o ciclo imediatamente.
         payout = float(operacao.get("payout_percent", BULLEX_PAYOUT_FALLBACK) or BULLEX_PAYOUT_FALLBACK)
         valor_op = float(operacao.get("valor", 0.0) or 0.0)
         operacao["lucro_operacao"] = round(valor_op * payout / 100.0 if resultado == "WIN" else -valor_op if resultado == "LOSS" else 0.0, 2)
@@ -4939,14 +4899,14 @@ def enviar_resultado_telegram(operacao, estatisticas):
             "🟢 WIN ✅\n\n"
             f"💱 {symbol}\n"
             f"📍 {direcao}\n\n"
-            "🏆 WIN DE PRIMEIRA!"
+            "🏆 WIN M15!"
         )
     elif resultado == "LOSS" and tipo != "GALE":
         texto = (
             "🔴 LOSS ❌\n\n"
             f"💱 {symbol}\n"
             f"📍 {direcao}\n\n"
-            "🔄 Vamos para o Gale 1"
+            "⛔ Operação encerrada em LOSS"
         )
     elif resultado == "WIN" and tipo == "GALE":
         texto = (
@@ -4991,7 +4951,9 @@ def _ciclos_telegram_desde(inicio, fim):
                 ciclos_loss += 1
         elif resultado == "WIN":
             primeira_wins += 1
-        # LOSS da primeira não encerra o ciclo e não entra na parcial.
+        elif resultado == "LOSS":
+            ciclos_loss += 1
+        # R30: sem Gale; WIN/LOSS da primeira encerra o ciclo.
 
     total = primeira_wins + gale_wins + ciclos_loss
     wins = primeira_wins + gale_wins
@@ -5009,9 +4971,8 @@ def loop_parcial_horaria_telegram():
 
         texto = (
             "📊 PARCIAL — ÚLTIMA HORA\n\n"
-            f"🟢 WIN de primeira: {primeira_wins}\n"
-            f"🔄 WIN no Gale 1: {gale_wins}\n"
-            f"🔴 Ciclos LOSS: {ciclos_loss}\n\n"
+            f"🟢 WIN M15: {primeira_wins}\n"
+            f"🔴 LOSS M15: {ciclos_loss}\n\n"
             f"📈 Total: {total} ciclos\n"
             f"🏆 {wins} WIN | {ciclos_loss} LOSS\n"
             f"🎯 Assertividade: {taxa:.1f}%\n\n"
@@ -5059,7 +5020,7 @@ def finalizar_operacoes_vencidas_antes_da_leitura():
 # ============================================================
 
 def processar_ativo(chave, symbol, executar_sinal=False):
-    """Na R22 o loop de 5 minutos mantém histórico e finaliza operações.
+    """Na R22 o loop mantém histórico M15 e finaliza operações.
 
     Ele apenas mantém histórico atualizado e finaliza operações.
     Os sinais surgem exclusivamente do candle-generated da vela corrente.
@@ -5082,7 +5043,7 @@ def processar_ativo(chave, symbol, executar_sinal=False):
             estado["atualidade_min"] = f"{idade:.1f} min" if idade is not None else "-"
             if estado.get("sinal") not in ("CALL", "PUT"):
                 estado["sinal"] = "AGUARDAR"
-                estado["mensagem"] = "Monitorando tendência M15 + pullback M5 nos ativos OTC."
+                estado["mensagem"] = "Monitorando M15: suporte/resistência + LTA/LTB + retração, sem Gale."
         return None
 
     except Exception as e:
