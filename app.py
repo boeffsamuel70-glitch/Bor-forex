@@ -119,7 +119,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OTC-AUTONOMO-KNN-R32-M15-2OPS-DISTINCT-20260918"
+BULLEX_DIAGNOSTIC_VERSION = "OTC-AUTONOMO-KNN-R34-M15-DASH-CANDLE-20260918"
 
 _bullex_diag = {
     "messages": 0,
@@ -5096,6 +5096,19 @@ def processar_ativo(chave, symbol, executar_sinal=False):
         if ultimo is not None:
             estado["ativo"] = symbol
             estado["preco"] = f"{float(ultimo['close']):.5f}"
+
+            # R34: o ciclo de manutenção também precisa informar ao dashboard
+            # qual vela M15 acabou de ser processada. Antes este campo só era
+            # preenchido quando surgia um setup aprovado, por isso permanecia "-".
+            dt_ultima = ultimo.get("_dt")
+            if not isinstance(dt_ultima, datetime):
+                dt_ultima = parse_datetime_candle(ultimo.get("datetime"))
+            estado["vela"] = (
+                dt_ultima.strftime("%Y-%m-%d %H:%M:%S BRT")
+                if isinstance(dt_ultima, datetime)
+                else "-"
+            )
+
             estado["atualizado"] = agora_brt().strftime("%H:%M:%S BRT")
             estado["atualidade_min"] = f"{idade:.1f} min" if idade is not None else "-"
             if estado.get("sinal") not in ("CALL", "PUT"):
