@@ -119,7 +119,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OTC-AUTONOMO-KNN-R12-SR-M15-FORCA-REAL-20260917"
+BULLEX_DIAGNOSTIC_VERSION = "OTC-AUTONOMO-KNN-R31-M15-2OPS-20260918"
 
 _bullex_diag = {
     "messages": 0,
@@ -211,7 +211,7 @@ M15_RETRACAO_MAX = 0.72
 M15_LINHA_TOLERANCIA_ATR = 0.22
 MARTINGALE_ATIVO = False
 
-UMA_OPERACAO_GLOBAL = True
+MAX_OPERACOES_GLOBAIS = 2
 MAX_OPERACOES_POR_ATIVO = 1
 AUTONOMO_MIN_AMOSTRAS = 45
 AUTONOMO_K_VIZINHOS = 17
@@ -333,6 +333,17 @@ _operacao_global_ativa = None
 _operacao_global_em_envIO_LEGACY = False
 _operacoes_ativas_por_symbol = {}
 _operacoes_em_envio = set()
+
+def _qtd_operacoes_globais_em_andamento():
+    """Conta símbolos únicos ativos, em envio ou aguardando resultado."""
+    return len(
+        set(_operacoes_ativas_por_symbol.keys())
+        | set(_operacoes_em_envio)
+        | set(_operacoes_pendentes.keys())
+    )
+
+def _ha_vaga_operacao_global():
+    return _qtd_operacoes_globais_em_andamento() < int(MAX_OPERACOES_GLOBAIS)
 _gales_pendentes = {}  # symbol -> dados do Gale 1 para a próxima vela M5
 _bloqueios_por_symbol = {}  # symbol -> {ate_ts, motivo, sequencia}
 _sequencia_ciclos_loss = {}  # symbol -> ciclos completos perdidos em sequência
@@ -1072,10 +1083,11 @@ def executar_ordem_intravela(symbol, sinal, resultado, valor_override=None, tipo
         if symbol in _operacoes_ativas_por_symbol or symbol in _operacoes_em_envio or symbol in _operacoes_pendentes:
             log(f"[AUTONOMO] {symbol}: já existe operação deste ativo ativa/em envio.")
             return "BLOQUEADA_ATIVO"
-        if UMA_OPERACAO_GLOBAL and (
-            _operacoes_ativas_por_symbol or _operacoes_em_envio or _operacoes_pendentes
-        ):
-            log(f"[AUTONOMO GLOBAL] {symbol}: outra operação já está ativa/em envio; entrada ignorada.")
+        if not _ha_vaga_operacao_global():
+            log(
+                f"[AUTONOMO GLOBAL] {symbol}: limite de {MAX_OPERACOES_GLOBAIS} "
+                f"operações simultâneas atingido; entrada ignorada."
+            )
             return "BLOQUEADA_GLOBAL"
         _operacoes_em_envio.add(symbol)
 
@@ -4210,7 +4222,7 @@ def _ticker_por_symbol(symbol):
 
 
 def _r24_despachar_melhor(candle_from):
-    """Compara uma única vez os sinais OTC da vela M15 e executa no máximo um."""
+    """Compara os sinais OTC da vela M15 e executa até as vagas globais disponíveis."""
     candle_from = int(candle_from)
 
     # Coleta ancorada na abertura da vela: todos os candidatos que surgirem
@@ -4233,8 +4245,12 @@ def _r24_despachar_melhor(candle_from):
             return
 
         with _execucao_lock:
-            if _operacoes_ativas_por_symbol or _operacoes_em_envio or _operacoes_pendentes:
-                log(f"[SELETOR GLOBAL] vela={candle_from}: candidatos ignorados; já existe uma operação ativa/em envio.")
+            vagas = max(0, int(MAX_OPERACOES_GLOBAIS) - _qtd_operacoes_globais_em_andamento())
+            if vagas <= 0:
+                log(
+                    f"[SELETOR GLOBAL] vela={candle_from}: candidatos ignorados; "
+                    f"limite de {MAX_OPERACOES_GLOBAIS} operações simultâneas atingido."
+                )
                 return
 
         candidatos.sort(key=lambda x: _r24_chave_classificacao(x[2]), reverse=True)
@@ -4244,14 +4260,11 @@ def _r24_despachar_melhor(candle_from):
         )
         log(f"[SELETOR GLOBAL] candidatos={ranking}")
 
-        escolhido = None
+        escolhidos = []
         for active_id, symbol, resultado in candidatos:
-            # Se outra rotina abriu uma ordem enquanto consultávamos contratos,
-            # encerra esta seleção sem continuar testando candidatos.
             with _execucao_lock:
-                if _operacoes_ativas_por_symbol or _operacoes_em_envio or _operacoes_pendentes:
-                    log(f"[SELETOR GLOBAL] vela={candle_from}: operação já iniciada; seleção encerrada.")
-                    return
+                if not _ha_vaga_operacao_global() or len(escolhidos) >= vagas:
+                    break
 
             ticker = _ticker_por_symbol(symbol)
             if not ticker:
@@ -4265,19 +4278,18 @@ def _r24_despachar_melhor(candle_from):
                 log(f"[SELETOR GLOBAL] {symbol}: sem DIGITAL M15 SPT; tentando próximo candidato.")
                 continue
             resultado["instrumento_digital_preselecionado"] = dict(instrumento)
-            escolhido = (active_id, symbol, resultado)
-            break
+            escolhidos.append((active_id, symbol, resultado))
 
-        if not escolhido:
+        if not escolhidos:
             log(f"[SELETOR GLOBAL] vela={candle_from}: nenhum candidato possui DIGITAL M15 SPT disponível; sem entrada.")
             return
 
-        active_id, symbol, resultado = escolhido
-        log(
-            f"[SELETOR GLOBAL] MELHOR DIGITAL={symbol} {resultado.get('sinal')} | "
-            f"index={resultado['instrumento_digital_preselecionado'].get('instrument_index')}"
-        )
-        registrar_operacao_intravela(symbol, resultado)
+        for posicao, (active_id, symbol, resultado) in enumerate(escolhidos, start=1):
+            log(
+                f"[SELETOR GLOBAL] ESCOLHIDO {posicao}/{len(escolhidos)}={symbol} {resultado.get('sinal')} | "
+                f"index={resultado['instrumento_digital_preselecionado'].get('instrument_index')}"
+            )
+            registrar_operacao_intravela(symbol, resultado)
 
     finally:
         with _r24_candidatos_lock:
@@ -4407,11 +4419,10 @@ def _processar_sinal_intravela(active_id, msg):
     # R30: Martingale desativado. Cada entrada M15 encerra em WIN/LOSS/DOJI.
     _gales_pendentes.clear()
 
-    # Apenas uma operação/ciclo por vez no robô inteiro.
+    # R31: permite até 2 operações simultâneas no robô inteiro,
+    # mantendo no máximo 1 operação por ativo.
     with _execucao_lock:
-        if UMA_OPERACAO_GLOBAL and (
-            _operacoes_ativas_por_symbol or _operacoes_em_envio or _operacoes_pendentes
-        ):
+        if not _ha_vaga_operacao_global():
             return
 
     if not dentro_do_horario() or not _historico_pronto_event.is_set():
