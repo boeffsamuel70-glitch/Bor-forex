@@ -96,7 +96,7 @@ _bullex_assets_source = "DIGITAL_OTC_DYNAMIC_ALL"
 _bullex_assets_ready_event = threading.Event()
 _bullex_assets_init_lock = threading.Lock()
 
-_BULLEX_CANDLE_SIZES = {"5min": 300, "15min": 900}
+_BULLEX_CANDLE_SIZES = {"1min": 60, "5min": 300, "15min": 900}
 
 _bullex_ws = None
 _bullex_ws_lock = threading.RLock()
@@ -119,7 +119,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OTC-M1-R39-RADAR-AO-VIVO-20260918"
+BULLEX_DIAGNOSTIC_VERSION = "OTC-M1-R40-RADAR-AO-VIVO-CORRIGIDO-20260918"
 
 _bullex_diag = {
     "messages": 0,
@@ -1785,7 +1785,7 @@ def _on_bullex_message(ws, raw_message):
                     _bullex_diag["stored"] += 1
 
                 # Estratégia R30: observa a vela M1 ainda aberta.
-                if int(size) == 900:
+                if int(size) == 60:
                     threading.Thread(
                         target=_processar_sinal_intravela,
                         args=(active_id, dict(msg)),
@@ -2488,7 +2488,7 @@ def _assinar_candles_mercado_aberto():
 
     for config in configs:
         active_id = int(config["active_id"])
-        for size, rotulo in ((300, "M5"), (900, "M15")):
+        for size, rotulo in ((60, "M1"), (300, "M5"), (900, "M15")):
             chave = (active_id, size)
             if chave in assinaturas:
                 continue
@@ -2894,9 +2894,9 @@ def _contar_fechadas_cache(active_id, size):
 
 
 def _historico_m15_pronto_ativo(active_id, minimo=55):
-    """Retorna True quando este ativo, individualmente, já tem M15 suficiente."""
+    """Compatibilidade R40: retorna True quando o ativo já tem M1 suficiente."""
     try:
-        return len(somente_velas_fechadas(_candles_cache(int(active_id), 60), 15)) >= int(minimo)
+        return len(somente_velas_fechadas(_candles_cache(int(active_id), 60), 1)) >= int(minimo)
     except Exception:
         return False
 
@@ -2941,7 +2941,7 @@ def _precarregar_historico_r22(forcar=False):
             except Exception as e:
                 erro = str(e)
 
-            m15 = len(somente_velas_fechadas(_candles_cache(active_id, 60), 15))
+            m15 = len(somente_velas_fechadas(_candles_cache(active_id, 60), 1))
             ok = m15 >= 55
             if ok:
                 qtd_prontos += 1
@@ -4021,18 +4021,18 @@ def _linha_tendencia_m15(fechadas, lado, atr15):
 
 def _resultado_retracao_intravela(msg, active_id):
     """R30: M15, suporte/resistência + LTA/LTB, entrada na retração e expiração na mesma vela."""
-    if not isinstance(msg,dict) or int(msg.get("size",900) or 900) != 900: return None
+    if not isinstance(msg,dict) or int(msg.get("size",60) or 60) != 60: return None
     try:
         abertura=float(msg['open']); preco=float(msg['close'])
         maxima=float(msg.get('max',msg.get('high'))); minima=float(msg.get('min',msg.get('low')))
-        candle_from=int(float(msg['from'])); candle_to=int(float(msg.get('to') or candle_from+900))
+        candle_from=int(float(msg['from'])); candle_to=int(float(msg.get('to') or candle_from+60))
     except Exception: return None
     server_ts,_=_horario_servidor_atual()
     decorridos=max(0.0,server_ts-candle_from); restantes=max(0.0,candle_to-server_ts)
     if decorridos < INTRAVELA_MIN_SEGUNDOS_DECORRIDOS or decorridos > INTRAVELA_MAX_SEGUNDOS_DECORRIDOS: return None
     if restantes < INTRAVELA_MIN_SEGUNDOS_RESTANTES: return None
 
-    m15=_fechadas_antes(_candles_cache(active_id,900),candle_from,900)[-SR_M15_LOOKBACK:]
+    m15=_fechadas_antes(_candles_cache(active_id,60),candle_from,60)[-SR_M15_LOOKBACK:]
     if len(m15)<45: return None
     a=atr(m15,14)
     if not a or a<=0: return None
@@ -4086,12 +4086,12 @@ def _resultado_retracao_intravela(msg, active_id):
       'sinal':sinal,'score':round(confianca*100,1),'score_call':round(confianca*100,1) if sinal=='CALL' else 0,'score_put':round(confianca*100,1) if sinal=='PUT' else 0,
       'preco':preco,'vela':datetime.fromtimestamp(candle_from,TZ),'estrategia':'M1_SR_LTA_LTB_RETRACAO','regime':tendencia,
       'pullback':f'RETRACAO {retracao*100:.1f}% EM {tipo}','rejeicao':f'REJEICAO {rejeicao/a:.2f} ATR','atr':a,'rsi':rv,
-      'ema5':e5,'ema13':e13,'ema21':e21,'tendencia_5m':'N/A','tendencia_15m':tendencia,'bloqueio':'SINAL_M15_RETRACAO',
-      'mensagem':f'{sinal} M15 | {tipo} + retração | confluência={confluencia} | qualidade={confianca*100:.1f}%',
+      'ema5':e5,'ema13':e13,'ema21':e21,'tendencia_5m':'N/A','tendencia_15m':tendencia,'bloqueio':'SINAL_M1_RETRACAO',
+      'mensagem':f'{sinal} M1 | {tipo} + retração | confluência={confluencia} | qualidade={confianca*100:.1f}%',
       'candle_from':candle_from,'candle_to':candle_to,'segundos_decorridos':decorridos,'segundos_restantes':restantes,
       'impulso':impulso,'retracao_ratio':retracao,'nivel_sr':nivel,'tipo_nivel':tipo,'toques_nivel':toques,'distancia_abertura_nivel':dist_abertura,
       'adx15':adx15,'confianca':confianca,'confianca_ciclo':confianca,'amostras_ciclo':0,'amostras_modelo':len(m15),'margem':0.0,
-      'ajuste_online':0.0,'faixa_confianca':'M15','adaptativo':{},'filtro_adaptativo':'N/A'
+      'ajuste_online':0.0,'faixa_confianca':'M1','adaptativo':{},'filtro_adaptativo':'N/A'
     }
 
 def _atualizar_dashboard_intravela(symbol, resultado):
@@ -5995,82 +5995,82 @@ setTimeout(function(){ location.reload(); }, 1000);
 """
 
 
+
+# R40_MANUAL_FORCE: este app é radar manual; não envia ordens automaticamente.
+BULLEX_AUTO_TRADE = False
+
 # ============================================================
 # ROTAS
 # ============================================================
 
 
 def _radar_m1_ao_vivo():
-    """Retorna até 6 ativos mais próximos de uma entrada M1 para o painel manual."""
+    """R40: até 6 ativos OTC mais próximos da entrada, usando candles M1 reais do WS."""
     itens = []
     agora, _ = _horario_servidor_atual()
-    candle_from = int(agora // 60) * 60
-    restantes = max(0, int(candle_from + 60 - agora))
+    candle_from_atual = int(agora // 60) * 60
+    restantes = max(0, int(candle_from_atual + 60 - agora))
 
-    ativos_iter = []
-    try:
-        ativos_iter = list(ATIVOS.items())
-    except Exception:
+    # ATIVO_BULLEX é atualizado pela descoberta dinâmica da Traderoom.
+    with _bullex_assets_lock:
+        configs = [dict(v) for v in ATIVO_BULLEX.values() if isinstance(v, dict)]
+
+    for cfg in configs:
         try:
-            ativos_iter = [(str(k), v) for k, v in ativos_otc.items()]
-        except Exception:
-            ativos_iter = []
-
-    for codigo, cfg in ativos_iter:
-        try:
-            if isinstance(cfg, dict):
-                aid = cfg.get("active_id") or cfg.get("id")
-                simbolo = cfg.get("symbol") or cfg.get("ticker") or str(codigo)
-            else:
-                aid = cfg
-                simbolo = str(codigo)
-            if aid is None:
-                continue
-
-            candles = _candles_cache(int(aid), 60)
+            aid = int(cfg.get("active_id"))
+            simbolo = cfg.get("symbol") or cfg.get("ticker") or str(aid)
+            candles = _candles_cache(aid, 60)
             if not candles or len(candles) < 25:
                 continue
 
-            # Usa o próprio analisador de retração da estratégia.
-            resultado = None
-            try:
-                resultado = _resultado_retracao_intravela(int(aid), simbolo, candles)
-            except TypeError:
+            # Localiza a vela M1 corrente recebida pelo candle-generated.
+            corrente = None
+            for c in reversed(candles):
                 try:
-                    resultado = _resultado_retracao_intravela(int(aid), candles)
+                    cf = int(float(c.get("from", c.get("at", c.get("timestamp", 0))) or 0))
                 except Exception:
-                    resultado = None
-            except Exception:
-                resultado = None
+                    cf = 0
+                if cf == candle_from_atual:
+                    corrente = dict(c)
+                    break
+            if corrente is None:
+                corrente = dict(candles[-1])
 
-            ultimo = candles[-1]
-            preco = float(ultimo.get("close", ultimo.get("price", 0)) or 0)
+            corrente["active_id"] = aid
+            corrente["size"] = 60
+            if "from" not in corrente:
+                corrente["from"] = candle_from_atual
+            if "to" not in corrente:
+                corrente["to"] = int(corrente["from"]) + 60
+
+            preco = float(corrente.get("close", corrente.get("price", 0)) or 0)
+            resultado = _resultado_retracao_intravela(corrente, aid)
 
             direcao = None
             confianca = 0.0
             detalhe = ""
             if isinstance(resultado, dict):
-                direcao = resultado.get("sinal") or resultado.get("direcao")
-                confianca = float(resultado.get("confianca", resultado.get("confidence", 0)) or 0)
-                detalhe = str(resultado.get("motivo") or resultado.get("tipo") or resultado.get("estrategia") or "")
-            elif isinstance(resultado, (tuple, list)) and resultado:
-                direcao = resultado[0] if len(resultado) > 0 else None
-                try:
-                    confianca = float(resultado[1]) if len(resultado) > 1 else 0.0
-                except Exception:
-                    confianca = 0.0
+                direcao = resultado.get("sinal")
+                confianca = float(resultado.get("confianca", 0) or 0)
+                detalhe = str(resultado.get("pullback") or resultado.get("estrategia") or "")
 
-            # Quando ainda não há setup completo, calcula um progresso visual conservador
-            # pela posição da vela atual em relação à sua amplitude recente.
+            # Progresso visual NÃO é probabilidade de vitória.
+            # Mede proximidade do preço a um extremo da faixa recente enquanto
+            # o setup completo ainda não foi confirmado.
             if confianca <= 0:
                 recentes = candles[-20:]
-                highs = [float(c.get("high", 0) or 0) for c in recentes]
-                lows = [float(c.get("low", 0) or 0) for c in recentes]
-                hi, lo = max(highs), min(lows)
-                amplitude = max(hi - lo, 1e-12)
-                pos = (preco - lo) / amplitude
-                proximidade_extremo = max(pos, 1.0 - pos)
-                confianca = min(0.79, max(0.20, proximidade_extremo * 0.79))
+                highs = [float(c.get("high", c.get("max", 0)) or 0) for c in recentes]
+                lows = [float(c.get("low", c.get("min", 0)) or 0) for c in recentes]
+                highs = [v for v in highs if v > 0]
+                lows = [v for v in lows if v > 0]
+                if highs and lows and preco > 0:
+                    hi, lo = max(highs), min(lows)
+                    amplitude = max(hi - lo, 1e-12)
+                    pos = max(0.0, min(1.0, (preco - lo) / amplitude))
+                    proximidade_extremo = max(pos, 1.0 - pos)
+                    confianca = min(0.79, max(0.20, proximidade_extremo * 0.79))
+                else:
+                    confianca = 0.20
 
             pct = int(round(confianca * 100 if confianca <= 1 else confianca))
             pct = max(0, min(100, pct))
@@ -6087,7 +6087,7 @@ def _radar_m1_ao_vivo():
 
             itens.append({
                 "ativo": simbolo,
-                "active_id": int(aid),
+                "active_id": aid,
                 "preco": preco,
                 "progresso": pct,
                 "status": status,
@@ -6095,10 +6095,17 @@ def _radar_m1_ao_vivo():
                 "restantes": restantes,
                 "detalhe": detalhe,
             })
-        except Exception:
+        except Exception as e:
+            log(f"[RADAR M1] ativo ignorado: {e}")
             continue
 
-    itens.sort(key=lambda x: (1 if x["status"] == "ENTRAR AGORA" else 0, x["progresso"]), reverse=True)
+    itens.sort(
+        key=lambda x: (
+            1 if x["status"] == "ENTRAR AGORA" else 0,
+            x["progresso"]
+        ),
+        reverse=True
+    )
     return itens[:6]
 
 
@@ -6110,6 +6117,7 @@ def radar_m1():
         "modo": "MANUAL",
         "atualizacao_ms": 1000,
         "ativos": _radar_m1_ao_vivo(),
+        "candles_m1_armazenados": sum(len(_candles_cache(int(v.get("active_id")), 60)) for v in ATIVO_BULLEX.values() if isinstance(v, dict) and v.get("active_id") is not None),
     })
 
 
