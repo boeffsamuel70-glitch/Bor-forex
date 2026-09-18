@@ -2855,11 +2855,21 @@ def _contar_fechadas_cache(active_id, size):
     return len(somente_velas_fechadas(_candidatos_candles_cache(active_id, size), segundos // 60))
 
 
-def _precarregar_historico_r22(forcar=False):
-    """Carrega histórico recente M5 e M15 de TODOS os ativos antes de liberar sinais.
+def _historico_m15_pronto_ativo(active_id, minimo=55):
+    """Retorna True quando este ativo, individualmente, já tem M15 suficiente."""
+    try:
+        return len(somente_velas_fechadas(_candles_cache(int(active_id), 900), 15)) >= int(minimo)
+    except Exception:
+        return False
 
-    A estratégia exige pelo menos 55 velas fechadas de cada timeframe. O evento
-    global só é liberado quando todos os ativos mapeados atendem esse mínimo.
+
+def _precarregar_historico_r22(forcar=False):
+    """R30 M15: carrega M15 por ativo sem travar o robô inteiro por um ativo atrasado.
+
+    A estratégia operacional é M15. Cada ativo fica apto individualmente quando
+    possui pelo menos 55 velas M15 fechadas. O evento global significa que há
+    pelo menos um ativo pronto para análise; ativos ainda incompletos continuam
+    aguardando sem bloquear os demais.
     """
     global _historico_preload_ultima_tentativa
 
@@ -2870,44 +2880,43 @@ def _precarregar_historico_r22(forcar=False):
         return _historico_pronto_event.is_set()
 
     try:
-        _historico_pronto_event.clear()
         _historico_preload_ultima_tentativa = agora_brt().isoformat()
 
         with _bullex_assets_lock:
             itens = [(codigo, dict(cfg)) for codigo, cfg in ATIVO_BULLEX.items()]
 
         if not itens:
-            log("[R22 PRELOAD] Nenhum ativo mapeado ainda.")
+            _historico_pronto_event.clear()
+            log("[R30 PRELOAD M15] Nenhum ativo mapeado ainda.")
             return False
 
-        log(f"[R22 PRELOAD] Iniciando M5+M15 para {len(itens)} ativo(s).")
-        todos_ok = True
+        log(f"[R30 PRELOAD M15] Iniciando M15 para {len(itens)} ativo(s).")
         status_local = {}
+        qtd_prontos = 0
 
         for codigo, cfg in itens:
             symbol = cfg.get("symbol")
             active_id = int(cfg.get("active_id"))
             erro = None
             try:
-                # O feed M5/M15 já está assinado. obter_candles usa o último ID
-                # recebido para pedir histórico recente com only_closed=True.
-                obter_candles(symbol, TIMEFRAME, max(OUTPUTSIZE, 90))
                 obter_candles(symbol, TIMEFRAME_TREND, max(OUTPUTSIZE_15M, 90))
             except Exception as e:
                 erro = str(e)
 
-            m5 = len(somente_velas_fechadas(_candles_cache(active_id, 300), 5))
             m15 = len(somente_velas_fechadas(_candles_cache(active_id, 900), 15))
-            ok = m5 >= 55 and m15 >= 55 and erro is None
-            if not ok:
-                todos_ok = False
+            ok = m15 >= 55
+            if ok:
+                qtd_prontos += 1
 
             status_local[codigo] = {
-                "symbol": symbol, "active_id": active_id,
-                "m5": m5, "m15": m15, "pronto": ok, "erro": erro,
+                "symbol": symbol,
+                "active_id": active_id,
+                "m15": m15,
+                "pronto": ok,
+                "erro": erro,
             }
             log(
-                f"[R22 PRELOAD] {symbol} | M5={m5} M15={m15} | "
+                f"[R30 PRELOAD M15] {symbol} | M15={m15} | "
                 f"status={'PRONTO' if ok else 'AGUARDANDO'}"
                 + (f" | erro={erro}" if erro else "")
             )
@@ -2915,16 +2924,19 @@ def _precarregar_historico_r22(forcar=False):
         _historico_preload_status.clear()
         _historico_preload_status.update(status_local)
 
-        if todos_ok:
+        if qtd_prontos > 0:
             _historico_pronto_event.set()
-            log("[R22 PRELOAD] CONCLUÍDO: todos os ativos têm M5+M15 suficiente. ENTRADAS LIBERADAS.")
+            log(
+                f"[R30 PRELOAD M15] LIBERADO: {qtd_prontos}/{len(itens)} ativo(s) "
+                "com M15 suficiente. Ativos incompletos não bloqueiam os demais."
+            )
             return True
 
-        log("[R22 PRELOAD] INCOMPLETO: entradas continuam BLOQUEADAS até todos os ativos ficarem prontos.")
+        _historico_pronto_event.clear()
+        log("[R30 PRELOAD M15] AGUARDANDO: nenhum ativo possui M15 suficiente ainda.")
         return False
     finally:
         _historico_preload_lock.release()
-
 
 
 # ============================================================
@@ -4404,6 +4416,11 @@ def _processar_sinal_intravela(active_id, msg):
 
     if not dentro_do_horario() or not _historico_pronto_event.is_set():
         return
+
+    # R30 M15: histórico é validado por ativo. Um ativo atrasado não bloqueia os demais.
+    if not _historico_m15_pronto_ativo(active_id, 55):
+        return
+
     resultado = _resultado_retracao_intravela(msg, active_id)
     if resultado is None:
         return
@@ -5106,17 +5123,17 @@ def executar_leitura():
         estado["atualizado"] = agora_brt().strftime("%H:%M:%S BRT")
         return
 
-    # R25 OTC: garante histórico completo M5+M15 antes de liberar qualquer análise/ordem.
+    # R30 M15: libera análise assim que pelo menos um ativo tiver histórico M15 suficiente.
     if not _historico_pronto_event.is_set():
         _precarregar_historico_r22()
         if not _historico_pronto_event.is_set():
             estado["sinal"] = "AGUARDAR"
-            estado["mensagem"] = "R22 aguardando preload M5+M15 de todos os ativos."
+            estado["mensagem"] = "R30 aguardando histórico M15 suficiente em pelo menos um ativo."
             estado["atualizado"] = agora_brt().strftime("%H:%M:%S BRT")
-            log("[R22 PRELOAD] Leitura sem sinais: histórico ainda incompleto.")
+            log("[R30 PRELOAD M15] Leitura sem sinais: nenhum ativo M15 pronto ainda.")
             return
 
-    # A R25 gera sinais OTC no candle-generated após preload M5+M15.
+    # A R30 gera sinais OTC M15 após o preload individual por ativo.
     # Este ciclo de 5 minutos finaliza/atualiza operações e saúde dos ativos.
     finalizar_operacoes_vencidas_antes_da_leitura()
 
