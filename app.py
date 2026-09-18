@@ -119,7 +119,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OTC-AUTONOMO-KNN-R31-M15-2OPS-20260918"
+BULLEX_DIAGNOSTIC_VERSION = "OTC-AUTONOMO-KNN-R32-M15-2OPS-DISTINCT-20260918"
 
 _bullex_diag = {
     "messages": 0,
@@ -333,6 +333,7 @@ _operacao_global_ativa = None
 _operacao_global_em_envIO_LEGACY = False
 _operacoes_ativas_por_symbol = {}
 _operacoes_em_envio = set()
+_active_ids_em_envio = set()  # trava forte: nunca envia 2 ordens para o mesmo active_id
 
 def _qtd_operacoes_globais_em_andamento():
     """Conta símbolos únicos ativos, em envio ou aguardando resultado."""
@@ -1079,9 +1080,37 @@ def executar_ordem_intravela(symbol, sinal, resultado, valor_override=None, tipo
         _atualizar_estado_execucao()
         return "SEM_BALANCE_ID"
 
+    # Resolve o active_id ANTES de reservar a vaga. A trava passa a usar tanto
+    # o nome do ativo quanto o active_id real da Bullex, evitando duplicidade
+    # mesmo se o mesmo ativo aparecer com nomes/chaves diferentes.
+    config = next(
+        (cfg for cfg in ATIVO_BULLEX.values() if cfg["symbol"] == symbol),
+        None,
+    )
+    if not config:
+        return "SEM_ATIVO"
+    active_id = int(config["active_id"])
+
     with _execucao_lock:
-        if symbol in _operacoes_ativas_por_symbol or symbol in _operacoes_em_envio or symbol in _operacoes_pendentes:
-            log(f"[AUTONOMO] {symbol}: já existe operação deste ativo ativa/em envio.")
+        active_ids_ocupados = {
+            int(info.get("asset_id"))
+            for info in _operacoes_ativas_por_symbol.values()
+            if info.get("asset_id") is not None
+        }
+        active_ids_ocupados.update(
+            int(op.get("asset_id"))
+            for op in _operacoes_pendentes.values()
+            if op.get("asset_id") is not None
+        )
+
+        if (
+            symbol in _operacoes_ativas_por_symbol
+            or symbol in _operacoes_em_envio
+            or symbol in _operacoes_pendentes
+            or active_id in _active_ids_em_envio
+            or active_id in active_ids_ocupados
+        ):
+            log(f"[AUTONOMO ATIVO] {symbol} active_id={active_id}: já existe operação deste ativo; segunda entrada BLOQUEADA.")
             return "BLOQUEADA_ATIVO"
         if not _ha_vaga_operacao_global():
             log(
@@ -1090,23 +1119,15 @@ def executar_ordem_intravela(symbol, sinal, resultado, valor_override=None, tipo
             )
             return "BLOQUEADA_GLOBAL"
         _operacoes_em_envio.add(symbol)
+        _active_ids_em_envio.add(active_id)
 
     balance_id = _obter_balance_id()
     if not balance_id:
         with _execucao_lock:
             _operacoes_em_envio.discard(symbol)
+            _active_ids_em_envio.discard(active_id)
         return "SEM_BALANCE_ID"
 
-    config = next(
-        (cfg for cfg in ATIVO_BULLEX.values() if cfg["symbol"] == symbol),
-        None,
-    )
-    if not config:
-        with _execucao_lock:
-            _operacoes_em_envio.discard(symbol)
-        return "SEM_ATIVO"
-
-    active_id = int(config["active_id"])
     ticker = config.get("ticker")
     valor = float(valor_override) if valor_override is not None else _valor_entrada_atual()
 
@@ -1124,6 +1145,7 @@ def executar_ordem_intravela(symbol, sinal, resultado, valor_override=None, tipo
         )
         with _execucao_lock:
             _operacoes_em_envio.discard(symbol)
+            _active_ids_em_envio.discard(active_id)
         return "VELA_ENCERRADA"
 
     if restantes < INTRAVELA_MIN_SEGUNDOS_RESTANTES:
@@ -1133,6 +1155,7 @@ def executar_ordem_intravela(symbol, sinal, resultado, valor_override=None, tipo
         )
         with _execucao_lock:
             _operacoes_em_envio.discard(symbol)
+            _active_ids_em_envio.discard(active_id)
         return "POUCO_TEMPO"
 
     janela = {
@@ -1154,6 +1177,7 @@ def executar_ordem_intravela(symbol, sinal, resultado, valor_override=None, tipo
     if not instrumento or not instrumento.get("instrument_id"):
         with _execucao_lock:
             _operacoes_em_envio.discard(symbol)
+            _active_ids_em_envio.discard(active_id)
         log(f"[DIGITAL] {symbol}: instrument_id {sinal} M5 não encontrado; ordem não enviada.")
         return "SEM_INSTRUMENTO_DIGITAL"
     instrument_id = str(instrumento["instrument_id"])
@@ -1163,6 +1187,7 @@ def executar_ordem_intravela(symbol, sinal, resultado, valor_override=None, tipo
     if instrument_index is None:
         with _execucao_lock:
             _operacoes_em_envio.discard(symbol)
+            _active_ids_em_envio.discard(active_id)
         log(f"[DIGITAL] {symbol}: instrument_index ausente; ordem NÃO enviada.")
         return "SEM_INSTRUMENT_INDEX"
 
@@ -1211,6 +1236,7 @@ def executar_ordem_intravela(symbol, sinal, resultado, valor_override=None, tipo
             )
             with _execucao_lock:
                 _operacoes_em_envio.discard(symbol)
+            _active_ids_em_envio.discard(active_id)
             return "SEM_CONFIRMACAO"
 
         with _bullex_diag_lock:
@@ -1232,6 +1258,7 @@ def executar_ordem_intravela(symbol, sinal, resultado, valor_override=None, tipo
 
         with _execucao_lock:
             _operacoes_em_envio.discard(symbol)
+            _active_ids_em_envio.discard(active_id)
 
         with _execucao_lock:
             if symbol in _operacoes_ativas_por_symbol:
@@ -1257,6 +1284,7 @@ def executar_ordem_intravela(symbol, sinal, resultado, valor_override=None, tipo
         _atualizar_estado_execucao()
         with _execucao_lock:
             _operacoes_em_envio.discard(symbol)
+            _active_ids_em_envio.discard(active_id)
         log(f"[AUTO INTRAVELA] ERRO ao enviar ordem: {e}")
         return "ERRO"
 
@@ -4800,6 +4828,7 @@ def registrar_operacao_intravela(symbol, resultado):
     operacao = {
         "id": chave,
         "symbol": symbol,
+        "asset_id": info.get("asset_id"),
         "mercado": _mercado_do_symbol(symbol),
         "sinal": sinal,
         "score": resultado.get("score", 0),
