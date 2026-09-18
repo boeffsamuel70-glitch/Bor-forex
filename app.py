@@ -119,7 +119,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OTC-AUTONOMO-KNN-R34-M15-DASH-CANDLE-20260918"
+BULLEX_DIAGNOSTIC_VERSION = "OTC-M15-R35-FLUXO-INTRAVELA-20260918"
 
 _bullex_diag = {
     "messages": 0,
@@ -1178,7 +1178,7 @@ def executar_ordem_intravela(symbol, sinal, resultado, valor_override=None, tipo
         with _execucao_lock:
             _operacoes_em_envio.discard(symbol)
             _active_ids_em_envio.discard(active_id)
-        log(f"[DIGITAL] {symbol}: instrument_id {sinal} M5 não encontrado; ordem não enviada.")
+        log(f"[DIGITAL] {symbol}: instrument_id {sinal} M15 não encontrado; ordem não enviada.")
         return "SEM_INSTRUMENTO_DIGITAL"
     instrument_id = str(instrumento["instrument_id"])
     instrument_index = instrumento.get("instrument_index")
@@ -4253,11 +4253,10 @@ def _r24_despachar_melhor(candle_from):
     """Compara os sinais OTC da vela M15 e executa até as vagas globais disponíveis."""
     candle_from = int(candle_from)
 
-    # Coleta ancorada na abertura da vela: todos os candidatos que surgirem
-    # até ~7s participam do mesmo ranking global.
-    server_ts, _ = _horario_servidor_atual()
-    alvo = candle_from + float(R24_JANELA_CLASSIFICACAO_SEGUNDOS)
-    espera = max(0.0, alvo - float(server_ts))
+    # R35: M15 é intravela. O candidato pode surgir em qualquer momento dos
+    # 15 minutos, então a janela de comparação precisa começar AGORA, e não
+    # ficar ancorada nos primeiros segundos da abertura da vela.
+    espera = min(1.5, float(R24_JANELA_CLASSIFICACAO_SEGUNDOS))
     if espera > 0:
         time.sleep(espera)
 
@@ -4322,11 +4321,8 @@ def _r24_despachar_melhor(candle_from):
     finally:
         with _r24_candidatos_lock:
             _r24_dispatchers.discard(candle_from)
-            _r24_velas_finalizadas.add(candle_from)
-            limite = candle_from - 3600
-            antigos = [v for v in _r24_velas_finalizadas if v < limite]
-            for v in antigos:
-                _r24_velas_finalizadas.discard(v)
+            # R35: não marca a vela M15 inteira como finalizada. Novos ativos
+            # podem gerar setups válidos mais tarde dentro da mesma vela.
 
 def _status_bloqueio_ativo(symbol):
     info = _bloqueios_por_symbol.get(symbol)
@@ -4466,6 +4462,7 @@ def _processar_sinal_intravela(active_id, msg):
     candle_key=(int(active_id),int(resultado['candle_from']))
     with _intravela_lock:
         if candle_key in _intravela_velas_tentadas:
+            log(f"[M15 FLUXO] {symbol}: setup repetido na mesma vela M15; já encaminhado anteriormente.")
             return
         _intravela_velas_tentadas.add(candle_key)
 
@@ -4473,10 +4470,9 @@ def _processar_sinal_intravela(active_id, msg):
 
     candle_from = int(resultado['candle_from'])
     with _r24_candidatos_lock:
-        # Depois que a vela já foi classificada, candidatos tardios não podem
-        # criar um segundo dispatcher nem uma segunda tentativa de entrada.
-        if candle_from in _r24_velas_finalizadas:
-            return
+        # R35: não finaliza a vela inteira após a primeira rodada do seletor.
+        # Como a estratégia é intravela, outro ativo pode formar um setup válido
+        # minutos depois. A trava por active_id/símbolo continua impedindo duplicidade.
         _r24_candidatos.setdefault(candle_from, []).append((int(active_id), symbol, resultado))
         if candle_from not in _r24_dispatchers:
             _r24_dispatchers.add(candle_from)
@@ -4787,14 +4783,14 @@ def enviar_status_ordem_telegram(symbol, sinal, status, detalhe=""):
             "🔄 GALE 1 CONFIRMADO\n\n"
             f"💱 Ativo: {symbol}\n"
             f"📍 Direção: {direcao}\n"
-            "⏱ Expiração: 5 minutos"
+            "⏱ Expiração: 15 minutos"
         )
     else:
         texto = (
             "🚨 SINAL CONFIRMADO\n\n"
             f"💱 Ativo: {symbol}\n"
             f"📍 Direção: {direcao}\n"
-            "⏱ Expiração: 5 minutos\n\n"
+            "⏱ Expiração: 15 minutos\n\n"
             "✅ Entrada confirmada"
         )
     enviar_telegram(texto)
