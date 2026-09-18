@@ -119,7 +119,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OTC-M1-R41-RADAR-LIMPO-20260918"
+BULLEX_DIAGNOSTIC_VERSION = "OTC-M5-R42-RADAR-LIMPO-20260918"
 
 _bullex_diag = {
     "messages": 0,
@@ -142,8 +142,8 @@ TELEGRAM_CHAT_ID = os.getenv(
     "TELEGRAM_CHAT_ID", ""
 ).strip()
 
-TIMEFRAME = "1min"
-TIMEFRAME_TREND = "1min"
+TIMEFRAME = "5min"
+TIMEFRAME_TREND = "5min"
 
 TIMEZONE = "America/Sao_Paulo"
 TZ = ZoneInfo(TIMEZONE)
@@ -174,10 +174,10 @@ BULLEX_PAYOUT_FALLBACK = float(os.getenv("BULLEX_PAYOUT_FALLBACK", "87").strip()
 EXPIRACAO_MINUTOS = 15
 # A antiga janela de 3 segundos foi removida.
 # Esta estratégia entra DURANTE a vela atual e expira no fechamento da MESMA vela.
-INTRAVELA_MIN_SEGUNDOS_DECORRIDOS = 8
-INTRAVELA_MAX_SEGUNDOS_DECORRIDOS = 48
-INTRAVELA_MIN_SEGUNDOS_RESTANTES = 7
-# R38: entrada na retração durante a vela M1; expiração no fechamento da própria vela.
+INTRAVELA_MIN_SEGUNDOS_DECORRIDOS = 35
+INTRAVELA_MAX_SEGUNDOS_DECORRIDOS = 240
+INTRAVELA_MIN_SEGUNDOS_RESTANTES = 45
+# R38: entrada na retração durante a vela M5; expiração no fechamento da própria vela.
 
 # Estratégia R17: somente suporte/resistência M5.
 # O nível precisa ter pelo menos 3 toques em velas M5 fechadas.
@@ -1784,8 +1784,8 @@ def _on_bullex_message(ws, raw_message):
                 with _bullex_diag_lock:
                     _bullex_diag["stored"] += 1
 
-                # Estratégia R30: observa a vela M1 ainda aberta.
-                if int(size) == 60:
+                # Estratégia R30: observa a vela M5 ainda aberta.
+                if int(size) == 300:
                     threading.Thread(
                         target=_processar_sinal_intravela,
                         args=(active_id, dict(msg)),
@@ -2896,7 +2896,7 @@ def _contar_fechadas_cache(active_id, size):
 def _historico_m15_pronto_ativo(active_id, minimo=55):
     """Compatibilidade R40: retorna True quando o ativo já tem M1 suficiente."""
     try:
-        return len(somente_velas_fechadas(_candles_cache(int(active_id), 60), 1)) >= int(minimo)
+        return len(somente_velas_fechadas(_candles_cache(int(active_id), 300), 5)) >= int(minimo)
     except Exception:
         return False
 
@@ -2941,7 +2941,7 @@ def _precarregar_historico_r22(forcar=False):
             except Exception as e:
                 erro = str(e)
 
-            m15 = len(somente_velas_fechadas(_candles_cache(active_id, 60), 1))
+            m15 = len(somente_velas_fechadas(_candles_cache(active_id, 300), 1))
             ok = m15 >= 55
             if ok:
                 qtd_prontos += 1
@@ -3648,8 +3648,8 @@ def _atr_cache_5m(active_id):
 
 
 def _atr_cache_15m(active_id):
-    candles = _candles_cache(active_id, 60)
-    fechadas = somente_velas_fechadas(candles, 1)
+    candles = _candles_cache(active_id, 300)
+    fechadas = somente_velas_fechadas(candles, 5)
     if len(fechadas) < 15:
         return None
     return atr(fechadas, 14)
@@ -3703,8 +3703,8 @@ def _agrupar_niveis(valores, tolerancia):
 
 
 def _niveis_sr_m15(active_id):
-    candles = _candles_cache(active_id, 60)
-    fechadas = somente_velas_fechadas(candles, 1)
+    candles = _candles_cache(active_id, 300)
+    fechadas = somente_velas_fechadas(candles, 5)
 
     if len(fechadas) < 25:
         return [], [], None
@@ -3951,10 +3951,10 @@ def _agregar_m15_desde_m5(active_id, candle_from, limite=100):
 def _autonomo_contexto_m15_forca(active_id, candle_from, sinal):
     """Confirma contexto sem olhar o futuro: M15 fechado + força M5/M15.
 
-    Prefere M15 nativo da Bullex. Se ainda não houver histórico M15 suficiente
+    Prefere M15 nativo da Bullex. Se ainda não houver histórico M55 suficiente
     para um ativo dinâmico, reconstrói M15 com os candles M5 já fechados.
     """
-    m15 = _fechadas_antes(_candles_cache(active_id, 60), candle_from, 900)[-100:]
+    m15 = _fechadas_antes(_candles_cache(active_id, 300), candle_from, 900)[-100:]
     m5 = _fechadas_antes(_candles_cache(active_id, 300), candle_from, 300)[-100:]
     fonte_m15 = "NATIVO"
     if len(m15) < 30:
@@ -4021,18 +4021,18 @@ def _linha_tendencia_m15(fechadas, lado, atr15):
 
 def _resultado_retracao_intravela(msg, active_id):
     """R30: M15, suporte/resistência + LTA/LTB, entrada na retração e expiração na mesma vela."""
-    if not isinstance(msg,dict) or int(msg.get("size",60) or 60) != 60: return None
+    if not isinstance(msg,dict) or int(msg.get("size",300) or 300) != 300: return None
     try:
         abertura=float(msg['open']); preco=float(msg['close'])
         maxima=float(msg.get('max',msg.get('high'))); minima=float(msg.get('min',msg.get('low')))
-        candle_from=int(float(msg['from'])); candle_to=int(float(msg.get('to') or candle_from+60))
+        candle_from=int(float(msg['from'])); candle_to=int(float(msg.get('to') or candle_from+300))
     except Exception: return None
     server_ts,_=_horario_servidor_atual()
     decorridos=max(0.0,server_ts-candle_from); restantes=max(0.0,candle_to-server_ts)
     if decorridos < INTRAVELA_MIN_SEGUNDOS_DECORRIDOS or decorridos > INTRAVELA_MAX_SEGUNDOS_DECORRIDOS: return None
     if restantes < INTRAVELA_MIN_SEGUNDOS_RESTANTES: return None
 
-    m15=_fechadas_antes(_candles_cache(active_id,60),candle_from,60)[-SR_M15_LOOKBACK:]
+    m15=_fechadas_antes(_candles_cache(active_id,300),candle_from,60)[-SR_M15_LOOKBACK:]
     if len(m15)<45: return None
     a=atr(m15,14)
     if not a or a<=0: return None
@@ -4081,17 +4081,17 @@ def _resultado_retracao_intravela(msg, active_id):
     # confiança é um indicador interno de qualidade do setup, não probabilidade garantida.
     confianca=min(0.90,0.58+0.035*score)
     symbol=_symbol_por_active_id(active_id)[1]
-    log(f"[M1 RETRACAO] {symbol} {sinal} | {tipo}={nivel:.5f} toques={toques} | tendencia={tendencia} ADX={adx15 if adx15 is not None else 0:.1f} | retracao={retracao*100:.1f}% | confluencia={confluencia}")
+    log(f"[M5 RETRACAO] {symbol} {sinal} | {tipo}={nivel:.5f} toques={toques} | tendencia={tendencia} ADX={adx15 if adx15 is not None else 0:.1f} | retracao={retracao*100:.1f}% | confluencia={confluencia}")
     return {
       'sinal':sinal,'score':round(confianca*100,1),'score_call':round(confianca*100,1) if sinal=='CALL' else 0,'score_put':round(confianca*100,1) if sinal=='PUT' else 0,
       'preco':preco,'vela':datetime.fromtimestamp(candle_from,TZ),'estrategia':'M1_SR_LTA_LTB_RETRACAO','regime':tendencia,
       'pullback':f'RETRACAO {retracao*100:.1f}% EM {tipo}','rejeicao':f'REJEICAO {rejeicao/a:.2f} ATR','atr':a,'rsi':rv,
-      'ema5':e5,'ema13':e13,'ema21':e21,'tendencia_5m':'N/A','tendencia_15m':tendencia,'bloqueio':'SINAL_M1_RETRACAO',
+      'ema5':e5,'ema13':e13,'ema21':e21,'tendencia_5m':'N/A','tendencia_15m':tendencia,'bloqueio':'SINAL_M5_RETRACAO',
       'mensagem':f'{sinal} M1 | {tipo} + retração | confluência={confluencia} | qualidade={confianca*100:.1f}%',
       'candle_from':candle_from,'candle_to':candle_to,'segundos_decorridos':decorridos,'segundos_restantes':restantes,
       'impulso':impulso,'retracao_ratio':retracao,'nivel_sr':nivel,'tipo_nivel':tipo,'toques_nivel':toques,'distancia_abertura_nivel':dist_abertura,
       'adx15':adx15,'confianca':confianca,'confianca_ciclo':confianca,'amostras_ciclo':0,'amostras_modelo':len(m15),'margem':0.0,
-      'ajuste_online':0.0,'faixa_confianca':'M1','adaptativo':{},'filtro_adaptativo':'N/A'
+      'ajuste_online':0.0,'faixa_confianca':'M5','adaptativo':{},'filtro_adaptativo':'N/A'
     }
 
 def _atualizar_dashboard_intravela(symbol, resultado):
@@ -4248,7 +4248,7 @@ def _ticker_por_symbol(symbol):
 
 
 def _r24_despachar_melhor(candle_from):
-    """Compara os sinais OTC da vela M1 e executa até as vagas globais disponíveis."""
+    """Compara os sinais OTC da vela M5 e executa até as vagas globais disponíveis."""
     candle_from = int(candle_from)
 
     # R35: M15 é intravela. O candidato pode surgir em qualquer momento dos
@@ -4319,7 +4319,7 @@ def _r24_despachar_melhor(candle_from):
     finally:
         with _r24_candidatos_lock:
             _r24_dispatchers.discard(candle_from)
-            # R35: não marca a vela M1 inteira como finalizada. Novos ativos
+            # R35: não marca a vela M5 inteira como finalizada. Novos ativos
             # podem gerar setups válidos mais tarde dentro da mesma vela.
 
 def _status_bloqueio_ativo(symbol):
@@ -4460,11 +4460,11 @@ def _processar_sinal_intravela(active_id, msg):
     candle_key=(int(active_id),int(resultado['candle_from']))
     with _intravela_lock:
         if candle_key in _intravela_velas_tentadas:
-            log(f"[M1 FLUXO] {symbol}: setup repetido na mesma vela M1; já encaminhado anteriormente.")
+            log(f"[M5 FLUXO] {symbol}: setup repetido na mesma vela M5; já encaminhado anteriormente.")
             return
         _intravela_velas_tentadas.add(candle_key)
 
-    log(f"[M1 CANDIDATO] {symbol} -> {resultado['sinal']} | qualidade={resultado.get('confianca',0)*100:.1f}% | setup={resultado.get('tipo_nivel')} | histórico={resultado.get('amostras_modelo',0)}")
+    log(f"[M5 CANDIDATO] {symbol} -> {resultado['sinal']} | qualidade={resultado.get('confianca',0)*100:.1f}% | setup={resultado.get('tipo_nivel')} | histórico={resultado.get('amostras_modelo',0)}")
 
     candle_from = int(resultado['candle_from'])
     with _r24_candidatos_lock:
@@ -5071,7 +5071,7 @@ def finalizar_operacoes_vencidas_antes_da_leitura():
 # ============================================================
 
 def processar_ativo(chave, symbol, executar_sinal=False):
-    """Na R22 o loop mantém histórico M15 e finaliza operações.
+    """Na R22 o loop mantém histórico M55 e finaliza operações.
 
     Ele apenas mantém histórico atualizado e finaliza operações.
     Os sinais surgem exclusivamente do candle-generated da vela corrente.
@@ -5092,7 +5092,7 @@ def processar_ativo(chave, symbol, executar_sinal=False):
             estado["preco"] = f"{float(ultimo['close']):.5f}"
 
             # R34: o ciclo de manutenção também precisa informar ao dashboard
-            # qual vela M1 acabou de ser processada. Antes este campo só era
+            # qual vela M5 acabou de ser processada. Antes este campo só era
             # preenchido quando surgia um setup aprovado, por isso permanecia "-".
             dt_ultima = ultimo.get("_dt")
             if not isinstance(dt_ultima, datetime):
@@ -5170,12 +5170,12 @@ def executar_leitura():
         estado["atualizado"] = agora_brt().strftime("%H:%M:%S BRT")
         return
 
-    # R30 M15: libera análise assim que pelo menos um ativo tiver histórico M15 suficiente.
+    # R30 M15: libera análise assim que pelo menos um ativo tiver histórico M55 suficiente.
     if not _historico_pronto_event.is_set():
         _precarregar_historico_r22()
         if not _historico_pronto_event.is_set():
             estado["sinal"] = "AGUARDAR"
-            estado["mensagem"] = "R30 aguardando histórico M15 suficiente em pelo menos um ativo."
+            estado["mensagem"] = "R30 aguardando histórico M55 suficiente em pelo menos um ativo."
             estado["atualizado"] = agora_brt().strftime("%H:%M:%S BRT")
             log("[R30 PRELOAD M15] Leitura sem sinais: nenhum ativo M15 pronto ainda.")
             return
@@ -5393,7 +5393,7 @@ def _dados_grafico_dashboard():
     if cfg_alvo is None:
         for codigo, cfg in itens:
             aid = cfg.get("active_id")
-            if aid is not None and len(_candles_cache(int(aid), 60)) >= 20:
+            if aid is not None and len(_candles_cache(int(aid), 300)) >= 20:
                 codigo_alvo, cfg_alvo = codigo, cfg
                 break
 
@@ -5401,7 +5401,7 @@ def _dados_grafico_dashboard():
         return {"pronto": False, "symbol": symbol_alvo or "-", "candles": [], "niveis": []}
 
     active_id = int(cfg_alvo["active_id"])
-    candles = _candles_cache(active_id, 60)[-55:]
+    candles = _candles_cache(active_id, 300)[-55:]
     serie = []
     for c in candles:
         try:
@@ -5419,7 +5419,7 @@ def _dados_grafico_dashboard():
         except Exception:
             continue
 
-    fechadas = somente_velas_fechadas(candles, 1)
+    fechadas = somente_velas_fechadas(candles, 5)
     atr15 = atr(fechadas[-SR_M15_LOOKBACK:], 14) if fechadas else None
     niveis = []
 
@@ -5795,7 +5795,7 @@ Taxa de acerto
 <div class="linha"><span>Último ativo</span><span class="valor">{{ estado.ativo }}</span></div>
 <div class="linha"><span>Direção</span><span class="valor">{{ estado.sinal }}</span></div>
 <div class="linha"><span>Preço</span><span class="valor">{{ estado.preco }}</span></div>
-<div class="linha"><span>Vela M1</span><span class="valor">{{ estado.vela }}</span></div>
+<div class="linha"><span>Vela M5</span><span class="valor">{{ estado.vela }}</span></div>
 </div>
 
 <div class="card">
@@ -5811,13 +5811,13 @@ Quando houver sinal:
 <br>
 
 <strong>
-Entrada: durante a retração da vela M1
+Entrada: durante a retração da vela M5
 </strong>
 
 <br>
 
 <strong>
-Expiração: fechamento da mesma vela M1
+Expiração: fechamento da mesma vela M5
 </strong>
 
 <br><br>
@@ -5941,7 +5941,7 @@ setTimeout(function(){ location.reload(); }, 1000);
 <section id="radar-m1-live" style="margin:18px 0;padding:16px;border:1px solid #333;border-radius:14px;">
   <div style="display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap">
     <div>
-      <h2 style="margin:0 0 4px">Radar M1 ao vivo</h2>
+      <h2 style="margin:0 0 4px">Radar M5 ao vivo</h2>
       <div style="opacity:.75">6 ativos mais próximos da entrada • atualização a cada 1 segundo • operação manual</div>
     </div>
     <div id="radar-clock" style="font-weight:700">Atualizando…</div>
@@ -5956,7 +5956,7 @@ setTimeout(function(){ location.reload(); }, 1000);
   function esc(v){return String(v == null ? '' : v).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));}
   async function atualizarRadar(){
     try{
-      const r = await fetch('/radar-m1', {cache:'no-store'});
+      const r = await fetch('/radar-m5', {cache:'no-store'});
       const d = await r.json();
       const ativos = Array.isArray(d.ativos) ? d.ativos : [];
       grid.innerHTML = ativos.map(a=>{
@@ -5996,7 +5996,7 @@ setTimeout(function(){ location.reload(); }, 1000);
 
 
 
-# R40_MANUAL_FORCE: este app é radar manual; não envia ordens automaticamente.
+# R42_MANUAL_FORCE: este app é radar manual; não envia ordens automaticamente.
 BULLEX_AUTO_TRADE = False
 
 # ============================================================
@@ -6004,12 +6004,12 @@ BULLEX_AUTO_TRADE = False
 # ============================================================
 
 
-def _radar_m1_ao_vivo():
-    """R40: até 6 ativos OTC mais próximos da entrada, usando candles M1 reais do WS."""
+def _radar_m5_ao_vivo():
+    """R40: até 6 ativos OTC mais próximos da entrada, usando candles M5 reais do WS."""
     itens = []
     agora, _ = _horario_servidor_atual()
-    candle_from_atual = int(agora // 60) * 60
-    restantes = max(0, int(candle_from_atual + 60 - agora))
+    candle_from_atual = int(agora // 300) * 300
+    restantes = max(0, int(candle_from_atual + 300 - agora))
 
     # ATIVO_BULLEX é atualizado pela descoberta dinâmica da Traderoom.
     with _bullex_assets_lock:
@@ -6019,11 +6019,11 @@ def _radar_m1_ao_vivo():
         try:
             aid = int(cfg.get("active_id"))
             simbolo = cfg.get("symbol") or cfg.get("ticker") or str(aid)
-            candles = _candles_cache(aid, 60)
+            candles = _candles_cache(aid, 300)
             if not candles or len(candles) < 25:
                 continue
 
-            # Localiza a vela M1 corrente recebida pelo candle-generated.
+            # Localiza a vela M5 corrente recebida pelo candle-generated.
             corrente = None
             for c in reversed(candles):
                 try:
@@ -6037,11 +6037,11 @@ def _radar_m1_ao_vivo():
                 corrente = dict(candles[-1])
 
             corrente["active_id"] = aid
-            corrente["size"] = 60
+            corrente["size"] = 300
             if "from" not in corrente:
                 corrente["from"] = candle_from_atual
             if "to" not in corrente:
-                corrente["to"] = int(corrente["from"]) + 60
+                corrente["to"] = int(corrente["from"]) + 300
 
             preco = float(corrente.get("close", corrente.get("price", 0)) or 0)
             resultado = _resultado_retracao_intravela(corrente, aid)
@@ -6096,7 +6096,7 @@ def _radar_m1_ao_vivo():
                 "detalhe": detalhe,
             })
         except Exception as e:
-            log(f"[RADAR M1] ativo ignorado: {e}")
+            log(f"[RADAR M5] ativo ignorado: {e}")
             continue
 
     itens.sort(
@@ -6109,15 +6109,15 @@ def _radar_m1_ao_vivo():
     return itens[:6]
 
 
-@app.route("/radar-m1")
-def radar_m1():
+@app.route("/radar-m5")
+def radar_m5():
     return jsonify({
         "status": "ok",
-        "timeframe": "M1",
+        "timeframe": "M5",
         "modo": "MANUAL",
         "atualizacao_ms": 1000,
-        "ativos": _radar_m1_ao_vivo(),
-        "candles_m1_armazenados": sum(len(_candles_cache(int(v.get("active_id")), 60)) for v in ATIVO_BULLEX.values() if isinstance(v, dict) and v.get("active_id") is not None),
+        "ativos": _radar_m5_ao_vivo(),
+        "candles_m5_armazenados": sum(len(_candles_cache(int(v.get("active_id")), 60)) for v in ATIVO_BULLEX.values() if isinstance(v, dict) and v.get("active_id") is not None),
     })
 
 
@@ -6129,7 +6129,7 @@ def index():
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Radar M1</title>
+<title>Radar M5</title>
 <style>
 :root{color-scheme:dark}
 *{box-sizing:border-box}
@@ -6154,7 +6154,7 @@ h1{font-size:22px;margin:0}.live{font-size:13px;opacity:.75}
 <body>
 <main>
   <div class="top">
-    <h1>Radar M1 ao vivo</h1>
+    <h1>Radar M5 ao vivo</h1>
     <div id="clock" class="live">Conectando…</div>
   </div>
   <div id="grid" class="grid"><div class="empty">Aguardando mercado…</div></div>
@@ -6166,7 +6166,7 @@ h1{font-size:22px;margin:0}.live{font-size:13px;opacity:.75}
  const esc=v=>String(v==null?'':v).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
  async function update(){
    try{
-     const r=await fetch('/radar-m1',{cache:'no-store'});
+     const r=await fetch('/radar-m5',{cache:'no-store'});
      const d=await r.json();
      const a=Array.isArray(d.ativos)?d.ativos:[];
      grid.innerHTML=a.map(x=>{
@@ -6180,7 +6180,7 @@ h1{font-size:22px;margin:0}.live{font-size:13px;opacity:.75}
          <div class="meta">Fecha em <strong>${esc(x.restantes)}s</strong></div>
          <div class="bar"><div class="fill" style="width:${Math.max(0,Math.min(100,Number(x.progresso)||0))}%"></div></div>
        </div>`;
-     }).join('')||'<div class="empty">Aguardando ativos M1…</div>';
+     }).join('')||'<div class="empty">Aguardando ativos M5…</div>';
      clock.textContent='AO VIVO • '+new Date().toLocaleTimeString();
      const atual=a.filter(x=>x.status==='ENTRAR AGORA').map(x=>x.ativo+':'+x.direcao).join('|');
      if(atual && atual!==ultimo && 'AudioContext' in window){
