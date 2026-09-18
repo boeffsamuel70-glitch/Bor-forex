@@ -5191,7 +5191,7 @@ def executar_leitura():
     log(
         f"[MONITOR] ativos mapeados={len(ativos_ciclo)} | "
         f"ABERTO={qtd_aberto} | OTC={qtd_otc} | "
-        "sinais=AUTONOMO KNN OTC | entrada 2-8s | 1 operação GLOBAL | melhor OTC Digital | 24H"
+        "sinais=AUTONOMO KNN OTC | entrada 2-8s | 2 operações GLOBAIS | 1 por ativo | melhor OTC Digital | 24H"
     )
 
     for chave, symbol in ativos_ciclo:
