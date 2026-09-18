@@ -119,7 +119,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OTC-M15-R36-DASH-GRAFICO-SR-LTA-LTB-20260918"
+BULLEX_DIAGNOSTIC_VERSION = "OTC-M15-R37-KNN-CICLOS-20260918"
 
 _bullex_diag = {
     "messages": 0,
@@ -3894,7 +3894,7 @@ def _autonomo_filtro_adaptativo(symbol, sinal, confianca):
     faixa=_autonomo_faixa_confianca(confianca)
     base=[x for x in _historico_resultados
           if x.get("resultado") in ("WIN","LOSS")
-          and x.get("estrategia")=="AUTONOMO_KNN_M5"][-AUTONOMO_ADAPTATIVO_ULTIMAS:]
+          and x.get("estrategia") in ("AUTONOMO_KNN_M5","AUTONOMO_KNN_M15")][-AUTONOMO_ADAPTATIVO_ULTIMAS:]
     por_faixa=[x for x in base if x.get("faixa_confianca")==faixa and x.get("sinal")==sinal]
     por_ativo=[x for x in por_faixa if x.get("symbol")==symbol]
     wa,na,ta=_autonomo_desempenho(por_ativo)
@@ -4022,78 +4022,159 @@ def _linha_tendencia_m15(fechadas, lado, atr15):
 
 
 def _resultado_retracao_intravela(msg, active_id):
-    """R30: M15, suporte/resistência + LTA/LTB, entrada na retração e expiração na mesma vela."""
-    if not isinstance(msg,dict) or int(msg.get("size",900) or 900) != 900: return None
+    """R37: lógica autônoma KNN/ciclos antiga, convertida integralmente para M15.
+
+    O modelo usa apenas candles M15 FECHADOS antes da vela atual, compara o
+    contexto mais recente com exemplos históricos semelhantes e prevê CALL/PUT
+    para a vela M15 em andamento. Não usa S/R, LTA/LTB ou retração como gatilho.
+    """
+    if not isinstance(msg, dict) or int(msg.get("size", 900) or 900) != 900:
+        return None
     try:
-        abertura=float(msg['open']); preco=float(msg['close'])
-        maxima=float(msg.get('max',msg.get('high'))); minima=float(msg.get('min',msg.get('low')))
-        candle_from=int(float(msg['from'])); candle_to=int(float(msg.get('to') or candle_from+900))
-    except Exception: return None
-    server_ts,_=_horario_servidor_atual()
-    decorridos=max(0.0,server_ts-candle_from); restantes=max(0.0,candle_to-server_ts)
-    if decorridos < INTRAVELA_MIN_SEGUNDOS_DECORRIDOS or decorridos > INTRAVELA_MAX_SEGUNDOS_DECORRIDOS: return None
-    if restantes < INTRAVELA_MIN_SEGUNDOS_RESTANTES: return None
+        preco = float(msg["close"])
+        candle_from = int(float(msg["from"]))
+        candle_to = int(float(msg.get("to") or candle_from + 900))
+    except Exception:
+        return None
 
-    m15=_fechadas_antes(_candles_cache(active_id,900),candle_from,900)[-SR_M15_LOOKBACK:]
-    if len(m15)<45: return None
-    a=atr(m15,14)
-    if not a or a<=0: return None
-    c=closes(m15); e5,e13,e21=ema(c,5),ema(c,13),ema(c,21); rv=rsi(c,14); adx15=_adx_candles(m15,14)
-    if None in (e5,e13,e21,rv): return None
-    tendencia='ALTA' if e5>e13>e21 else 'BAIXA' if e5<e13<e21 else 'NEUTRA'
+    server_ts, _ = _horario_servidor_atual()
+    decorridos = max(0.0, server_ts - candle_from)
+    restantes = max(0.0, candle_to - server_ts)
+    if decorridos < INTRAVELA_MIN_SEGUNDOS_DECORRIDOS:
+        return None
+    if decorridos > INTRAVELA_MAX_SEGUNDOS_DECORRIDOS:
+        return None
+    if restantes < INTRAVELA_MIN_SEGUNDOS_RESTANTES:
+        return None
 
-    sup,res,_=_niveis_sr_m15(active_id)
-    lta=_linha_tendencia_m15(m15,'LTA',a); ltb=_linha_tendencia_m15(m15,'LTB',a)
-    candidatos=[]
-    for g in sup:
-        candidatos.append(('CALL','SUPORTE',float(g['nivel']),int(g.get('toques',0))))
-    for g in res:
-        candidatos.append(('PUT','RESISTENCIA',float(g['nivel']),int(g.get('toques',0))))
-    if lta: candidatos.append(('CALL','LTA',lta['nivel'],2))
-    if ltb: candidatos.append(('PUT','LTB',ltb['nivel'],2))
-    if not candidatos: return None
+    # 150 candles M15 dão aproximadamente 37,5 horas de histórico.
+    m15 = _fechadas_antes(_candles_cache(active_id, 900), candle_from, 900)[-150:]
+    if len(m15) < AUTONOMO_MIN_AMOSTRAS + 24:
+        return None
 
-    amplitude=max(maxima-minima,1e-12)
-    movimento_alta=maxima-abertura; movimento_baixa=abertura-minima
-    aprovados=[]
-    for sinal,tipo,nivel,toques in candidatos:
-        # Opera retração a favor da estrutura/tendência; neutro é aceito só em S/R forte.
-        if sinal=='CALL' and tendencia=='BAIXA': continue
-        if sinal=='PUT' and tendencia=='ALTA': continue
-        dist_abertura=abs(abertura-nivel)/a
-        if dist_abertura < M15_DISTANCIA_ABERTURA_ATR_MIN: continue
-        tol=a*(M15_LINHA_TOLERANCIA_ATR if tipo in ('LTA','LTB') else M15_TOQUE_TOLERANCIA_ATR)
-        tocou = minima <= nivel+tol if sinal=='CALL' else maxima >= nivel-tol
-        if not tocou: continue
-        if sinal=='CALL':
-            impulso=max(movimento_baixa,1e-12); rejeicao=preco-minima; retracao=rejeicao/impulso
-            if preco <= nivel-a*0.03: continue
+    atual = _autonomo_features(m15, len(m15) - 1)
+    if atual is None:
+        return None
+
+    exemplos = []
+    for i in range(22, len(m15) - 2):
+        feat = _autonomo_features(m15, i)
+        if feat is None:
+            continue
+        entrada = float(m15[i]["close"])
+        saida1 = float(m15[i + 1]["close"])
+        saida2 = float(m15[i + 2]["close"])
+        if saida1 == entrada:
+            continue
+        label = "CALL" if saida1 > entrada else "PUT"
+        exemplos.append((_autonomo_distancia(atual, feat), label, entrada, saida1, saida2))
+
+    if len(exemplos) < AUTONOMO_MIN_AMOSTRAS:
+        return None
+
+    exemplos.sort(key=lambda x: x[0])
+    vizinhos = exemplos[:min(AUTONOMO_K_VIZINHOS, len(exemplos))]
+
+    call_w = put_w = 0.0
+    for dist, label, entrada_hist, saida1_hist, saida2_hist in vizinhos:
+        peso = 1.0 / (0.10 + dist)
+        if label == "CALL":
+            call_w += peso
         else:
-            impulso=max(movimento_alta,1e-12); rejeicao=maxima-preco; retracao=rejeicao/impulso
-            if preco >= nivel+a*0.03: continue
-        if rejeicao < a*M15_REJEICAO_ATR_MIN: continue
-        if not (M15_RETRACAO_MIN <= retracao <= M15_RETRACAO_MAX): continue
-        confluencia=0
-        for s2,t2,n2,_ in candidatos:
-            if s2==sinal and t2!=tipo and abs(n2-nivel)<=a*0.25: confluencia+=1
-        score=(toques if tipo in ('SUPORTE','RESISTENCIA') else 2) + confluencia*2 + (1 if tendencia!='NEUTRA' else 0) + (1 if adx15 and adx15>=18 else 0)
-        aprovados.append((score,sinal,tipo,nivel,toques,retracao,rejeicao,confluencia))
-    if not aprovados: return None
-    aprovados.sort(reverse=True,key=lambda x:x[0]); score,sinal,tipo,nivel,toques,retracao,rejeicao,confluencia=aprovados[0]
-    # confiança é um indicador interno de qualidade do setup, não probabilidade garantida.
-    confianca=min(0.90,0.58+0.035*score)
-    symbol=_symbol_por_active_id(active_id)[1]
-    log(f"[M15 RETRACAO] {symbol} {sinal} | {tipo}={nivel:.5f} toques={toques} | tendencia={tendencia} ADX={adx15 if adx15 is not None else 0:.1f} | retracao={retracao*100:.1f}% | confluencia={confluencia}")
+            put_w += peso
+
+    total = call_w + put_w
+    if total <= 0:
+        return None
+
+    p_call = call_w / total
+    p_put = put_w / total
+    sinal = "CALL" if p_call >= p_put else "PUT"
+    confianca = max(p_call, p_put)
+    margem = abs(p_call - p_put)
+
+    # "Ciclo" preserva a ideia da estratégia antiga, mas sem Martingale:
+    # mede entre os vizinhos quantas vezes a PRIMEIRA vela seguinte terminou
+    # na direção escolhida. Assim a confiança de ciclo não é inflada por Gale.
+    ciclo_win_w = ciclo_total_w = 0.0
+    ciclo_n = 0
+    for dist, label, entrada_hist, saida1_hist, saida2_hist in vizinhos:
+        peso = 1.0 / (0.10 + dist)
+        primeira_win = (
+            (saida1_hist > entrada_hist) if sinal == "CALL"
+            else (saida1_hist < entrada_hist)
+        )
+        ciclo_total_w += peso
+        ciclo_n += 1
+        if primeira_win:
+            ciclo_win_w += peso
+
+    ciclo_confianca = (ciclo_win_w / ciclo_total_w) if ciclo_total_w > 0 else 0.0
+    if ciclo_n < AUTONOMO_CICLO_MIN_VIZINHOS:
+        return None
+    if ciclo_confianca < AUTONOMO_CICLO_CONFIANCA_MIN:
+        return None
+
+    symbol = _symbol_por_active_id(active_id)[1]
+    ajuste, amostras_online = _autonomo_ajuste_online(symbol, sinal)
+    confianca_ajustada = max(0.0, min(1.0, confianca + ajuste))
+    if confianca_ajustada < AUTONOMO_CONFIANCA_MIN or margem < AUTONOMO_MARGEM_MIN:
+        return None
+
+    permitir, motivo_adaptativo, diag_adaptativo = _autonomo_filtro_adaptativo(
+        symbol, sinal, confianca_ajustada
+    )
+    if not permitir:
+        log(f"[AUTONOMO M15][NAO OPERAR] {motivo_adaptativo}")
+        return None
+
+    c = closes(m15)
+    a = atr(m15, 14)
+    rv = rsi(c, 14)
+    e5, e13, e21 = ema(c, 5), ema(c, 13), ema(c, 21)
+    tendencia = (
+        "ALTA" if e5 and e13 and e21 and e5 > e13 > e21
+        else "BAIXA" if e5 and e13 and e21 and e5 < e13 < e21
+        else "NEUTRA"
+    )
+    score = round(confianca_ajustada * 100, 1)
+
     return {
-      'sinal':sinal,'score':round(confianca*100,1),'score_call':round(confianca*100,1) if sinal=='CALL' else 0,'score_put':round(confianca*100,1) if sinal=='PUT' else 0,
-      'preco':preco,'vela':datetime.fromtimestamp(candle_from,TZ),'estrategia':'M15_SR_LTA_LTB_RETRACAO','regime':tendencia,
-      'pullback':f'RETRACAO {retracao*100:.1f}% EM {tipo}','rejeicao':f'REJEICAO {rejeicao/a:.2f} ATR','atr':a,'rsi':rv,
-      'ema5':e5,'ema13':e13,'ema21':e21,'tendencia_5m':'N/A','tendencia_15m':tendencia,'bloqueio':'SINAL_M15_RETRACAO',
-      'mensagem':f'{sinal} M15 | {tipo} + retração | confluência={confluencia} | qualidade={confianca*100:.1f}%',
-      'candle_from':candle_from,'candle_to':candle_to,'segundos_decorridos':decorridos,'segundos_restantes':restantes,
-      'impulso':impulso,'retracao_ratio':retracao,'nivel_sr':nivel,'tipo_nivel':tipo,'toques_nivel':toques,'distancia_abertura_nivel':dist_abertura,
-      'adx15':adx15,'confianca':confianca,'confianca_ciclo':confianca,'amostras_ciclo':0,'amostras_modelo':len(m15),'margem':0.0,
-      'ajuste_online':0.0,'faixa_confianca':'M15','adaptativo':{},'filtro_adaptativo':'N/A'
+        "sinal": sinal,
+        "score": score,
+        "score_call": round(p_call * 100, 1),
+        "score_put": round(p_put * 100, 1),
+        "preco": preco,
+        "vela": datetime.fromtimestamp(candle_from, TZ),
+        "estrategia": "AUTONOMO_KNN_M15",
+        "regime": tendencia,
+        "pullback": f"APRENDIZADO M15: {len(exemplos)} exemplos; {len(vizinhos)} vizinhos",
+        "rejeicao": f"confiança={confianca_ajustada*100:.1f}% ciclo={ciclo_confianca*100:.1f}%",
+        "lateral": "N/A",
+        "atr": a, "rsi": rv, "ema5": e5, "ema13": e13, "ema21": e21,
+        "tendencia_5m": "N/A", "tendencia_15m": tendencia,
+        "zona_fibonacci": "N/A",
+        "bloqueio": "SINAL_AUTONOMO_M15",
+        "mensagem": (
+            f"{sinal} autônomo M15 | confiança {confianca_ajustada*100:.1f}% | "
+            f"ciclo {ciclo_confianca*100:.1f}% | histórico {len(exemplos)} | "
+            f"online {amostras_online}"
+        ),
+        "candle_from": candle_from, "candle_to": candle_to,
+        "segundos_decorridos": decorridos, "segundos_restantes": restantes,
+        "impulso": 0.0, "retracao_ratio": 0.0, "nivel_sr": None,
+        "tipo_nivel": "MODELO_KNN_M15", "toques_nivel": 0,
+        "distancia_abertura_nivel": 0.0, "adx5": 0.0, "adx15": 0.0,
+        "confianca": confianca_ajustada,
+        "confianca_ciclo": ciclo_confianca,
+        "amostras_ciclo": ciclo_n,
+        "amostras_modelo": len(exemplos),
+        "vizinhos": len(vizinhos),
+        "margem": margem,
+        "ajuste_online": ajuste,
+        "faixa_confianca": _autonomo_faixa_confianca(confianca_ajustada),
+        "adaptativo": diag_adaptativo,
+        "filtro_adaptativo": motivo_adaptativo,
     }
 
 def _atualizar_dashboard_intravela(symbol, resultado):
@@ -4127,7 +4208,7 @@ def _atualizar_dashboard_intravela(symbol, resultado):
         ),
         "bloqueio": resultado.get("bloqueio", "-"),
         "regime": resultado.get("regime", "AUTONOMO"),
-        "estrategia": resultado.get("estrategia", "AUTONOMO_KNN_M5"),
+        "estrategia": resultado.get("estrategia", "AUTONOMO_KNN_M15"),
         "zona_fibonacci": "-",
     }
 
@@ -4452,7 +4533,7 @@ def _processar_sinal_intravela(active_id, msg):
     if not dentro_do_horario() or not _historico_pronto_event.is_set():
         return
 
-    # R30 M15: histórico é validado por ativo. Um ativo atrasado não bloqueia os demais.
+    # R37 M15: histórico é validado por ativo. Um ativo atrasado não bloqueia os demais.
     if not _historico_m15_pronto_ativo(active_id, 55):
         return
 
@@ -4462,11 +4543,11 @@ def _processar_sinal_intravela(active_id, msg):
     candle_key=(int(active_id),int(resultado['candle_from']))
     with _intravela_lock:
         if candle_key in _intravela_velas_tentadas:
-            log(f"[M15 FLUXO] {symbol}: setup repetido na mesma vela M15; já encaminhado anteriormente.")
+            log(f"[AUTONOMO M15] {symbol}: sinal repetido na mesma vela M15; já encaminhado anteriormente.")
             return
         _intravela_velas_tentadas.add(candle_key)
 
-    log(f"[M15 CANDIDATO] {symbol} -> {resultado['sinal']} | qualidade={resultado.get('confianca',0)*100:.1f}% | setup={resultado.get('tipo_nivel')} | histórico={resultado.get('amostras_modelo',0)}")
+    log(f"[AUTONOMO M15 CANDIDATO] {symbol} -> {resultado['sinal']} | confiança={resultado.get('confianca',0)*100:.1f}% | ciclo={resultado.get('confianca_ciclo',0)*100:.1f}% | amostras={resultado.get('amostras_modelo',0)}")
 
     candle_from = int(resultado['candle_from'])
     with _r24_candidatos_lock:
@@ -4487,7 +4568,7 @@ def _processar_sinal_intravela(active_id, msg):
 def calcular_estatisticas_por_estrategia():
     wins = losses = dojis = 0
     for item in _historico_resultados:
-        if item.get("estrategia") != "AUTONOMO_KNN_M5":
+        if item.get("estrategia") not in ("AUTONOMO_KNN_M5", "AUTONOMO_KNN_M15"):
             continue
         r = item.get("resultado")
         if r == "WIN":
@@ -5421,32 +5502,7 @@ def _dados_grafico_dashboard():
         except Exception:
             continue
 
-    fechadas = somente_velas_fechadas(candles, 15)
-    atr15 = atr(fechadas[-SR_M15_LOOKBACK:], 14) if fechadas else None
     niveis = []
-
-    try:
-        sup, res, _ = _niveis_sr_m15(active_id)
-        for g in sup[-4:]:
-            niveis.append({"tipo": "SUPORTE", "nivel": float(g["nivel"]), "toques": int(g.get("toques", 0))})
-        for g in res[-4:]:
-            niveis.append({"tipo": "RESISTENCIA", "nivel": float(g["nivel"]), "toques": int(g.get("toques", 0))})
-    except Exception:
-        pass
-
-    if atr15 and fechadas:
-        try:
-            lta = _linha_tendencia_m15(fechadas[-SR_M15_LOOKBACK:], "LTA", atr15)
-            if lta:
-                niveis.append({"tipo": "LTA", "nivel": float(lta["nivel"]), "slope": float(lta["slope"]), "toques": 2})
-        except Exception:
-            pass
-        try:
-            ltb = _linha_tendencia_m15(fechadas[-SR_M15_LOOKBACK:], "LTB", atr15)
-            if ltb:
-                niveis.append({"tipo": "LTB", "nivel": float(ltb["nivel"]), "slope": float(ltb["slope"]), "toques": 2})
-        except Exception:
-            pass
 
     return {
         "pronto": bool(serie),
@@ -5649,7 +5705,7 @@ Robô OTC M15
 
 <div class="subtitulo">
 
-M15 • Suporte/Resistência • LTA/LTB • Retração intravela
+M15 • Autônomo KNN • Confiança + Ciclos • Sem Martingale
 
 </div>
 
@@ -5716,17 +5772,15 @@ M15 • Suporte/Resistência • LTA/LTB • Retração intravela
 </div>
 
 <div class="card">
-<h3>Visão do robô — gráfico M15</h3>
+<h3>Visão do robô — gráfico M15 / KNN + Ciclos</h3>
 <div class="linha"><span>Ativo no gráfico</span><span class="valor">{{ grafico.symbol }}</span></div>
 <div class="linha"><span>Timeframe</span><span class="valor">M15</span></div>
 <div id="grafico-m15" class="grafico-m15">
 <svg id="svg-m15" viewBox="0 0 720 390" role="img" aria-label="Candles M15 com suporte, resistência, LTA e LTB"></svg>
 </div>
-<div id="legenda-grafico" class="legenda-grafico">
-<span>— SUP suporte</span><span>— RES resistência</span><span>／ LTA</span><span>＼ LTB</span>
-</div>
+<div id="legenda-grafico" class="legenda-grafico"><span>KNN M15: direção, confiança e ciclo calculados pelo histórico do ativo</span></div>
 <div class="observacao" style="margin-top:10px">
-As linhas são calculadas com os mesmos candles M15 usados pela estratégia. Atualização automática a cada 10 segundos.
+Os candles são os mesmos M15 usados pelo modelo. Suporte/resistência e LTA/LTB não participam mais da decisão. Atualização automática a cada 10 segundos.
 </div>
 </div>
 
