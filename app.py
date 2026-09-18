@@ -119,7 +119,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OTC-M5-R42-RADAR-LIMPO-20260918"
+BULLEX_DIAGNOSTIC_VERSION = "OTC-M5-R43-RADAR-LIMPO-CORRIGIDO-20260918"
 
 _bullex_diag = {
     "messages": 0,
@@ -921,17 +921,17 @@ def _armazenar_instrumentos_digitais(data):
 
 
 def _instrumento_digital_cache(active_id, sinal, candle_to):
-    """Localiza um contrato DIGITAL M15 REAL recebido da Bullex.
+    """Localiza um contrato DIGITAL M5 REAL recebido da Bullex.
 
     Prioriza o vencimento exato da vela. Se a Traderoom publicar o mesmo
-    contrato M15 com vencimento ligeiramente diferente, aceita somente um
-    vencimento FUTURO real, dentro de uma janela máxima de 15 minutos.
+    contrato M5 com vencimento ligeiramente diferente, aceita somente um
+    vencimento FUTURO real, dentro de uma janela máxima de 5 minutos.
     Nunca inventa instrument_id/index.
     """
     direction = _direcao_instrumento(sinal)
     active_id = int(active_id)
     candle_to = int(candle_to)
-    key = (active_id, candle_to, 900, direction)
+    key = (active_id, candle_to, 300, direction)
     item = _bullex_instrument_cache.get(key)
     if item:
         return item
@@ -939,13 +939,13 @@ def _instrumento_digital_cache(active_id, sinal, candle_to):
     server_ts, _ = _horario_servidor_atual()
     candidatos = []
     for (asset_id, expiration, period, direcao), inst in list(_bullex_instrument_cache.items()):
-        if asset_id != active_id or period != 900 or direcao != direction:
+        if asset_id != active_id or period != 300 or direcao != direction:
             continue
-        # Não aceita contrato já vencido e não pula mais de um ciclo M15.
+        # Não aceita contrato já vencido e não pula mais de um ciclo M5.
         if expiration <= int(server_ts):
             continue
         distancia = abs(int(expiration) - candle_to)
-        if distancia <= 900:
+        if distancia <= 300:
             candidatos.append((distancia, int(expiration), inst))
 
     if not candidatos:
@@ -984,7 +984,7 @@ def _solicitar_instrumentos_digitais(active_id, timeout=3.0):
 
 
 def _buscar_instrumento(active_id, sinal, ticker, candle_to, symbol=None):
-    """Obtém index + symbol SPT M15 diretamente do catálogo REAL da Bullex."""
+    """Obtém index + symbol SPT M5 diretamente do catálogo REAL da Bullex."""
     item = _instrumento_digital_cache(active_id, sinal, candle_to)
     if item:
         return item
@@ -1000,7 +1000,7 @@ def _buscar_instrumento(active_id, sinal, ticker, candle_to, symbol=None):
         ajuste = exp_real - int(candle_to)
         extra = f" | ajuste_exp={ajuste:+d}s" if ajuste else ""
         log(
-            f"[DIGITAL INSTRUMENT] {symbol or ticker}: {sinal} M15 REAL -> "
+            f"[DIGITAL INSTRUMENT] {symbol or ticker}: {sinal} M5 REAL -> "
             f"index={item['instrument_index']} id={item['instrument_id']} "
             f"expiration={exp_real}{extra}"
         )
@@ -1014,7 +1014,7 @@ def _buscar_instrumento(active_id, sinal, ticker, candle_to, symbol=None):
             disponiveis.append(f"P{period}/EXP{expiration}/IDX{inst.get('instrument_index')}")
     resumo = ", ".join(disponiveis[:8]) if disponiveis else "nenhum SPT armazenado"
     log(
-        f"[DIGITAL INSTRUMENT] {symbol or ticker}: catálogo não trouxe SPT M15 utilizável "
+        f"[DIGITAL INSTRUMENT] {symbol or ticker}: catálogo não trouxe SPT M5 utilizável "
         f"asset_id={active_id} alvo={int(candle_to)} | disponíveis={resumo}; ordem não enviada."
     )
     return None
@@ -1176,7 +1176,7 @@ def executar_ordem_intravela(symbol, sinal, resultado, valor_override=None, tipo
         with _execucao_lock:
             _operacoes_em_envio.discard(symbol)
             _active_ids_em_envio.discard(active_id)
-        log(f"[DIGITAL] {symbol}: instrument_id {sinal} M1 não encontrado; ordem não enviada.")
+        log(f"[DIGITAL] {symbol}: instrument_id {sinal} M5 não encontrado; ordem não enviada.")
         return "SEM_INSTRUMENTO_DIGITAL"
     instrument_id = str(instrumento["instrument_id"])
     instrument_index = instrumento.get("instrument_index")
@@ -1261,7 +1261,7 @@ def executar_ordem_intravela(symbol, sinal, resultado, valor_override=None, tipo
         with _execucao_lock:
             if symbol in _operacoes_ativas_por_symbol:
                 _operacoes_ativas_por_symbol[symbol]["preco_entrada_estimado"] = float(resultado["preco"])
-                _operacoes_ativas_por_symbol[symbol]["estrategia"] = resultado.get("estrategia", "M1_SR_LTA_LTB_RETRACAO")
+                _operacoes_ativas_por_symbol[symbol]["estrategia"] = resultado.get("estrategia", "M5_SR_LTA_LTB_RETRACAO")
                 _operacoes_ativas_por_symbol[symbol]["regime"] = resultado.get("regime", "AUTONOMO")
                 _operacoes_ativas_por_symbol[symbol]["tipo_entrada"] = tipo_entrada
 
@@ -4032,7 +4032,7 @@ def _resultado_retracao_intravela(msg, active_id):
     if decorridos < INTRAVELA_MIN_SEGUNDOS_DECORRIDOS or decorridos > INTRAVELA_MAX_SEGUNDOS_DECORRIDOS: return None
     if restantes < INTRAVELA_MIN_SEGUNDOS_RESTANTES: return None
 
-    m15=_fechadas_antes(_candles_cache(active_id,300),candle_from,60)[-SR_M15_LOOKBACK:]
+    m15=_fechadas_antes(_candles_cache(active_id,300),candle_from,300)[-SR_M15_LOOKBACK:]
     if len(m15)<45: return None
     a=atr(m15,14)
     if not a or a<=0: return None
@@ -4084,10 +4084,10 @@ def _resultado_retracao_intravela(msg, active_id):
     log(f"[M5 RETRACAO] {symbol} {sinal} | {tipo}={nivel:.5f} toques={toques} | tendencia={tendencia} ADX={adx15 if adx15 is not None else 0:.1f} | retracao={retracao*100:.1f}% | confluencia={confluencia}")
     return {
       'sinal':sinal,'score':round(confianca*100,1),'score_call':round(confianca*100,1) if sinal=='CALL' else 0,'score_put':round(confianca*100,1) if sinal=='PUT' else 0,
-      'preco':preco,'vela':datetime.fromtimestamp(candle_from,TZ),'estrategia':'M1_SR_LTA_LTB_RETRACAO','regime':tendencia,
+      'preco':preco,'vela':datetime.fromtimestamp(candle_from,TZ),'estrategia':'M5_SR_LTA_LTB_RETRACAO','regime':tendencia,
       'pullback':f'RETRACAO {retracao*100:.1f}% EM {tipo}','rejeicao':f'REJEICAO {rejeicao/a:.2f} ATR','atr':a,'rsi':rv,
       'ema5':e5,'ema13':e13,'ema21':e21,'tendencia_5m':'N/A','tendencia_15m':tendencia,'bloqueio':'SINAL_M5_RETRACAO',
-      'mensagem':f'{sinal} M1 | {tipo} + retração | confluência={confluencia} | qualidade={confianca*100:.1f}%',
+      'mensagem':f'{sinal} M5 | {tipo} + retração | confluência={confluencia} | qualidade={confianca*100:.1f}%',
       'candle_from':candle_from,'candle_to':candle_to,'segundos_decorridos':decorridos,'segundos_restantes':restantes,
       'impulso':impulso,'retracao_ratio':retracao,'nivel_sr':nivel,'tipo_nivel':tipo,'toques_nivel':toques,'distancia_abertura_nivel':dist_abertura,
       'adx15':adx15,'confianca':confianca,'confianca_ciclo':confianca,'amostras_ciclo':0,'amostras_modelo':len(m15),'margem':0.0,
@@ -4295,18 +4295,18 @@ def _r24_despachar_melhor(candle_from):
             if not ticker:
                 log(f"[SELETOR GLOBAL] {symbol}: ticker não encontrado; pulando candidato.")
                 continue
-            candle_to = int(resultado.get("candle_from", candle_from)) + 900
+            candle_to = int(resultado.get("candle_from", candle_from)) + 300
             instrumento = _buscar_instrumento(
                 int(active_id), resultado.get("sinal"), ticker, candle_to, symbol
             )
             if not instrumento:
-                log(f"[SELETOR GLOBAL] {symbol}: sem DIGITAL M1 SPT; tentando próximo candidato.")
+                log(f"[SELETOR GLOBAL] {symbol}: sem DIGITAL M5 SPT; tentando próximo candidato.")
                 continue
             resultado["instrumento_digital_preselecionado"] = dict(instrumento)
             escolhidos.append((active_id, symbol, resultado))
 
         if not escolhidos:
-            log(f"[SELETOR GLOBAL] vela={candle_from}: nenhum candidato possui DIGITAL M1 SPT disponível; sem entrada.")
+            log(f"[SELETOR GLOBAL] vela={candle_from}: nenhum candidato possui DIGITAL M5 SPT disponível; sem entrada.")
             return
 
         for posicao, (active_id, symbol, resultado) in enumerate(escolhidos, start=1):
@@ -4412,7 +4412,7 @@ def _tentar_gale_na_proxima_vela(active_id, msg):
             "id": chave, "symbol": symbol, "mercado": _mercado_do_symbol(symbol),
             "sinal": gale["sinal"], "score": 0, "confianca": 0.0,
             "faixa_confianca": "GALE", "ajuste_online": 0.0, "adaptativo": {},
-            "estrategia": resultado.get("estrategia", "M1_SR_LTA_LTB_RETRACAO"), "regime": "GALE_OBRIGATORIO_APOS_LOSS",
+            "estrategia": resultado.get("estrategia", "M5_SR_LTA_LTB_RETRACAO"), "regime": "GALE_OBRIGATORIO_APOS_LOSS",
             "preco_sinal": preco, "vela_sinal": datetime.fromtimestamp(candle_from, TZ),
             "vela_entrada": datetime.fromtimestamp(candle_from, TZ),
             "vela_expiracao": datetime.fromtimestamp(candle_from, TZ),
@@ -4830,7 +4830,7 @@ def registrar_operacao_intravela(symbol, resultado):
         "faixa_confianca": resultado.get("faixa_confianca") or _autonomo_faixa_confianca(resultado.get("confianca", 0.0)),
         "ajuste_online": resultado.get("ajuste_online", 0.0),
         "adaptativo": resultado.get("adaptativo", {}),
-        "estrategia": resultado.get("estrategia", "M1_SR_LTA_LTB_RETRACAO"),
+        "estrategia": resultado.get("estrategia", "M5_SR_LTA_LTB_RETRACAO"),
         "regime": resultado.get("regime", "AUTONOMO"),
         "preco_sinal": float(resultado["preco"]),
         "vela_sinal": candle_dt,
@@ -5476,7 +5476,7 @@ content="width=device-width,
 initial-scale=1.0">
 
 <title>
-Radar OTC M1
+Radar OTC M5
 </title>
 
 <style>
@@ -5642,12 +5642,12 @@ h1 {
 <div class="container">
 
 <h1>
-Radar OTC M1
+Radar OTC M5
 </h1>
 
 <div class="subtitulo">
 
-M1 • Radar de retração • atualização a cada 1 segundo
+M5 • Radar de retração • atualização a cada 1 segundo
 
 </div>
 
@@ -5970,7 +5970,7 @@ setTimeout(function(){ location.reload(); }, 1000);
           <div style="opacity:.8">Preço: ${esc(a.preco)} • fecha em ${esc(a.restantes)}s</div>
           <div style="height:8px;background:#333;border-radius:99px;overflow:hidden;margin-top:10px"><div style="height:100%;width:${a.progresso}%;background:currentColor"></div></div>
         </div>`;
-      }).join('') || '<div style="opacity:.7">Aguardando candles M1 suficientes…</div>';
+      }).join('') || '<div style="opacity:.7">Aguardando candles M5 suficientes…</div>';
       clock.textContent = 'Ao vivo • ' + new Date().toLocaleTimeString();
       const atual = ativos.filter(a=>a.status==='ENTRAR AGORA').map(a=>a.ativo+':'+a.direcao).join('|');
       if(atual && atual !== ultimoEntrar && 'AudioContext' in window){
@@ -6109,6 +6109,23 @@ def _radar_m5_ao_vivo():
     return itens[:6]
 
 
+@app.route("/radar-m1")
+def radar_m1_compat():
+    """Compatibilidade temporária para páginas antigas em cache: entrega o Radar M5."""
+    return jsonify({
+        "status": "ok",
+        "timeframe": "M5",
+        "modo": "MANUAL",
+        "atualizacao_ms": 1000,
+        "ativos": _radar_m5_ao_vivo(),
+        "candles_m5_armazenados": sum(
+            len(_candles_cache(int(v.get("active_id")), 300))
+            for v in ATIVO_BULLEX.values()
+            if isinstance(v, dict) and v.get("active_id") is not None
+        ),
+    })
+
+
 @app.route("/radar-m5")
 def radar_m5():
     return jsonify({
@@ -6117,7 +6134,7 @@ def radar_m5():
         "modo": "MANUAL",
         "atualizacao_ms": 1000,
         "ativos": _radar_m5_ao_vivo(),
-        "candles_m5_armazenados": sum(len(_candles_cache(int(v.get("active_id")), 60)) for v in ATIVO_BULLEX.values() if isinstance(v, dict) and v.get("active_id") is not None),
+        "candles_m5_armazenados": sum(len(_candles_cache(int(v.get("active_id")), 300)) for v in ATIVO_BULLEX.values() if isinstance(v, dict) and v.get("active_id") is not None),
     })
 
 
