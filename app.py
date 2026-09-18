@@ -119,7 +119,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OTC-M1-R40-RADAR-AO-VIVO-CORRIGIDO-20260918"
+BULLEX_DIAGNOSTIC_VERSION = "OTC-M1-R41-RADAR-LIMPO-20260918"
 
 _bullex_diag = {
     "messages": 0,
@@ -6123,22 +6123,81 @@ def radar_m1():
 
 @app.route("/")
 def index():
-    garantir_robo_iniciado()
-
-    estado[
-        "estatisticas"
-    ] = calcular_estatisticas()
-
-    return render_template_string(
-        HTML,
-        estado=estado,
-        grafico=_dados_grafico_dashboard(),
-        financeiro=calcular_financeiro(),
-        valor_entrada_atual=_valor_entrada_atual(),
-        valor_gale_atual=_valor_gale_atual(),
-        bloqueios_pares=calcular_bloqueios_por_par()
-    )
-
+    return render_template_string(r"""
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Radar M1</title>
+<style>
+:root{color-scheme:dark}
+*{box-sizing:border-box}
+body{margin:0;background:#0d0f12;color:#f4f6f8;font-family:Arial,sans-serif}
+main{max-width:1100px;margin:auto;padding:14px}
+.top{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:12px}
+h1{font-size:22px;margin:0}.live{font-size:13px;opacity:.75}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:12px}
+.card{border:1px solid #343941;border-radius:14px;padding:15px;background:#15181d;min-height:145px}
+.card.enter{border:3px solid currentColor}
+.card.attn{border:2px solid currentColor}
+.row{display:flex;justify-content:space-between;gap:8px;align-items:center}
+.asset{font-size:18px;font-weight:800}.pct{font-weight:800}
+.signal{font-size:23px;font-weight:900;margin:13px 0 9px}
+.meta{font-size:14px;opacity:.78}
+.bar{height:9px;background:#30343a;border-radius:99px;overflow:hidden;margin-top:12px}
+.fill{height:100%;background:currentColor}
+.empty{opacity:.7;padding:18px 2px}
+@media(max-width:520px){main{padding:10px}.grid{grid-template-columns:1fr}.signal{font-size:21px}}
+</style>
+</head>
+<body>
+<main>
+  <div class="top">
+    <h1>Radar M1 ao vivo</h1>
+    <div id="clock" class="live">Conectando…</div>
+  </div>
+  <div id="grid" class="grid"><div class="empty">Aguardando mercado…</div></div>
+</main>
+<script>
+(function(){
+ const grid=document.getElementById('grid'), clock=document.getElementById('clock');
+ let ultimo='';
+ const esc=v=>String(v==null?'':v).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+ async function update(){
+   try{
+     const r=await fetch('/radar-m1',{cache:'no-store'});
+     const d=await r.json();
+     const a=Array.isArray(d.ativos)?d.ativos:[];
+     grid.innerHTML=a.map(x=>{
+       const entrar=x.status==='ENTRAR AGORA', at=x.status==='ATENÇÃO';
+       const cls='card'+(entrar?' enter':at?' attn':'');
+       let sinal=esc(x.status);
+       if(entrar) sinal=x.direcao==='CALL'?'🟢 COMPRA AGORA':'🔴 VENDA AGORA';
+       return `<div class="${cls}">
+         <div class="row"><span class="asset">${esc(x.ativo)}</span><span class="pct">${esc(x.progresso)}%</span></div>
+         <div class="signal">${sinal}</div>
+         <div class="meta">Fecha em <strong>${esc(x.restantes)}s</strong></div>
+         <div class="bar"><div class="fill" style="width:${Math.max(0,Math.min(100,Number(x.progresso)||0))}%"></div></div>
+       </div>`;
+     }).join('')||'<div class="empty">Aguardando ativos M1…</div>';
+     clock.textContent='AO VIVO • '+new Date().toLocaleTimeString();
+     const atual=a.filter(x=>x.status==='ENTRAR AGORA').map(x=>x.ativo+':'+x.direcao).join('|');
+     if(atual && atual!==ultimo && 'AudioContext' in window){
+       try{
+         const ac=new AudioContext(),o=ac.createOscillator(),g=ac.createGain();
+         o.connect(g);g.connect(ac.destination);o.frequency.value=880;g.gain.value=.05;o.start();o.stop(ac.currentTime+.16);
+       }catch(e){}
+     }
+     ultimo=atual;
+   }catch(e){clock.textContent='Reconectando…';}
+ }
+ update(); setInterval(update,1000);
+})();
+</script>
+</body>
+</html>
+""")
 
 @app.route("/dados")
 def dados():
