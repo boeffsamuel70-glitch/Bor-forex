@@ -119,7 +119,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OTC-M15-R35-FLUXO-INTRAVELA-20260918"
+BULLEX_DIAGNOSTIC_VERSION = "OTC-M15-R36-DASH-GRAFICO-SR-LTA-LTB-20260918"
 
 _bullex_diag = {
     "messages": 0,
@@ -5375,6 +5375,91 @@ def calcular_bloqueios_por_par():
     return saida
 
 
+
+def _dados_grafico_dashboard():
+    """Monta o gráfico M15 usando exatamente os candles e níveis calculados pelo robô."""
+    symbol_alvo = estado.get("ativo")
+    cfg_alvo = None
+    codigo_alvo = None
+
+    with _bullex_assets_lock:
+        itens = [(codigo, dict(cfg)) for codigo, cfg in ATIVO_BULLEX.items()]
+
+    # Primeiro tenta mostrar o ativo que o robô analisou/sinalizou por último.
+    for codigo, cfg in itens:
+        if cfg.get("symbol") == symbol_alvo:
+            codigo_alvo, cfg_alvo = codigo, cfg
+            break
+
+    # Se ainda não houve sinal, escolhe o primeiro ativo que já tenha M15 suficiente.
+    if cfg_alvo is None:
+        for codigo, cfg in itens:
+            aid = cfg.get("active_id")
+            if aid is not None and len(_candles_cache(int(aid), 900)) >= 20:
+                codigo_alvo, cfg_alvo = codigo, cfg
+                break
+
+    if not cfg_alvo:
+        return {"pronto": False, "symbol": symbol_alvo or "-", "candles": [], "niveis": []}
+
+    active_id = int(cfg_alvo["active_id"])
+    candles = _candles_cache(active_id, 900)[-55:]
+    serie = []
+    for c in candles:
+        try:
+            ts = int(float(c.get("from") or 0))
+            if not ts:
+                dt = c.get("_dt") or parse_datetime_candle(c.get("datetime"))
+                ts = int(dt.timestamp()) if dt else 0
+            serie.append({
+                "t": ts,
+                "o": float(c["open"]),
+                "h": float(c["high"]),
+                "l": float(c["low"]),
+                "c": float(c["close"]),
+            })
+        except Exception:
+            continue
+
+    fechadas = somente_velas_fechadas(candles, 15)
+    atr15 = atr(fechadas[-SR_M15_LOOKBACK:], 14) if fechadas else None
+    niveis = []
+
+    try:
+        sup, res, _ = _niveis_sr_m15(active_id)
+        for g in sup[-4:]:
+            niveis.append({"tipo": "SUPORTE", "nivel": float(g["nivel"]), "toques": int(g.get("toques", 0))})
+        for g in res[-4:]:
+            niveis.append({"tipo": "RESISTENCIA", "nivel": float(g["nivel"]), "toques": int(g.get("toques", 0))})
+    except Exception:
+        pass
+
+    if atr15 and fechadas:
+        try:
+            lta = _linha_tendencia_m15(fechadas[-SR_M15_LOOKBACK:], "LTA", atr15)
+            if lta:
+                niveis.append({"tipo": "LTA", "nivel": float(lta["nivel"]), "slope": float(lta["slope"]), "toques": 2})
+        except Exception:
+            pass
+        try:
+            ltb = _linha_tendencia_m15(fechadas[-SR_M15_LOOKBACK:], "LTB", atr15)
+            if ltb:
+                niveis.append({"tipo": "LTB", "nivel": float(ltb["nivel"]), "slope": float(ltb["slope"]), "toques": 2})
+        except Exception:
+            pass
+
+    return {
+        "pronto": bool(serie),
+        "symbol": cfg_alvo.get("symbol", codigo_alvo),
+        "active_id": active_id,
+        "candles": serie,
+        "niveis": niveis,
+        "sinal": estado.get("sinal", "AGUARDAR"),
+        "preco": estado.get("preco", "0"),
+        "atualizado": estado.get("atualizado", "-"),
+    }
+
+
 # ============================================================
 # INTERFACE HTML
 # ============================================================
@@ -5393,7 +5478,7 @@ content="width=device-width,
 initial-scale=1.0">
 
 <title>
-Robô OTC Autônomo KNN
+Robô OTC M15
 </title>
 
 <style>
@@ -5546,6 +5631,10 @@ h1 {
 .tabela-pares th,.tabela-pares td { padding:8px 5px; border-bottom:1px solid #444; text-align:center; }
 .tabela-pares th:first-child,.tabela-pares td:first-child { text-align:left; }
 .tabela-wrap { overflow-x:auto; }
+
+.grafico-m15 { width:100%; margin-top:14px; overflow:hidden; background:#151515; border:1px solid #333; border-radius:12px; }
+.grafico-m15 svg { display:block; width:100%; height:auto; min-height:300px; }
+.legenda-grafico { display:flex; flex-wrap:wrap; gap:12px; justify-content:center; margin-top:10px; color:#bbb; font-size:12px; }
 </style>
 
 </head>
@@ -5555,12 +5644,12 @@ h1 {
 <div class="container">
 
 <h1>
-Robô OTC Autônomo KNN
+Robô OTC M15
 </h1>
 
 <div class="subtitulo">
 
-Autônomo KNN DIGITAL OTC + melhor par global + Gale 1 R$ 6
+M15 • Suporte/Resistência • LTA/LTB • Retração intravela
 
 </div>
 
@@ -5569,7 +5658,7 @@ Autônomo KNN DIGITAL OTC + melhor par global + Gale 1 R$ 6
 <div class="linha"><span>Modo</span><span class="valor">{{ estado.execucao.modo }}</span></div>
 <div class="linha"><span>Automática</span><span class="valor">{{ "ATIVA" if estado.execucao.automatica else "DESATIVADA" }}</span></div>
 <div class="linha"><span>Entrada atual</span><span class="valor">R$ {{ "%.2f"|format(estado.execucao.valor_atual) }}</span></div>
-<div class="linha"><span>Progressão</span><span class="valor">R$ 5,00 normal | Gale 1 R$ 6,00</span></div>
+<div class="linha"><span>Entrada</span><span class="valor">R$ 5,00 fixa • sem Martingale</span></div>
 <div class="linha"><span>Operação ativa</span><span class="valor">{{ "SIM" if estado.execucao.operacao_ativa else "NÃO" }}</span></div>
 <div class="linha"><span>Balance DEMO</span><span class="valor">{{ "ENCONTRADO" if estado.execucao.balance_id_disponivel else "AGUARDANDO" }}</span></div>
 <div class="linha"><span>Último erro</span><span class="valor">{{ estado.execucao.ultimo_erro or "-" }}</span></div>
@@ -5627,110 +5716,18 @@ Autônomo KNN DIGITAL OTC + melhor par global + Gale 1 R$ 6
 </div>
 
 <div class="card">
-
-<h3>
-Filtros da entrada
-</h3>
-
-<div class="linha">
-<span>Regime</span>
-<span class="valor">{{ estado.detalhes.regime }}</span>
+<h3>Visão do robô — gráfico M15</h3>
+<div class="linha"><span>Ativo no gráfico</span><span class="valor">{{ grafico.symbol }}</span></div>
+<div class="linha"><span>Timeframe</span><span class="valor">M15</span></div>
+<div id="grafico-m15" class="grafico-m15">
+<svg id="svg-m15" viewBox="0 0 720 390" role="img" aria-label="Candles M15 com suporte, resistência, LTA e LTB"></svg>
 </div>
-
-<div class="linha">
-<span>Estratégia</span>
-<span class="valor">{{ estado.detalhes.estrategia }}</span>
+<div id="legenda-grafico" class="legenda-grafico">
+<span>— SUP suporte</span><span>— RES resistência</span><span>／ LTA</span><span>＼ LTB</span>
 </div>
-
-<div class="linha">
-<span>Nível M15</span>
-<span class="valor">MESMA VELA 5M</span>
+<div class="observacao" style="margin-top:10px">
+As linhas são calculadas com os mesmos candles M15 usados pela estratégia. Atualização automática a cada 10 segundos.
 </div>
-
-<div class="linha">
-<span>Tendência 5M</span>
-<span class="valor">
-{{ estado.detalhes.tendencia_5m }}
-</span>
-</div>
-
-<div class="linha">
-<span>Tendência 15M</span>
-<span class="valor">
-{{ estado.detalhes.tendencia_15m }}
-</span>
-</div>
-
-<div class="linha">
-<span>Pullback</span>
-<span class="valor">
-{{ estado.detalhes.pullback }}
-</span>
-</div>
-
-<div class="linha">
-<span>Confirmação</span>
-<span class="valor">
-{{ estado.detalhes.confirmacao }}
-</span>
-</div>
-
-<div class="linha">
-<span>Mercado lateral</span>
-<span class="valor">
-{{ estado.detalhes.lateral }}
-</span>
-</div>
-
-<div class="linha">
-<span>Score CALL</span>
-<span class="valor">
-{{ estado.detalhes.score_call }}
-</span>
-</div>
-
-<div class="linha">
-<span>Score PUT</span>
-<span class="valor">
-{{ estado.detalhes.score_put }}
-</span>
-</div>
-
-<div class="linha">
-<span>RSI 14</span>
-<span class="valor">
-{{ estado.detalhes.rsi }}
-</span>
-</div>
-
-<div class="linha">
-<span>EMA 5</span>
-<span class="valor">
-{{ estado.detalhes.ema5 }}
-</span>
-</div>
-
-<div class="linha">
-<span>EMA 13</span>
-<span class="valor">
-{{ estado.detalhes.ema13 }}
-</span>
-</div>
-
-<div class="linha">
-<span>EMA 21</span>
-<span class="valor">
-{{ estado.detalhes.ema21 }}
-</span>
-</div>
-
-<div class="linha">
-<span>ATR 14</span>
-<span class="valor">
-{{ estado.detalhes.atr }}
-</span>
-</div>
-
 </div>
 
 <div class="card">
@@ -5796,15 +5793,11 @@ Taxa de acerto
 </div>
 
 <div class="card">
-<h3>Resultados por par</h3>
-<div class="tabela-wrap">
-<table class="tabela-pares">
-<tr><th>Ativo</th><th>Status</th><th>WIN</th><th>LOSS</th><th>WIN 1ª</th><th>LOSS 1ª</th><th>Gale WIN</th><th>Gale LOSS</th><th>Lucro</th><th>Taxa</th></tr>
-{% for p in estatisticas_pares %}
-<tr><td>{{ p.symbol }}</td><td>{% set b = bloqueios_pares.get(p.symbol, {}) %}{% if b.get('bloqueado') %}BLOQUEADO {{ b.get('minutos_restantes') }} min{% else %}ATIVO{% endif %}</td><td>{{ p.wins }}</td><td>{{ p.losses }}</td><td>{{ p.primeira_wins }}</td><td>{{ p.primeira_losses }}</td><td>{{ p.gale_wins }}</td><td>{{ p.gale_losses }}</td><td>R$ {{ '%.2f'|format(p.lucro) }}</td><td>{{ p.taxa }}%</td></tr>
-{% endfor %}
-</table>
-</div>
+<h3>Operação atual</h3>
+<div class="linha"><span>Último ativo</span><span class="valor">{{ estado.ativo }}</span></div>
+<div class="linha"><span>Direção</span><span class="valor">{{ estado.sinal }}</span></div>
+<div class="linha"><span>Preço</span><span class="valor">{{ estado.preco }}</span></div>
+<div class="linha"><span>Vela M15</span><span class="valor">{{ estado.vela }}</span></div>
 </div>
 
 <div class="card">
@@ -5820,13 +5813,13 @@ Quando houver sinal:
 <br>
 
 <strong>
-Entrada: próxima vela de 5 minutos
+Entrada: durante a retração da vela M15
 </strong>
 
 <br>
 
 <strong>
-Expiração: 5 minutos
+Expiração: fechamento da mesma vela M15
 </strong>
 
 <br><br>
@@ -5872,13 +5865,78 @@ a cada 10 segundos.
 </div>
 
 <script>
+(function () {
+    const dados = {{ grafico|tojson }};
+    const svg = document.getElementById("svg-m15");
+    if (!svg) return;
 
-setTimeout(function() {
+    const NS = "http://www.w3.org/2000/svg";
+    const W = 720, H = 390, left = 58, right = 12, top = 16, bottom = 34;
+    const candles = Array.isArray(dados.candles) ? dados.candles : [];
+    const niveis = Array.isArray(dados.niveis) ? dados.niveis : [];
 
-    location.reload();
+    function el(tag, attrs, txt) {
+        const n = document.createElementNS(NS, tag);
+        Object.entries(attrs || {}).forEach(([k,v]) => n.setAttribute(k, String(v)));
+        if (txt !== undefined) n.textContent = txt;
+        svg.appendChild(n);
+        return n;
+    }
 
-}, 10000);
+    if (!candles.length) {
+        el("text", {x: W/2, y: H/2, fill:"#aaa", "text-anchor":"middle", "font-size":"16"}, "Aguardando candles M15...");
+        return;
+    }
 
+    let minP = Math.min(...candles.map(c => c.l), ...niveis.map(n => n.nivel));
+    let maxP = Math.max(...candles.map(c => c.h), ...niveis.map(n => n.nivel));
+    let pad = Math.max((maxP-minP)*0.08, Math.abs(maxP)*0.0001);
+    minP -= pad; maxP += pad;
+    const plotW = W-left-right, plotH = H-top-bottom;
+    const y = p => top + (maxP-p)/(maxP-minP)*plotH;
+    const step = plotW / candles.length;
+    const x = i => left + step*(i+0.5);
+
+    // Grade e escala de preço.
+    for (let i=0;i<=4;i++) {
+        const yy = top + plotH*i/4;
+        const price = maxP - (maxP-minP)*i/4;
+        el("line",{x1:left,y1:yy,x2:W-right,y2:yy,stroke:"#2d2d2d","stroke-width":"1"});
+        el("text",{x:left-6,y:yy+4,fill:"#888","text-anchor":"end","font-size":"10"}, price.toFixed(price < 10 ? 5 : 3));
+    }
+
+    // Candles.
+    candles.forEach((c,i) => {
+        const xx=x(i), up=c.c>=c.o;
+        const stroke = up ? "#8bcf9b" : "#e58b8b";
+        el("line",{x1:xx,y1:y(c.h),x2:xx,y2:y(c.l),stroke:stroke,"stroke-width":"1.2"});
+        const yo=y(Math.max(c.o,c.c)), yc=y(Math.min(c.o,c.c));
+        el("rect",{x:xx-Math.max(2,step*0.28),y:yo,width:Math.max(3,step*0.56),height:Math.max(1,yc-yo),fill:stroke,rx:"0.5"});
+    });
+
+    // Níveis horizontais e linhas de tendência projetadas.
+    niveis.forEach((n,idx) => {
+        const isTrend = n.tipo==="LTA" || n.tipo==="LTB";
+        const stroke = n.tipo==="SUPORTE" ? "#78aee8" : n.tipo==="RESISTENCIA" ? "#e5b96f" : n.tipo==="LTA" ? "#75c7a1" : "#d78fa7";
+        if (isTrend && Number.isFinite(Number(n.slope))) {
+            const base = Number(n.nivel);
+            const slope = Number(n.slope);
+            const p0 = base - slope*(candles.length-1);
+            el("line",{x1:x(0),y1:y(p0),x2:x(candles.length-1),y2:y(base),stroke:stroke,"stroke-width":"1.7","stroke-dasharray":"6 4"});
+        } else {
+            el("line",{x1:left,y1:y(n.nivel),x2:W-right,y2:y(n.nivel),stroke:stroke,"stroke-width":"1.4","stroke-dasharray":"5 4"});
+        }
+        el("text",{x:W-right-3,y:y(n.nivel)-3,fill:stroke,"text-anchor":"end","font-size":"10"}, n.tipo+" "+Number(n.nivel).toFixed(Number(n.nivel)<10?5:3));
+    });
+
+    // Horários aproximados no eixo X.
+    [0, Math.floor((candles.length-1)/2), candles.length-1].forEach(i => {
+        const d = new Date(Number(candles[i].t)*1000);
+        const label = Number.isFinite(d.getTime()) ? d.toLocaleTimeString("pt-BR",{hour:"2-digit",minute:"2-digit"}) : "";
+        el("text",{x:x(i),y:H-10,fill:"#888","text-anchor":"middle","font-size":"10"},label);
+    });
+})();
+setTimeout(function(){ location.reload(); }, 10000);
 </script>
 
 </body>
@@ -5902,7 +5960,7 @@ def index():
     return render_template_string(
         HTML,
         estado=estado,
-        estatisticas_pares=calcular_estatisticas_por_par(),
+        grafico=_dados_grafico_dashboard(),
         financeiro=calcular_financeiro(),
         valor_entrada_atual=_valor_entrada_atual(),
         valor_gale_atual=_valor_gale_atual(),
