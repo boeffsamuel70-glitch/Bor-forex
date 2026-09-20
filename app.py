@@ -119,7 +119,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OTC-M5-R43-RADAR-LIMPO-CORRIGIDO-20260918"
+BULLEX_DIAGNOSTIC_VERSION = "OTC-M5-R44-AUTO3-META50-PAUSA4H-20260920"
 
 _bullex_diag = {
     "messages": 0,
@@ -160,7 +160,7 @@ MAX_ATRASO_MINUTOS = 8
 # EXECUÇÃO AUTOMÁTICA - DEMO
 # ============================================================
 
-BULLEX_AUTO_TRADE = False  # R39: painel manual; não executa ordens automaticamente
+BULLEX_AUTO_TRADE = True  # R44: entradas automáticas habilitadas
 
 BULLEX_USER_BALANCE_ID = os.getenv(
     "BULLEX_USER_BALANCE_ID",
@@ -209,8 +209,59 @@ M15_RETRACAO_MAX = 0.72
 M15_LINHA_TOLERANCIA_ATR = 0.22
 MARTINGALE_ATIVO = False
 
-MAX_OPERACOES_GLOBAIS = 2
+MAX_OPERACOES_GLOBAIS = 3
 MAX_OPERACOES_POR_ATIVO = 1
+
+# R44: nunca operar estes ativos.
+ATIVOS_BLOQUEADOS_R44 = {"USD/BRL OTC", "USDBRL-OTC", "USDBRL_OTC", "AUS200 OTC", "AUS200-OTC", "AUS/OTC OTC"}
+
+# R44: ao atingir R$ 50,00 de lucro líquido desde este deploy,
+# pausa novas entradas por 4 horas e depois libera automaticamente.
+META_LUCRO_PAUSA = 50.00
+PAUSA_LUCRO_SEGUNDOS = 4 * 60 * 60
+_pausa_lucro_ate = 0.0
+_pausa_lucro_acionada = False
+
+def _ativo_bloqueado_r44(symbol=None, ticker=None, codigo=None, raw=None):
+    textos = [symbol, ticker, codigo]
+    if isinstance(raw, dict):
+        textos.extend(raw.get(k) for k in (
+            "name", "symbol", "ticker", "description", "display_name",
+            "underlying", "underlying_name"
+        ))
+    bruto = " ".join(str(x or "") for x in textos).upper()
+    compacto = re.sub(r"[^A-Z0-9]", "", bruto)
+    # AUS200 às vezes era normalizado no app antigo como AUS/OTC.
+    return (
+        "USDBRL" in compacto
+        or "AUS200" in compacto
+        or str(symbol or "").upper().strip() == "AUS/OTC OTC"
+    )
+
+def _status_pausa_lucro():
+    global _pausa_lucro_ate
+    restante = max(0, int(_pausa_lucro_ate - time.time()))
+    return {
+        "ativa": restante > 0,
+        "restante_segundos": restante,
+        "ate": (
+            datetime.fromtimestamp(_pausa_lucro_ate, TZ).isoformat()
+            if restante > 0 else None
+        ),
+    }
+
+def _verificar_meta_lucro():
+    global _pausa_lucro_ate, _pausa_lucro_acionada
+    financeiro = calcular_financeiro()
+    lucro = float(financeiro.get("lucro_total", 0.0) or 0.0)
+    if (not _pausa_lucro_acionada) and lucro >= META_LUCRO_PAUSA:
+        _pausa_lucro_acionada = True
+        _pausa_lucro_ate = time.time() + PAUSA_LUCRO_SEGUNDOS
+        ate = datetime.fromtimestamp(_pausa_lucro_ate, TZ).strftime("%d/%m %H:%M:%S")
+        log(f"[META LUCRO] R${lucro:.2f} atingidos. Novas entradas PAUSADAS por 4 horas, até {ate} BRT.")
+        return True
+    return False
+
 AUTONOMO_MIN_AMOSTRAS = 45
 AUTONOMO_K_VIZINHOS = 17
 AUTONOMO_CONFIANCA_MIN = 0.62
@@ -1072,6 +1123,15 @@ def executar_ordem_intravela(symbol, sinal, resultado, valor_override=None, tipo
 
     if sinal not in ("CALL", "PUT"):
         return None
+
+    if _ativo_bloqueado_r44(symbol=symbol):
+        log(f"[R44 BLOQUEIO] {symbol}: ativo excluído das operações automáticas.")
+        return "ATIVO_EXCLUIDO"
+
+    pausa = _status_pausa_lucro()
+    if pausa["ativa"]:
+        log(f"[META LUCRO] {symbol}: nova entrada bloqueada; pausa de lucro ainda ativa por {pausa['restante_segundos']}s.")
+        return "PAUSA_META_LUCRO"
 
     if not BULLEX_USER_BALANCE_ID:
         estado["execucao"]["ultimo_erro"] = "SEM_BALANCE_ID"
@@ -2217,6 +2277,9 @@ def _normalizar_par_mercado_aberto(item):
         return None
 
     par = base[:6]
+
+    if _ativo_bloqueado_r44(symbol=symbol, ticker=ticker, raw=item):
+        return None
 
     if is_otc:
         # R8: aceita dinamicamente TODOS os pares OTC devolvidos pela lista DIGITAL
@@ -4435,6 +4498,10 @@ def _processar_sinal_intravela(active_id, msg):
     codigo, symbol = _symbol_por_active_id(active_id)
     if not codigo or not symbol:
         return
+    if _ativo_bloqueado_r44(symbol=symbol, codigo=codigo):
+        return
+    if _status_pausa_lucro()["ativa"]:
+        return
     if _status_bloqueio_ativo(symbol):
         return
 
@@ -4781,14 +4848,14 @@ def enviar_status_ordem_telegram(symbol, sinal, status, detalhe=""):
             "🔄 GALE 1 CONFIRMADO\n\n"
             f"💱 Ativo: {symbol}\n"
             f"📍 Direção: {direcao}\n"
-            "⏱ Expiração: fim da mesma vela de 1 minuto"
+            "⏱ Expiração: fim da mesma vela M5"
         )
     else:
         texto = (
             "🚨 SINAL CONFIRMADO\n\n"
             f"💱 Ativo: {symbol}\n"
             f"📍 Direção: {direcao}\n"
-            "⏱ Expiração: fim da mesma vela de 1 minuto\n\n"
+            "⏱ Expiração: fim da mesma vela M5\n\n"
             "✅ Entrada confirmada"
         )
     enviar_telegram(texto)
@@ -4908,6 +4975,7 @@ def avaliar_operacao(symbol, candles):
         valor_op = float(operacao.get("valor", 0.0) or 0.0)
         operacao["lucro_operacao"] = round(valor_op * payout / 100.0 if resultado == "WIN" else -valor_op if resultado == "LOSS" else 0.0, 2)
         _historico_resultados.append(operacao.copy())
+        _verificar_meta_lucro()
         del _operacoes_pendentes[symbol]
 
         with _execucao_lock:
@@ -4950,7 +5018,7 @@ def enviar_resultado_telegram(operacao, estatisticas):
             "🟢 WIN ✅\n\n"
             f"💱 {symbol}\n"
             f"📍 {direcao}\n\n"
-            "🏆 WIN M15!"
+            "🏆 WIN M5!"
         )
     elif resultado == "LOSS" and tipo != "GALE":
         texto = (
@@ -5022,8 +5090,8 @@ def loop_parcial_horaria_telegram():
 
         texto = (
             "📊 PARCIAL — ÚLTIMA HORA\n\n"
-            f"🟢 WIN M15: {primeira_wins}\n"
-            f"🔴 LOSS M15: {ciclos_loss}\n\n"
+            f"🟢 WIN M5: {primeira_wins}\n"
+            f"🔴 LOSS M5: {ciclos_loss}\n\n"
             f"📈 Total: {total} ciclos\n"
             f"🏆 {wins} WIN | {ciclos_loss} LOSS\n"
             f"🎯 Assertividade: {taxa:.1f}%\n\n"
@@ -5996,8 +6064,8 @@ setTimeout(function(){ location.reload(); }, 1000);
 
 
 
-# R42_MANUAL_FORCE: este app é radar manual; não envia ordens automaticamente.
-BULLEX_AUTO_TRADE = False
+# R44: execução automática permanece habilitada.
+BULLEX_AUTO_TRADE = True
 
 # ============================================================
 # ROTAS
@@ -6115,7 +6183,7 @@ def radar_m1_compat():
     return jsonify({
         "status": "ok",
         "timeframe": "M5",
-        "modo": "MANUAL",
+        "modo": "AUTOMATICO",
         "atualizacao_ms": 1000,
         "ativos": _radar_m5_ao_vivo(),
         "candles_m5_armazenados": sum(
@@ -6128,12 +6196,20 @@ def radar_m1_compat():
 
 @app.route("/radar-m5")
 def radar_m5():
+    financeiro = calcular_financeiro()
+    stats = calcular_estatisticas()
     return jsonify({
         "status": "ok",
         "timeframe": "M5",
-        "modo": "MANUAL",
+        "modo": "AUTOMATICO",
         "atualizacao_ms": 1000,
         "ativos": _radar_m5_ao_vivo(),
+        "estatisticas": stats,
+        "financeiro": financeiro,
+        "pausa_lucro": _status_pausa_lucro(),
+        "meta_lucro": META_LUCRO_PAUSA,
+        "max_operacoes": MAX_OPERACOES_GLOBAIS,
+        "operacoes_ativas": _qtd_operacoes_globais_em_andamento(),
         "candles_m5_armazenados": sum(len(_candles_cache(int(v.get("active_id")), 300)) for v in ATIVO_BULLEX.values() if isinstance(v, dict) and v.get("active_id") is not None),
     })
 
@@ -6174,11 +6250,21 @@ h1{font-size:22px;margin:0}.live{font-size:13px;opacity:.75}
     <h1>Radar M5 ao vivo</h1>
     <div id="clock" class="live">Conectando…</div>
   </div>
+  <div id="resumo" style="display:grid;grid-template-columns:repeat(4,minmax(120px,1fr));gap:8px;margin-bottom:12px">
+    <div class="card" style="min-height:auto"><div class="meta">Vitórias</div><strong id="wins">0</strong></div>
+    <div class="card" style="min-height:auto"><div class="meta">Perdas</div><strong id="losses">0</strong></div>
+    <div class="card" style="min-height:auto"><div class="meta">Lucro</div><strong id="lucro">R$ 0,00</strong></div>
+    <div class="card" style="min-height:auto"><div class="meta">Operações</div><strong id="ops">0/3</strong></div>
+  </div>
+  <div id="pausa" class="meta" style="margin:0 0 12px 2px">AUTO ATIVO • Meta de pausa: R$ 50,00</div>
   <div id="grid" class="grid"><div class="empty">Aguardando mercado…</div></div>
 </main>
 <script>
 (function(){
  const grid=document.getElementById('grid'), clock=document.getElementById('clock');
+ const wins=document.getElementById('wins'), losses=document.getElementById('losses'),
+       lucro=document.getElementById('lucro'), ops=document.getElementById('ops'),
+       pausa=document.getElementById('pausa');
  let ultimo='';
  const esc=v=>String(v==null?'':v).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
  async function update(){
