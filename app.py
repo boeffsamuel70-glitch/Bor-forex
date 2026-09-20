@@ -119,7 +119,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OTC-M5-R47-RETRY-SPT-EXECUCAO-CORRIGIDA-20260920"
+BULLEX_DIAGNOSTIC_VERSION = "OTC-M5-R48-BLOQUEIO-DUPLICATA-ATIVO-20260920"
 
 _bullex_diag = {
     "messages": 0,
@@ -4386,13 +4386,20 @@ def _r24_despachar_melhor(candle_from):
             )
             status_ordem = registrar_operacao_intravela(symbol, resultado)
             if status_ordem != "CONFIRMADA":
-                # R47: só mantém a vela marcada como tentada após confirmação real.
-                with _intravela_lock:
-                    _intravela_velas_tentadas.discard((int(active_id), candle_from))
-                log(
-                    f"[M5 RETRY] {symbol}: ordem não confirmada ({status_ordem}); "
-                    "setup liberado para nova tentativa enquanto a vela M5 estiver válida."
-                )
+                # R48: se já existe operação pendente/registrada neste ativo,
+                # NÃO libera retry. Evita duas ordens simultâneas no mesmo ativo.
+                if status_ordem in ("JA_REGISTRADA", "JA_PENDENTE"):
+                    log(
+                        f"[M5 BLOQUEIO DUPLICATA] {symbol}: {status_ordem}; "
+                        "nova ordem no mesmo ativo bloqueada."
+                    )
+                else:
+                    with _intravela_lock:
+                        _intravela_velas_tentadas.discard((int(active_id), candle_from))
+                    log(
+                        f"[M5 RETRY] {symbol}: ordem não confirmada ({status_ordem}); "
+                        "setup liberado para nova tentativa enquanto a vela M5 estiver válida."
+                    )
 
     finally:
         with _r24_candidatos_lock:
@@ -4890,6 +4897,11 @@ def registrar_operacao_intravela(symbol, resultado):
 
     if symbol in _operacoes_pendentes:
         return "JA_PENDENTE"
+
+    # R48: segunda trava por ativo antes do envio.
+    # Mantém no máximo uma operação simultânea por ativo.
+    if symbol in operacoes and operacoes.get(symbol):
+        return "JA_REGISTRADA"
 
     status = executar_ordem_intravela(symbol, sinal, resultado)
     if status != "CONFIRMADA":
