@@ -119,7 +119,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OTC-M5-R50-TRAVA-ATIVO-CORRIGIDA-20260920"
+BULLEX_DIAGNOSTIC_VERSION = "OTC-M5-R51-TRAVA-FORTE-ANTI-DUPLICATA-20260920"
 
 _bullex_diag = {
     "messages": 0,
@@ -383,6 +383,10 @@ _operacao_global_em_envIO_LEGACY = False
 _operacoes_ativas_por_symbol = {}
 _operacoes_em_envio = set()
 _active_ids_em_envio = set()  # trava forte: nunca envia 2 ordens para o mesmo active_id
+# R51: se a requisição de ordem já saiu para a Bullex, um timeout é ambíguo:
+# a corretora pode ter aceitado a ordem mesmo sem devolver a confirmação.
+# Nesse caso o active_id fica bloqueado até o vencimento da vela para impedir retry duplicado.
+_active_ids_bloqueados_ate = {}  # active_id -> epoch do vencimento
 
 def _qtd_operacoes_globais_em_andamento():
     """Conta símbolos únicos ativos, em envio ou aguardando resultado."""
@@ -1150,6 +1154,11 @@ def executar_ordem_intravela(symbol, sinal, resultado, valor_override=None, tipo
     active_id = int(config["active_id"])
 
     with _execucao_lock:
+        agora_lock = time.time()
+        for aid, ate in list(_active_ids_bloqueados_ate.items()):
+            if float(ate or 0) <= agora_lock:
+                _active_ids_bloqueados_ate.pop(aid, None)
+
         active_ids_ocupados = {
             int(info.get("asset_id"))
             for info in _operacoes_ativas_por_symbol.values()
@@ -1166,6 +1175,7 @@ def executar_ordem_intravela(symbol, sinal, resultado, valor_override=None, tipo
             or symbol in _operacoes_em_envio
             or symbol in _operacoes_pendentes
             or active_id in _active_ids_em_envio
+            or active_id in _active_ids_bloqueados_ate
             or active_id in active_ids_ocupados
         ):
             log(f"[AUTONOMO ATIVO] {symbol} active_id={active_id}: já existe operação deste ativo; segunda entrada BLOQUEADA.")
@@ -1273,6 +1283,9 @@ def executar_ordem_intravela(symbol, sinal, resultado, valor_override=None, tipo
         with _bullex_diag_lock:
             _bullex_diag["orders_sent"] += 1
 
+        with _execucao_lock:
+            _active_ids_bloqueados_ate[active_id] = int(expiration_real)
+
         resposta = _enviar_e_aguardar(
             "digital-options.place-digital-option",
             "3.0",
@@ -1294,8 +1307,13 @@ def executar_ordem_intravela(symbol, sinal, resultado, valor_override=None, tipo
             )
             with _execucao_lock:
                 _operacoes_em_envio.discard(symbol)
-            _active_ids_em_envio.discard(active_id)
-            return "SEM_CONFIRMACAO"
+                _active_ids_em_envio.discard(active_id)
+                _active_ids_bloqueados_ate[active_id] = int(expiration_real)
+            log(
+                f"[R51 ANTI-DUPLICATA] {symbol} active_id={active_id}: "
+                "requisição de ordem já foi enviada; retry bloqueado até o fim da vela."
+            )
+            return "ORDEM_ENVIADA_SEM_CONFIRMACAO"
 
         with _bullex_diag_lock:
             _bullex_diag["orders_confirmed"] += 1
@@ -1343,8 +1361,12 @@ def executar_ordem_intravela(symbol, sinal, resultado, valor_override=None, tipo
         with _execucao_lock:
             _operacoes_em_envio.discard(symbol)
             _active_ids_em_envio.discard(active_id)
-        log(f"[AUTO INTRAVELA] ERRO ao enviar ordem: {e}")
-        return "ERRO"
+            _active_ids_bloqueados_ate[active_id] = int(expiration_real)
+        log(
+            f"[AUTO INTRAVELA] ERRO/timeout após tentativa de envio: {e} | "
+            f"{symbol} active_id={active_id} BLOQUEADO até o vencimento para evitar ordem duplicada."
+        )
+        return "ORDEM_ENVIADA_STATUS_INCERTO"
 
 
 
@@ -4388,7 +4410,10 @@ def _r24_despachar_melhor(candle_from):
             if status_ordem != "CONFIRMADA":
                 # R48: se já existe operação pendente/registrada neste ativo,
                 # NÃO libera retry. Evita duas ordens simultâneas no mesmo ativo.
-                if status_ordem in ("JA_REGISTRADA", "JA_PENDENTE"):
+                if status_ordem in (
+                    "JA_REGISTRADA", "JA_PENDENTE", "BLOQUEADA_ATIVO",
+                    "ORDEM_ENVIADA_SEM_CONFIRMACAO", "ORDEM_ENVIADA_STATUS_INCERTO"
+                ):
                     log(
                         f"[M5 BLOQUEIO DUPLICATA] {symbol}: {status_ordem}; "
                         "nova ordem no mesmo ativo bloqueada."
