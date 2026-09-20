@@ -119,7 +119,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OTC-M5-R49-SOMENTE-STREAM-M5-20260920"
+BULLEX_DIAGNOSTIC_VERSION = "OTC-M5-R50-TRAVA-ATIVO-CORRIGIDA-20260920"
 
 _bullex_diag = {
     "messages": 0,
@@ -4898,10 +4898,19 @@ def registrar_operacao_intravela(symbol, resultado):
     if symbol in _operacoes_pendentes:
         return "JA_PENDENTE"
 
-    # R48: segunda trava por ativo antes do envio.
-    # Mantém no máximo uma operação simultânea por ativo.
-    if symbol in operacoes and operacoes.get(symbol):
-        return "JA_REGISTRADA"
+    # R50: trava redundante usando as estruturas reais do executor.
+    # A trava principal também existe dentro de executar_ordem_intravela().
+    with _execucao_lock:
+        if (
+            symbol in _operacoes_ativas_por_symbol
+            or symbol in _operacoes_em_envio
+            or symbol in _operacoes_pendentes
+        ):
+            log(
+                f"[M5 BLOQUEIO DUPLICATA] {symbol}: "
+                "já existe operação ativa/em envio/pendente; nova ordem bloqueada."
+            )
+            return "JA_REGISTRADA"
 
     status = executar_ordem_intravela(symbol, sinal, resultado)
     if status != "CONFIRMADA":
