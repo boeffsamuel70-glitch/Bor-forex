@@ -119,7 +119,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OTC-M5-R46-DASHBOARD-30S-20260920"
+BULLEX_DIAGNOSTIC_VERSION = "OTC-M5-R47-RETRY-SPT-EXECUCAO-CORRIGIDA-20260920"
 
 _bullex_diag = {
     "messages": 0,
@@ -1041,7 +1041,7 @@ def _buscar_instrumento(active_id, sinal, ticker, candle_to, symbol=None):
         return item
 
     try:
-        _solicitar_instrumentos_digitais(active_id, timeout=2.5)
+        _solicitar_instrumentos_digitais(active_id, timeout=5.0)
     except Exception as e:
         log(f"[DIGITAL INSTRUMENT] {symbol or ticker}: consulta instruments falhou: {e}")
 
@@ -4363,7 +4363,14 @@ def _r24_despachar_melhor(candle_from):
                 int(active_id), resultado.get("sinal"), ticker, candle_to, symbol
             )
             if not instrumento:
-                log(f"[SELETOR GLOBAL] {symbol}: sem DIGITAL M5 SPT; tentando próximo candidato.")
+                # R47: a tentativa NÃO fica consumida quando a Bullex não entrega
+                # o contrato SPT M5. O próximo update da mesma vela pode tentar de novo.
+                with _intravela_lock:
+                    _intravela_velas_tentadas.discard((int(active_id), candle_from))
+                log(
+                    f"[SELETOR GLOBAL] {symbol}: sem DIGITAL M5 SPT; "
+                    "tentativa liberada para repetir nesta mesma vela."
+                )
                 continue
             resultado["instrumento_digital_preselecionado"] = dict(instrumento)
             escolhidos.append((active_id, symbol, resultado))
@@ -4377,7 +4384,15 @@ def _r24_despachar_melhor(candle_from):
                 f"[SELETOR GLOBAL] ESCOLHIDO {posicao}/{len(escolhidos)}={symbol} {resultado.get('sinal')} | "
                 f"index={resultado['instrumento_digital_preselecionado'].get('instrument_index')}"
             )
-            registrar_operacao_intravela(symbol, resultado)
+            status_ordem = registrar_operacao_intravela(symbol, resultado)
+            if status_ordem != "CONFIRMADA":
+                # R47: só mantém a vela marcada como tentada após confirmação real.
+                with _intravela_lock:
+                    _intravela_velas_tentadas.discard((int(active_id), candle_from))
+                log(
+                    f"[M5 RETRY] {symbol}: ordem não confirmada ({status_ordem}); "
+                    "setup liberado para nova tentativa enquanto a vela M5 estiver válida."
+                )
 
     finally:
         with _r24_candidatos_lock:
@@ -4864,21 +4879,21 @@ def enviar_status_ordem_telegram(symbol, sinal, status, detalhe=""):
 def registrar_operacao_intravela(symbol, resultado):
     sinal = resultado.get("sinal")
     if sinal not in ("CALL", "PUT"):
-        return
+        return "SINAL_INVALIDO"
 
     candle_from = int(resultado["candle_from"])
     candle_dt = datetime.fromtimestamp(candle_from, TZ)
     chave = f"{symbol}|INTRAVELA|{candle_from}"
 
     if _ultimas_operacoes_registradas.get(symbol) == chave:
-        return
+        return "JA_REGISTRADA"
 
     if symbol in _operacoes_pendentes:
-        return
+        return "JA_PENDENTE"
 
     status = executar_ordem_intravela(symbol, sinal, resultado)
     if status != "CONFIRMADA":
-        return
+        return status or "NAO_CONFIRMADA"
 
     # Só agora o dashboard passa a mostrar a entrada: a Bullex confirmou a ordem.
     _atualizar_dashboard_intravela(symbol, resultado)
@@ -4931,6 +4946,7 @@ def registrar_operacao_intravela(symbol, resultado):
         f"entrada={operacao['entrada']:.5f} | "
         f"expira={datetime.fromtimestamp(int(resultado['candle_to']), TZ).strftime('%H:%M:%S')}"
     )
+    return "CONFIRMADA"
 
 
 
