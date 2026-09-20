@@ -119,7 +119,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OTC-M5-R45-AUTO3-RESULTADOS-DASH-CORRIGIDO-20260920"
+BULLEX_DIAGNOSTIC_VERSION = "OTC-M5-R46-DASHBOARD-30S-20260920"
 
 _bullex_diag = {
     "messages": 0,
@@ -6053,7 +6053,7 @@ setTimeout(function(){ location.reload(); }, 1000);
     }
   }
   atualizarRadar();
-  setInterval(atualizarRadar,1000);
+  setInterval(atualizarRadar,30000);
 })();
 </script>
 
@@ -6308,7 +6308,7 @@ h1{font-size:22px;margin:0}.live{font-size:13px;opacity:.75}
      ultimo=atual;
    }catch(e){clock.textContent='Reconectando…';}
  }
- update(); setInterval(update,1000);
+ update(); setInterval(update,30000);
 })();
 </script>
 </body>
