@@ -119,7 +119,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OTC-M5-R48-BLOQUEIO-DUPLICATA-ATIVO-20260920"
+BULLEX_DIAGNOSTIC_VERSION = "OTC-M5-R49-SOMENTE-STREAM-M5-20260920"
 
 _bullex_diag = {
     "messages": 0,
@@ -2543,7 +2543,7 @@ def _aguardar_ativos_mercado_aberto(timeout=30):
     return False
 
 def _assinar_candles_mercado_aberto():
-    """R22: assina M5 e M15 para alimentar estratégia e preload recente."""
+    """R49: assina somente M5 (300s), reduzindo carga do WebSocket."""
     assinaturas = set()
 
     with _bullex_assets_lock:
@@ -2551,7 +2551,7 @@ def _assinar_candles_mercado_aberto():
 
     for config in configs:
         active_id = int(config["active_id"])
-        for size, rotulo in ((60, "M1"), (300, "M5"), (900, "M15")):
+        for size, rotulo in ((300, "M5"),):
             chave = (active_id, size)
             if chave in assinaturas:
                 continue
