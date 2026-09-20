@@ -119,7 +119,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OTC-M5-R44-AUTO3-META50-PAUSA4H-20260920"
+BULLEX_DIAGNOSTIC_VERSION = "OTC-M5-R45-AUTO3-RESULTADOS-DASH-CORRIGIDO-20260920"
 
 _bullex_diag = {
     "messages": 0,
@@ -171,7 +171,7 @@ VALORES_ENTRADA = [5.00]
 VALOR_GALE = 6.00
 # Se a Bullex não devolver o payout no retorno da ordem, usa este valor apenas como fallback.
 BULLEX_PAYOUT_FALLBACK = float(os.getenv("BULLEX_PAYOUT_FALLBACK", "87").strip() or "87")
-EXPIRACAO_MINUTOS = 15
+EXPIRACAO_MINUTOS = 5
 # A antiga janela de 3 segundos foi removida.
 # Esta estratégia entra DURANTE a vela atual e expira no fechamento da MESMA vela.
 INTRAVELA_MIN_SEGUNDOS_DECORRIDOS = 35
@@ -6272,6 +6272,19 @@ h1{font-size:22px;margin:0}.live{font-size:13px;opacity:.75}
      const r=await fetch('/radar-m5',{cache:'no-store'});
      const d=await r.json();
      const a=Array.isArray(d.ativos)?d.ativos:[];
+     const st=d.estatisticas||{}, fin=d.financeiro||{}, ps=d.pausa_lucro||{};
+     wins.textContent=Number(st.wins||0);
+     losses.textContent=Number(st.losses||0);
+     lucro.textContent='R$ '+Number(fin.lucro_total||0).toFixed(2).replace('.',',');
+     ops.textContent=String(d.operacoes_ativas||0)+'/'+String(d.max_operacoes||3);
+     if(ps.ativa){
+       const total=Math.max(0,Number(ps.restante_segundos||0));
+       const h=Math.floor(total/3600);
+       const m=Math.floor((total%3600)/60);
+       pausa.textContent='⏸ PAUSADO POR META DE LUCRO • volta em '+h+'h '+m+'min';
+     }else{
+       pausa.textContent='🤖 AUTO ATIVO • até 3 pares diferentes • pausa em R$ 50,00 de lucro';
+     }
      grid.innerHTML=a.map(x=>{
        const entrar=x.status==='ENTRAR AGORA', at=x.status==='ATENÇÃO';
        const cls='card'+(entrar?' enter':at?' attn':'');
