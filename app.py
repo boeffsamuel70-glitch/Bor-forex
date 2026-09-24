@@ -65,38 +65,21 @@ BULLEX_USER_AGENT = os.getenv(
 # ATIVOS BULLEX
 # ============================================================
 
-# SOMENTE OTC. Primeiro usamos os active_id conhecidos como fallback e,
-# após autenticar, a Traderoom pode atualizar os ids/tickers dinamicamente.
-ATIVO_BULLEX = {
-    "EURUSD_OTC": {"symbol": "EUR/USD OTC", "active_id": 76, "ticker": "EURUSD-OTC", "is_otc": True, "mercado": "OTC"},
-    "GBPUSD_OTC": {"symbol": "GBP/USD OTC", "active_id": 81, "ticker": "GBPUSD-OTC", "is_otc": True, "mercado": "OTC"},
-    "USDJPY_OTC": {"symbol": "USD/JPY OTC", "active_id": 85, "ticker": "USDJPY-OTC", "is_otc": True, "mercado": "OTC"},
-    "GBPJPY_OTC": {"symbol": "GBP/JPY OTC", "active_id": 84, "ticker": "GBPJPY-OTC", "is_otc": True, "mercado": "OTC"},
-    "AUDCAD_OTC": {"symbol": "AUD/CAD OTC", "active_id": 86, "ticker": "AUDCAD-OTC", "is_otc": True, "mercado": "OTC"},
-    "USDCHF_OTC": {"symbol": "USD/CHF OTC", "active_id": 78, "ticker": "USDCHF-OTC", "is_otc": True, "mercado": "OTC"},
-}
-
+# MERCADO ABERTO DINAMICO.
+# Nao usa IDs fixos: apos autenticar, a Traderoom fornece os pares Forex abertos.
+ATIVO_BULLEX = {}
 PARES_MERCADO_ABERTO = {}
-
-PARES_OTC_ALVO = {
-    "EURUSD": "EUR/USD OTC",
-    "GBPUSD": "GBP/USD OTC",
-    "USDJPY": "USD/JPY OTC",
-    "GBPJPY": "GBP/JPY OTC",
-    "AUDCAD": "AUD/CAD OTC",
-    "AUDNZD": "AUD/NZD OTC",
-    "USDCHF": "USD/CHF OTC",
-}
+PARES_OTC_ALVO = {}
 
 _bullex_assets_lock = threading.RLock()
-_bullex_assets_detected = True
+_bullex_assets_detected = False
 _bullex_assets_last_error = None
 _bullex_assets_updated_at = None
-_bullex_assets_source = "DIGITAL_OTC_DYNAMIC_ALL"
+_bullex_assets_source = "DIGITAL_FOREX_OPEN_DYNAMIC"
 _bullex_assets_ready_event = threading.Event()
 _bullex_assets_init_lock = threading.Lock()
 
-_BULLEX_CANDLE_SIZES = {"1min": 60, "5min": 300, "15min": 900}
+_BULLEX_CANDLE_SIZES = {"5min": 300, "15min": 300}
 
 _bullex_ws = None
 _bullex_ws_lock = threading.RLock()
@@ -119,7 +102,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "OTC-M5-R51-TRAVA-FORTE-ANTI-DUPLICATA-20260920"
+BULLEX_DIAGNOSTIC_VERSION = "R34-OPEN-MARKET-M5-DYNAMIC-2OPS-20260924"
 
 _bullex_diag = {
     "messages": 0,
@@ -160,7 +143,10 @@ MAX_ATRASO_MINUTOS = 8
 # EXECUÇÃO AUTOMÁTICA - DEMO
 # ============================================================
 
-BULLEX_AUTO_TRADE = True  # R44: entradas automáticas habilitadas
+BULLEX_AUTO_TRADE = os.getenv(
+    "BULLEX_AUTO_TRADE",
+    "true"
+).strip().lower() in ("1", "true", "yes", "sim", "on")
 
 BULLEX_USER_BALANCE_ID = os.getenv(
     "BULLEX_USER_BALANCE_ID",
@@ -174,10 +160,9 @@ BULLEX_PAYOUT_FALLBACK = float(os.getenv("BULLEX_PAYOUT_FALLBACK", "87").strip()
 EXPIRACAO_MINUTOS = 5
 # A antiga janela de 3 segundos foi removida.
 # Esta estratégia entra DURANTE a vela atual e expira no fechamento da MESMA vela.
-INTRAVELA_MIN_SEGUNDOS_DECORRIDOS = 35
-INTRAVELA_MAX_SEGUNDOS_DECORRIDOS = 240
-INTRAVELA_MIN_SEGUNDOS_RESTANTES = 45
-# R38: entrada na retração durante a vela M5; expiração no fechamento da própria vela.
+INTRAVELA_MIN_SEGUNDOS_DECORRIDOS = 20
+INTRAVELA_MAX_SEGUNDOS_DECORRIDOS = 600
+INTRAVELA_MIN_SEGUNDOS_RESTANTES = 90
 
 # Estratégia R17: somente suporte/resistência M5.
 # O nível precisa ter pelo menos 3 toques em velas M5 fechadas.
@@ -209,59 +194,8 @@ M15_RETRACAO_MAX = 0.72
 M15_LINHA_TOLERANCIA_ATR = 0.22
 MARTINGALE_ATIVO = False
 
-MAX_OPERACOES_GLOBAIS = 3
+MAX_OPERACOES_GLOBAIS = 2
 MAX_OPERACOES_POR_ATIVO = 1
-
-# R44: nunca operar estes ativos.
-ATIVOS_BLOQUEADOS_R44 = {"USD/BRL OTC", "USDBRL-OTC", "USDBRL_OTC", "AUS200 OTC", "AUS200-OTC", "AUS/OTC OTC"}
-
-# R44: ao atingir R$ 50,00 de lucro líquido desde este deploy,
-# pausa novas entradas por 4 horas e depois libera automaticamente.
-META_LUCRO_PAUSA = 50.00
-PAUSA_LUCRO_SEGUNDOS = 4 * 60 * 60
-_pausa_lucro_ate = 0.0
-_pausa_lucro_acionada = False
-
-def _ativo_bloqueado_r44(symbol=None, ticker=None, codigo=None, raw=None):
-    textos = [symbol, ticker, codigo]
-    if isinstance(raw, dict):
-        textos.extend(raw.get(k) for k in (
-            "name", "symbol", "ticker", "description", "display_name",
-            "underlying", "underlying_name"
-        ))
-    bruto = " ".join(str(x or "") for x in textos).upper()
-    compacto = re.sub(r"[^A-Z0-9]", "", bruto)
-    # AUS200 às vezes era normalizado no app antigo como AUS/OTC.
-    return (
-        "USDBRL" in compacto
-        or "AUS200" in compacto
-        or str(symbol or "").upper().strip() == "AUS/OTC OTC"
-    )
-
-def _status_pausa_lucro():
-    global _pausa_lucro_ate
-    restante = max(0, int(_pausa_lucro_ate - time.time()))
-    return {
-        "ativa": restante > 0,
-        "restante_segundos": restante,
-        "ate": (
-            datetime.fromtimestamp(_pausa_lucro_ate, TZ).isoformat()
-            if restante > 0 else None
-        ),
-    }
-
-def _verificar_meta_lucro():
-    global _pausa_lucro_ate, _pausa_lucro_acionada
-    financeiro = calcular_financeiro()
-    lucro = float(financeiro.get("lucro_total", 0.0) or 0.0)
-    if (not _pausa_lucro_acionada) and lucro >= META_LUCRO_PAUSA:
-        _pausa_lucro_acionada = True
-        _pausa_lucro_ate = time.time() + PAUSA_LUCRO_SEGUNDOS
-        ate = datetime.fromtimestamp(_pausa_lucro_ate, TZ).strftime("%d/%m %H:%M:%S")
-        log(f"[META LUCRO] R${lucro:.2f} atingidos. Novas entradas PAUSADAS por 4 horas, até {ate} BRT.")
-        return True
-    return False
-
 AUTONOMO_MIN_AMOSTRAS = 45
 AUTONOMO_K_VIZINHOS = 17
 AUTONOMO_CONFIANCA_MIN = 0.62
@@ -302,15 +236,7 @@ _intravela_velas_tentadas = set()
 # ATIVOS
 # ============================================================
 
-ATIVOS = {
-    "EURUSD_OTC": "EUR/USD OTC",
-    "GBPUSD_OTC": "GBP/USD OTC",
-    "USDJPY_OTC": "USD/JPY OTC",
-    "GBPJPY_OTC": "GBP/JPY OTC",
-    "AUDCAD_OTC": "AUD/CAD OTC",
-    "AUDNZD_OTC": "AUD/NZD OTC",
-    "USDCHF_OTC": "USD/CHF OTC",
-}
+ATIVOS = {}
 
 # ============================================================
 # ESTADO
@@ -383,10 +309,6 @@ _operacao_global_em_envIO_LEGACY = False
 _operacoes_ativas_por_symbol = {}
 _operacoes_em_envio = set()
 _active_ids_em_envio = set()  # trava forte: nunca envia 2 ordens para o mesmo active_id
-# R51: se a requisição de ordem já saiu para a Bullex, um timeout é ambíguo:
-# a corretora pode ter aceitado a ordem mesmo sem devolver a confirmação.
-# Nesse caso o active_id fica bloqueado até o vencimento da vela para impedir retry duplicado.
-_active_ids_bloqueados_ate = {}  # active_id -> epoch do vencimento
 
 def _qtd_operacoes_globais_em_andamento():
     """Conta símbolos únicos ativos, em envio ou aguardando resultado."""
@@ -717,7 +639,7 @@ def _next_request_id():
     with _bullex_request_lock:
         _bullex_request_counter += 1
 
-    sufixo = 100_000_000 + secrets.randbelow(1_900_000_000)
+    sufixo = 100_000_000 + secrets.randbelow(1_300_000_000)
     return f"{int(time.time())}_{sufixo}"
 
 
@@ -979,8 +901,8 @@ def _instrumento_digital_cache(active_id, sinal, candle_to):
     """Localiza um contrato DIGITAL M5 REAL recebido da Bullex.
 
     Prioriza o vencimento exato da vela. Se a Traderoom publicar o mesmo
-    contrato M5 com vencimento ligeiramente diferente, aceita somente um
-    vencimento FUTURO real, dentro de uma janela máxima de 5 minutos.
+    contrato M15 com vencimento ligeiramente diferente, aceita somente um
+    vencimento FUTURO real, dentro de uma janela máxima de 15 minutos.
     Nunca inventa instrument_id/index.
     """
     direction = _direcao_instrumento(sinal)
@@ -996,7 +918,7 @@ def _instrumento_digital_cache(active_id, sinal, candle_to):
     for (asset_id, expiration, period, direcao), inst in list(_bullex_instrument_cache.items()):
         if asset_id != active_id or period != 300 or direcao != direction:
             continue
-        # Não aceita contrato já vencido e não pula mais de um ciclo M5.
+        # Não aceita contrato já vencido e não pula mais de um ciclo M15.
         if expiration <= int(server_ts):
             continue
         distancia = abs(int(expiration) - candle_to)
@@ -1045,7 +967,7 @@ def _buscar_instrumento(active_id, sinal, ticker, candle_to, symbol=None):
         return item
 
     try:
-        _solicitar_instrumentos_digitais(active_id, timeout=5.0)
+        _solicitar_instrumentos_digitais(active_id, timeout=2.5)
     except Exception as e:
         log(f"[DIGITAL INSTRUMENT] {symbol or ticker}: consulta instruments falhou: {e}")
 
@@ -1128,15 +1050,6 @@ def executar_ordem_intravela(symbol, sinal, resultado, valor_override=None, tipo
     if sinal not in ("CALL", "PUT"):
         return None
 
-    if _ativo_bloqueado_r44(symbol=symbol):
-        log(f"[R44 BLOQUEIO] {symbol}: ativo excluído das operações automáticas.")
-        return "ATIVO_EXCLUIDO"
-
-    pausa = _status_pausa_lucro()
-    if pausa["ativa"]:
-        log(f"[META LUCRO] {symbol}: nova entrada bloqueada; pausa de lucro ainda ativa por {pausa['restante_segundos']}s.")
-        return "PAUSA_META_LUCRO"
-
     if not BULLEX_USER_BALANCE_ID:
         estado["execucao"]["ultimo_erro"] = "SEM_BALANCE_ID"
         _atualizar_estado_execucao()
@@ -1154,11 +1067,6 @@ def executar_ordem_intravela(symbol, sinal, resultado, valor_override=None, tipo
     active_id = int(config["active_id"])
 
     with _execucao_lock:
-        agora_lock = time.time()
-        for aid, ate in list(_active_ids_bloqueados_ate.items()):
-            if float(ate or 0) <= agora_lock:
-                _active_ids_bloqueados_ate.pop(aid, None)
-
         active_ids_ocupados = {
             int(info.get("asset_id"))
             for info in _operacoes_ativas_por_symbol.values()
@@ -1175,7 +1083,6 @@ def executar_ordem_intravela(symbol, sinal, resultado, valor_override=None, tipo
             or symbol in _operacoes_em_envio
             or symbol in _operacoes_pendentes
             or active_id in _active_ids_em_envio
-            or active_id in _active_ids_bloqueados_ate
             or active_id in active_ids_ocupados
         ):
             log(f"[AUTONOMO ATIVO] {symbol} active_id={active_id}: já existe operação deste ativo; segunda entrada BLOQUEADA.")
@@ -1283,9 +1190,6 @@ def executar_ordem_intravela(symbol, sinal, resultado, valor_override=None, tipo
         with _bullex_diag_lock:
             _bullex_diag["orders_sent"] += 1
 
-        with _execucao_lock:
-            _active_ids_bloqueados_ate[active_id] = int(expiration_real)
-
         resposta = _enviar_e_aguardar(
             "digital-options.place-digital-option",
             "3.0",
@@ -1307,13 +1211,8 @@ def executar_ordem_intravela(symbol, sinal, resultado, valor_override=None, tipo
             )
             with _execucao_lock:
                 _operacoes_em_envio.discard(symbol)
-                _active_ids_em_envio.discard(active_id)
-                _active_ids_bloqueados_ate[active_id] = int(expiration_real)
-            log(
-                f"[R51 ANTI-DUPLICATA] {symbol} active_id={active_id}: "
-                "requisição de ordem já foi enviada; retry bloqueado até o fim da vela."
-            )
-            return "ORDEM_ENVIADA_SEM_CONFIRMACAO"
+            _active_ids_em_envio.discard(active_id)
+            return "SEM_CONFIRMACAO"
 
         with _bullex_diag_lock:
             _bullex_diag["orders_confirmed"] += 1
@@ -1339,7 +1238,7 @@ def executar_ordem_intravela(symbol, sinal, resultado, valor_override=None, tipo
         with _execucao_lock:
             if symbol in _operacoes_ativas_por_symbol:
                 _operacoes_ativas_por_symbol[symbol]["preco_entrada_estimado"] = float(resultado["preco"])
-                _operacoes_ativas_por_symbol[symbol]["estrategia"] = resultado.get("estrategia", "M5_SR_LTA_LTB_RETRACAO")
+                _operacoes_ativas_por_symbol[symbol]["estrategia"] = resultado.get("estrategia", "M15_SR_LTA_LTB_RETRACAO")
                 _operacoes_ativas_por_symbol[symbol]["regime"] = resultado.get("regime", "AUTONOMO")
                 _operacoes_ativas_por_symbol[symbol]["tipo_entrada"] = tipo_entrada
 
@@ -1361,12 +1260,8 @@ def executar_ordem_intravela(symbol, sinal, resultado, valor_override=None, tipo
         with _execucao_lock:
             _operacoes_em_envio.discard(symbol)
             _active_ids_em_envio.discard(active_id)
-            _active_ids_bloqueados_ate[active_id] = int(expiration_real)
-        log(
-            f"[AUTO INTRAVELA] ERRO/timeout após tentativa de envio: {e} | "
-            f"{symbol} active_id={active_id} BLOQUEADO até o vencimento para evitar ordem duplicada."
-        )
-        return "ORDEM_ENVIADA_STATUS_INCERTO"
+        log(f"[AUTO INTRAVELA] ERRO ao enviar ordem: {e}")
+        return "ERRO"
 
 
 
@@ -2300,26 +2195,20 @@ def _normalizar_par_mercado_aberto(item):
 
     par = base[:6]
 
-    if _ativo_bloqueado_r44(symbol=symbol, ticker=ticker, raw=item):
-        return None
-
+    # R34: opera SOMENTE Forex de mercado aberto. OTC e outros produtos sao ignorados.
     if is_otc:
-        # R8: aceita dinamicamente TODOS os pares OTC devolvidos pela lista DIGITAL
-        # da Bullex. Não depende mais de PARES_OTC_ALVO para decidir o universo.
-        if len(par) != 6 or not par.isalpha():
-            return None
-        codigo = f"{par}_OTC"
-        symbol_final = f"{par[:3]}/{par[3:]} OTC"
-        mercado = "OTC"
-    else:
-        # Esta versão opera SOMENTE Digital OTC. Mercado aberto é ignorado.
         return None
+    if len(par) != 6 or not par.isalpha():
+        return None
+    codigo = par
+    symbol_final = f"{par[:3]}/{par[3:]}"
+    mercado = "ABERTO"
 
     return {
         "codigo": codigo,
         "symbol": symbol_final,
         "active_id": active_id,
-        "ticker": str(ticker or (par + ("-OTC" if is_otc else ""))).strip(),
+        "ticker": str(ticker or par).strip(),
         "is_otc": bool(is_otc),
         "mercado": mercado,
         "raw": item,
@@ -2344,7 +2233,7 @@ def _extrair_mercado_aberto_da_resposta(resposta):
         score_atual = int(raw_atual.get("is_visible") is True) + int(raw_atual.get("is_active") is True)
         if score_novo > score_atual:
             encontrados[codigo] = normalizado
-    # R8: lista dinâmica; devolve todos os OTC digitais encontrados.
+    # R8: lista dinâmica; devolve os pares Forex de mercado aberto encontrados.
     return sorted(encontrados.values(), key=lambda x: x.get("codigo", ""))
 
 
@@ -2355,7 +2244,7 @@ def _corpo_lista_instrumentos(nome):
 
 
 def _consultar_lista_mercado_aberto(nome, versoes=("2.0", "1.0")):
-    """Consulta e agrega todos os pares OTC retornados pela lista digital.
+    """Consulta e agrega os pares Forex de mercado aberto retornados pela lista digital.
 
     Algumas respostas da Traderoom podem variar conforme versão/body.
     A R17 não para na primeira resposta parcial: junta todos os ativos
@@ -2446,16 +2335,16 @@ def _atualizar_ativos_mercado_aberto(ativos, origem):
         _bullex_assets_ready_event.set()
 
     estado["ativos_info"] = {
-        "tipo": "OTC",
+        "tipo": "MERCADO ABERTO",
         "quantidade": len(novos_bullex),
-        "status": "AUTOMÁTICO",
+        "status": "AUTOMÁTICO - M5",
         "lista": ", ".join(
             f"{cfg['ticker']} (id {cfg['active_id']})"
             for cfg in novos_bullex.values()
         ) or "-",
     }
     log(
-        "[ATIVOS OTC] Ativos OTC carregados: "
+        "[ATIVOS ABERTOS] Pares Forex carregados: "
         + ", ".join(
             f"{cfg['ticker']}={cfg['active_id']}"
             for cfg in novos_bullex.values()
@@ -2466,7 +2355,7 @@ def _atualizar_ativos_mercado_aberto(ativos, origem):
 
 
 def _inicializar_ativos_mercado_aberto():
-    """Descobre automaticamente todos os pares OTC disponíveis na lista DIGITAL.
+    """Descobre automaticamente os pares Forex de mercado aberto disponíveis na lista DIGITAL.
 
     A inicialização é serializada para impedir duas descobertas concorrentes
     após reconexões rápidas do WebSocket.
@@ -2474,7 +2363,7 @@ def _inicializar_ativos_mercado_aberto():
     global _bullex_assets_last_error
 
     if not _bullex_assets_init_lock.acquire(blocking=False):
-        log("[OTC] Descoberta de ativos já está em andamento.")
+        log("[ABERTO] Descoberta de ativos já está em andamento.")
         return
 
     try:
@@ -2485,19 +2374,19 @@ def _inicializar_ativos_mercado_aberto():
             _, ativos = _consultar_lista_mercado_aberto(fonte_digital)
             if not ativos:
                 raise RuntimeError(
-                    "Lista digital não retornou pares OTC disponíveis."
+                    "Lista digital não retornou pares Forex de mercado aberto disponíveis."
                 )
 
             _atualizar_ativos_mercado_aberto(ativos, fonte_digital)
             _assinar_candles_mercado_aberto()
             log(
-                f"[OTC] Inicialização concluída com {len(ativos)} ativo(s)."
+                f"[ABERTO] Inicialização concluída com {len(ativos)} ativo(s)."
             )
             return
 
         except Exception as e:
             _bullex_assets_last_error = str(e)
-            log(f"[OTC] Descoberta digital falhou: {e}")
+            log(f"[ABERTO] Descoberta digital falhou: {e}")
 
         # Diagnóstico adicional. IDs marginais nunca são usados para ordens.
         try:
@@ -2521,14 +2410,14 @@ def _inicializar_ativos_mercado_aberto():
             _bullex_assets_ready_event.clear()
 
         estado["ativos_info"] = {
-            "tipo": "OTC",
+            "tipo": "MERCADO ABERTO",
             "quantidade": 0,
             "status": "AGUARDANDO",
             "lista": "-",
             "erro": _bullex_assets_last_error,
         }
         log(
-            "[OTC] Ativos ainda não disponíveis. "
+            "[ABERTO] Ativos ainda não disponíveis. "
             "A leitura ficará bloqueada até nova autenticação/descoberta."
         )
     finally:
@@ -2565,7 +2454,7 @@ def _aguardar_ativos_mercado_aberto(timeout=30):
     return False
 
 def _assinar_candles_mercado_aberto():
-    """R49: assina somente M5 (300s), reduzindo carga do WebSocket."""
+    """R22: assina M5 e M15 para alimentar estratégia e preload recente."""
     assinaturas = set()
 
     with _bullex_assets_lock:
@@ -2573,7 +2462,7 @@ def _assinar_candles_mercado_aberto():
 
     for config in configs:
         active_id = int(config["active_id"])
-        for size, rotulo in ((300, "M5"),):
+        for size, rotulo in ((300, "M5"), (300, "M15")):
             chave = (active_id, size)
             if chave in assinaturas:
                 continue
@@ -2974,12 +2863,12 @@ def obter_candles(
 
 
 def _contar_fechadas_cache(active_id, size):
-    segundos = 300 if int(size) == 300 else 900
+    segundos = 300 if int(size) == 300 else 300
     return len(somente_velas_fechadas(_candidatos_candles_cache(active_id, size), segundos // 60))
 
 
 def _historico_m15_pronto_ativo(active_id, minimo=55):
-    """Compatibilidade R40: retorna True quando o ativo já tem M1 suficiente."""
+    """Retorna True quando este ativo, individualmente, já tem M15 suficiente."""
     try:
         return len(somente_velas_fechadas(_candles_cache(int(active_id), 300), 5)) >= int(minimo)
     except Exception:
@@ -3010,10 +2899,10 @@ def _precarregar_historico_r22(forcar=False):
 
         if not itens:
             _historico_pronto_event.clear()
-            log("[R30 PRELOAD M15] Nenhum ativo mapeado ainda.")
+            log("[R34 PRELOAD M5] Nenhum ativo mapeado ainda.")
             return False
 
-        log(f"[R30 PRELOAD M15] Iniciando M15 para {len(itens)} ativo(s).")
+        log(f"[R34 PRELOAD M5] Iniciando M15 para {len(itens)} ativo(s).")
         status_local = {}
         qtd_prontos = 0
 
@@ -3026,7 +2915,7 @@ def _precarregar_historico_r22(forcar=False):
             except Exception as e:
                 erro = str(e)
 
-            m15 = len(somente_velas_fechadas(_candles_cache(active_id, 300), 1))
+            m15 = len(somente_velas_fechadas(_candles_cache(active_id, 300), 5))
             ok = m15 >= 55
             if ok:
                 qtd_prontos += 1
@@ -3039,7 +2928,7 @@ def _precarregar_historico_r22(forcar=False):
                 "erro": erro,
             }
             log(
-                f"[R30 PRELOAD M15] {symbol} | M15={m15} | "
+                f"[R34 PRELOAD M5] {symbol} | M15={m15} | "
                 f"status={'PRONTO' if ok else 'AGUARDANDO'}"
                 + (f" | erro={erro}" if erro else "")
             )
@@ -3050,13 +2939,13 @@ def _precarregar_historico_r22(forcar=False):
         if qtd_prontos > 0:
             _historico_pronto_event.set()
             log(
-                f"[R30 PRELOAD M15] LIBERADO: {qtd_prontos}/{len(itens)} ativo(s) "
-                "com M15 suficiente. Ativos incompletos não bloqueiam os demais."
+                f"[R34 PRELOAD M5] LIBERADO: {qtd_prontos}/{len(itens)} ativo(s) "
+                "com M5 suficiente. Ativos incompletos não bloqueiam os demais."
             )
             return True
 
         _historico_pronto_event.clear()
-        log("[R30 PRELOAD M15] AGUARDANDO: nenhum ativo possui M15 suficiente ainda.")
+        log("[R34 PRELOAD M5] AGUARDANDO: nenhum ativo possui M15 suficiente ainda.")
         return False
     finally:
         _historico_preload_lock.release()
@@ -3734,14 +3623,14 @@ def _atr_cache_5m(active_id):
 
 def _atr_cache_15m(active_id):
     candles = _candles_cache(active_id, 300)
-    fechadas = somente_velas_fechadas(candles, 5)
+    fechadas = somente_velas_fechadas(candles, 15)
     if len(fechadas) < 15:
         return None
     return atr(fechadas, 14)
 
 
 def _pivos_sr(candles, janela):
-    """Retorna pivôs de suporte e resistência usando apenas candles M1 fechados."""
+    """Retorna pivôs de suporte e resistência usando apenas candles M15 fechados."""
     infos = [candle_info(c) for c in candles]
     suportes = []
     resistencias = []
@@ -3789,7 +3678,7 @@ def _agrupar_niveis(valores, tolerancia):
 
 def _niveis_sr_m15(active_id):
     candles = _candles_cache(active_id, 300)
-    fechadas = somente_velas_fechadas(candles, 5)
+    fechadas = somente_velas_fechadas(candles, 15)
 
     if len(fechadas) < 25:
         return [], [], None
@@ -3991,7 +3880,7 @@ def _autonomo_filtro_adaptativo(symbol, sinal, confianca):
 
 
 def _agregar_m15_desde_m5(active_id, candle_from, limite=100):
-    """Monta candles M1 fechados a partir do M5 quando o feed M15 nativo ainda não chegou.
+    """Monta candles M15 fechados a partir do M5 quando o feed M15 nativo ainda não chegou.
 
     Usa somente grupos completos de 3 candles M5 já fechados antes de candle_from,
     portanto não olha a vela atual nem informação futura.
@@ -4003,13 +3892,13 @@ def _agregar_m15_desde_m5(active_id, candle_from, limite=100):
         if dt is None:
             continue
         ts = int(dt.timestamp())
-        inicio15 = ts - (ts % 900)
+        inicio15 = ts - (ts % 300)
         grupos.setdefault(inicio15, []).append(c)
 
     saida = []
     for inicio15 in sorted(grupos):
         # O M15 inteiro precisa estar encerrado antes da abertura da vela analisada.
-        if inicio15 + 900 > candle_from + 0.001:
+        if inicio15 + 300 > candle_from + 0.001:
             continue
         itens = ordenar_candles(grupos[inicio15])
         # Exige exatamente a estrutura temporal M5 00/05/10 dentro do bloco M15.
@@ -4036,10 +3925,10 @@ def _agregar_m15_desde_m5(active_id, candle_from, limite=100):
 def _autonomo_contexto_m15_forca(active_id, candle_from, sinal):
     """Confirma contexto sem olhar o futuro: M15 fechado + força M5/M15.
 
-    Prefere M15 nativo da Bullex. Se ainda não houver histórico M55 suficiente
+    Prefere M15 nativo da Bullex. Se ainda não houver histórico M5 suficiente
     para um ativo dinâmico, reconstrói M15 com os candles M5 já fechados.
     """
-    m15 = _fechadas_antes(_candles_cache(active_id, 300), candle_from, 900)[-100:]
+    m15 = _fechadas_antes(_candles_cache(active_id, 300), candle_from, 300)[-100:]
     m5 = _fechadas_antes(_candles_cache(active_id, 300), candle_from, 300)[-100:]
     fonte_m15 = "NATIVO"
     if len(m15) < 30:
@@ -4169,14 +4058,14 @@ def _resultado_retracao_intravela(msg, active_id):
     log(f"[M5 RETRACAO] {symbol} {sinal} | {tipo}={nivel:.5f} toques={toques} | tendencia={tendencia} ADX={adx15 if adx15 is not None else 0:.1f} | retracao={retracao*100:.1f}% | confluencia={confluencia}")
     return {
       'sinal':sinal,'score':round(confianca*100,1),'score_call':round(confianca*100,1) if sinal=='CALL' else 0,'score_put':round(confianca*100,1) if sinal=='PUT' else 0,
-      'preco':preco,'vela':datetime.fromtimestamp(candle_from,TZ),'estrategia':'M5_SR_LTA_LTB_RETRACAO','regime':tendencia,
+      'preco':preco,'vela':datetime.fromtimestamp(candle_from,TZ),'estrategia':'M15_SR_LTA_LTB_RETRACAO','regime':tendencia,
       'pullback':f'RETRACAO {retracao*100:.1f}% EM {tipo}','rejeicao':f'REJEICAO {rejeicao/a:.2f} ATR','atr':a,'rsi':rv,
-      'ema5':e5,'ema13':e13,'ema21':e21,'tendencia_5m':'N/A','tendencia_15m':tendencia,'bloqueio':'SINAL_M5_RETRACAO',
-      'mensagem':f'{sinal} M5 | {tipo} + retração | confluência={confluencia} | qualidade={confianca*100:.1f}%',
+      'ema5':e5,'ema13':e13,'ema21':e21,'tendencia_5m':'N/A','tendencia_15m':tendencia,'bloqueio':'SINAL_M15_RETRACAO',
+      'mensagem':f'{sinal} M15 | {tipo} + retração | confluência={confluencia} | qualidade={confianca*100:.1f}%',
       'candle_from':candle_from,'candle_to':candle_to,'segundos_decorridos':decorridos,'segundos_restantes':restantes,
       'impulso':impulso,'retracao_ratio':retracao,'nivel_sr':nivel,'tipo_nivel':tipo,'toques_nivel':toques,'distancia_abertura_nivel':dist_abertura,
       'adx15':adx15,'confianca':confianca,'confianca_ciclo':confianca,'amostras_ciclo':0,'amostras_modelo':len(m15),'margem':0.0,
-      'ajuste_online':0.0,'faixa_confianca':'M5','adaptativo':{},'filtro_adaptativo':'N/A'
+      'ajuste_online':0.0,'faixa_confianca':'M15','adaptativo':{},'filtro_adaptativo':'N/A'
     }
 
 def _atualizar_dashboard_intravela(symbol, resultado):
@@ -4236,7 +4125,7 @@ def _diagnostico_r22(active_id, msg):
         return None
 
     m5=_fechadas_antes(_candles_cache(active_id,300),candle_from,300)[-90:]
-    m15=_fechadas_antes(_candles_cache(active_id,900),candle_from,900)[-90:]
+    m15=_fechadas_antes(_candles_cache(active_id,300),candle_from,300)[-90:]
     if len(m5)<55 or len(m15)<55:
         return {"candle_from":candle_from,"motivo":f"HISTORICO_INSUFICIENTE M5={len(m5)} M15={len(m15)}"}
 
@@ -4336,10 +4225,11 @@ def _r24_despachar_melhor(candle_from):
     """Compara os sinais OTC da vela M5 e executa até as vagas globais disponíveis."""
     candle_from = int(candle_from)
 
-    # R35: M15 é intravela. O candidato pode surgir em qualquer momento dos
-    # 15 minutos, então a janela de comparação precisa começar AGORA, e não
-    # ficar ancorada nos primeiros segundos da abertura da vela.
-    espera = min(1.5, float(R24_JANELA_CLASSIFICACAO_SEGUNDOS))
+    # Coleta ancorada na abertura da vela: todos os candidatos que surgirem
+    # até ~7s participam do mesmo ranking global.
+    server_ts, _ = _horario_servidor_atual()
+    alvo = candle_from + float(R24_JANELA_CLASSIFICACAO_SEGUNDOS)
+    espera = max(0.0, alvo - float(server_ts))
     if espera > 0:
         time.sleep(espera)
 
@@ -4385,14 +4275,7 @@ def _r24_despachar_melhor(candle_from):
                 int(active_id), resultado.get("sinal"), ticker, candle_to, symbol
             )
             if not instrumento:
-                # R47: a tentativa NÃO fica consumida quando a Bullex não entrega
-                # o contrato SPT M5. O próximo update da mesma vela pode tentar de novo.
-                with _intravela_lock:
-                    _intravela_velas_tentadas.discard((int(active_id), candle_from))
-                log(
-                    f"[SELETOR GLOBAL] {symbol}: sem DIGITAL M5 SPT; "
-                    "tentativa liberada para repetir nesta mesma vela."
-                )
+                log(f"[SELETOR GLOBAL] {symbol}: sem DIGITAL M5 SPT; tentando próximo candidato.")
                 continue
             resultado["instrumento_digital_preselecionado"] = dict(instrumento)
             escolhidos.append((active_id, symbol, resultado))
@@ -4406,31 +4289,16 @@ def _r24_despachar_melhor(candle_from):
                 f"[SELETOR GLOBAL] ESCOLHIDO {posicao}/{len(escolhidos)}={symbol} {resultado.get('sinal')} | "
                 f"index={resultado['instrumento_digital_preselecionado'].get('instrument_index')}"
             )
-            status_ordem = registrar_operacao_intravela(symbol, resultado)
-            if status_ordem != "CONFIRMADA":
-                # R48: se já existe operação pendente/registrada neste ativo,
-                # NÃO libera retry. Evita duas ordens simultâneas no mesmo ativo.
-                if status_ordem in (
-                    "JA_REGISTRADA", "JA_PENDENTE", "BLOQUEADA_ATIVO",
-                    "ORDEM_ENVIADA_SEM_CONFIRMACAO", "ORDEM_ENVIADA_STATUS_INCERTO"
-                ):
-                    log(
-                        f"[M5 BLOQUEIO DUPLICATA] {symbol}: {status_ordem}; "
-                        "nova ordem no mesmo ativo bloqueada."
-                    )
-                else:
-                    with _intravela_lock:
-                        _intravela_velas_tentadas.discard((int(active_id), candle_from))
-                    log(
-                        f"[M5 RETRY] {symbol}: ordem não confirmada ({status_ordem}); "
-                        "setup liberado para nova tentativa enquanto a vela M5 estiver válida."
-                    )
+            registrar_operacao_intravela(symbol, resultado)
 
     finally:
         with _r24_candidatos_lock:
             _r24_dispatchers.discard(candle_from)
-            # R35: não marca a vela M5 inteira como finalizada. Novos ativos
-            # podem gerar setups válidos mais tarde dentro da mesma vela.
+            _r24_velas_finalizadas.add(candle_from)
+            limite = candle_from - 3600
+            antigos = [v for v in _r24_velas_finalizadas if v < limite]
+            for v in antigos:
+                _r24_velas_finalizadas.discard(v)
 
 def _status_bloqueio_ativo(symbol):
     info = _bloqueios_por_symbol.get(symbol)
@@ -4522,7 +4390,7 @@ def _tentar_gale_na_proxima_vela(active_id, msg):
             "id": chave, "symbol": symbol, "mercado": _mercado_do_symbol(symbol),
             "sinal": gale["sinal"], "score": 0, "confianca": 0.0,
             "faixa_confianca": "GALE", "ajuste_online": 0.0, "adaptativo": {},
-            "estrategia": resultado.get("estrategia", "M5_SR_LTA_LTB_RETRACAO"), "regime": "GALE_OBRIGATORIO_APOS_LOSS",
+            "estrategia": resultado.get("estrategia", "M15_SR_LTA_LTB_RETRACAO"), "regime": "GALE_OBRIGATORIO_APOS_LOSS",
             "preco_sinal": preco, "vela_sinal": datetime.fromtimestamp(candle_from, TZ),
             "vela_entrada": datetime.fromtimestamp(candle_from, TZ),
             "vela_expiracao": datetime.fromtimestamp(candle_from, TZ),
@@ -4545,14 +4413,10 @@ def _processar_sinal_intravela(active_id, msg):
     codigo, symbol = _symbol_por_active_id(active_id)
     if not codigo or not symbol:
         return
-    if _ativo_bloqueado_r44(symbol=symbol, codigo=codigo):
-        return
-    if _status_pausa_lucro()["ativa"]:
-        return
     if _status_bloqueio_ativo(symbol):
         return
 
-    # R30: Martingale desativado. Cada entrada M15 encerra em WIN/LOSS/DOJI.
+    # R30: Martingale desativado. Cada entrada M5 encerra em WIN/LOSS/DOJI.
     _gales_pendentes.clear()
 
     # R31: permite até 2 operações simultâneas no robô inteiro,
@@ -4574,7 +4438,6 @@ def _processar_sinal_intravela(active_id, msg):
     candle_key=(int(active_id),int(resultado['candle_from']))
     with _intravela_lock:
         if candle_key in _intravela_velas_tentadas:
-            log(f"[M5 FLUXO] {symbol}: setup repetido na mesma vela M5; já encaminhado anteriormente.")
             return
         _intravela_velas_tentadas.add(candle_key)
 
@@ -4582,9 +4445,10 @@ def _processar_sinal_intravela(active_id, msg):
 
     candle_from = int(resultado['candle_from'])
     with _r24_candidatos_lock:
-        # R35: não finaliza a vela inteira após a primeira rodada do seletor.
-        # Como a estratégia é intravela, outro ativo pode formar um setup válido
-        # minutos depois. A trava por active_id/símbolo continua impedindo duplicidade.
+        # Depois que a vela já foi classificada, candidatos tardios não podem
+        # criar um segundo dispatcher nem uma segunda tentativa de entrada.
+        if candle_from in _r24_velas_finalizadas:
+            return
         _r24_candidatos.setdefault(candle_from, []).append((int(active_id), symbol, resultado))
         if candle_from not in _r24_dispatchers:
             _r24_dispatchers.add(candle_from)
@@ -4895,14 +4759,14 @@ def enviar_status_ordem_telegram(symbol, sinal, status, detalhe=""):
             "🔄 GALE 1 CONFIRMADO\n\n"
             f"💱 Ativo: {symbol}\n"
             f"📍 Direção: {direcao}\n"
-            "⏱ Expiração: fim da mesma vela M5"
+            "⏱ Expiração: 5 minutos"
         )
     else:
         texto = (
             "🚨 SINAL CONFIRMADO\n\n"
             f"💱 Ativo: {symbol}\n"
             f"📍 Direção: {direcao}\n"
-            "⏱ Expiração: fim da mesma vela M5\n\n"
+            "⏱ Expiração: 5 minutos\n\n"
             "✅ Entrada confirmada"
         )
     enviar_telegram(texto)
@@ -4911,35 +4775,21 @@ def enviar_status_ordem_telegram(symbol, sinal, status, detalhe=""):
 def registrar_operacao_intravela(symbol, resultado):
     sinal = resultado.get("sinal")
     if sinal not in ("CALL", "PUT"):
-        return "SINAL_INVALIDO"
+        return
 
     candle_from = int(resultado["candle_from"])
     candle_dt = datetime.fromtimestamp(candle_from, TZ)
     chave = f"{symbol}|INTRAVELA|{candle_from}"
 
     if _ultimas_operacoes_registradas.get(symbol) == chave:
-        return "JA_REGISTRADA"
+        return
 
     if symbol in _operacoes_pendentes:
-        return "JA_PENDENTE"
-
-    # R50: trava redundante usando as estruturas reais do executor.
-    # A trava principal também existe dentro de executar_ordem_intravela().
-    with _execucao_lock:
-        if (
-            symbol in _operacoes_ativas_por_symbol
-            or symbol in _operacoes_em_envio
-            or symbol in _operacoes_pendentes
-        ):
-            log(
-                f"[M5 BLOQUEIO DUPLICATA] {symbol}: "
-                "já existe operação ativa/em envio/pendente; nova ordem bloqueada."
-            )
-            return "JA_REGISTRADA"
+        return
 
     status = executar_ordem_intravela(symbol, sinal, resultado)
     if status != "CONFIRMADA":
-        return status or "NAO_CONFIRMADA"
+        return
 
     # Só agora o dashboard passa a mostrar a entrada: a Bullex confirmou a ordem.
     _atualizar_dashboard_intravela(symbol, resultado)
@@ -4958,7 +4808,7 @@ def registrar_operacao_intravela(symbol, resultado):
         "faixa_confianca": resultado.get("faixa_confianca") or _autonomo_faixa_confianca(resultado.get("confianca", 0.0)),
         "ajuste_online": resultado.get("ajuste_online", 0.0),
         "adaptativo": resultado.get("adaptativo", {}),
-        "estrategia": resultado.get("estrategia", "M5_SR_LTA_LTB_RETRACAO"),
+        "estrategia": resultado.get("estrategia", "M15_SR_LTA_LTB_RETRACAO"),
         "regime": resultado.get("regime", "AUTONOMO"),
         "preco_sinal": float(resultado["preco"]),
         "vela_sinal": candle_dt,
@@ -4992,7 +4842,6 @@ def registrar_operacao_intravela(symbol, resultado):
         f"entrada={operacao['entrada']:.5f} | "
         f"expira={datetime.fromtimestamp(int(resultado['candle_to']), TZ).strftime('%H:%M:%S')}"
     )
-    return "CONFIRMADA"
 
 
 
@@ -5037,7 +4886,6 @@ def avaliar_operacao(symbol, candles):
         valor_op = float(operacao.get("valor", 0.0) or 0.0)
         operacao["lucro_operacao"] = round(valor_op * payout / 100.0 if resultado == "WIN" else -valor_op if resultado == "LOSS" else 0.0, 2)
         _historico_resultados.append(operacao.copy())
-        _verificar_meta_lucro()
         del _operacoes_pendentes[symbol]
 
         with _execucao_lock:
@@ -5153,7 +5001,7 @@ def loop_parcial_horaria_telegram():
         texto = (
             "📊 PARCIAL — ÚLTIMA HORA\n\n"
             f"🟢 WIN M5: {primeira_wins}\n"
-            f"🔴 LOSS M5: {ciclos_loss}\n\n"
+            f"🔴 LOSS M15: {ciclos_loss}\n\n"
             f"📈 Total: {total} ciclos\n"
             f"🏆 {wins} WIN | {ciclos_loss} LOSS\n"
             f"🎯 Assertividade: {taxa:.1f}%\n\n"
@@ -5201,7 +5049,7 @@ def finalizar_operacoes_vencidas_antes_da_leitura():
 # ============================================================
 
 def processar_ativo(chave, symbol, executar_sinal=False):
-    """Na R22 o loop mantém histórico M55 e finaliza operações.
+    """Na R22 o loop mantém histórico M5 e finaliza operações.
 
     Ele apenas mantém histórico atualizado e finaliza operações.
     Os sinais surgem exclusivamente do candle-generated da vela corrente.
@@ -5220,24 +5068,11 @@ def processar_ativo(chave, symbol, executar_sinal=False):
         if ultimo is not None:
             estado["ativo"] = symbol
             estado["preco"] = f"{float(ultimo['close']):.5f}"
-
-            # R34: o ciclo de manutenção também precisa informar ao dashboard
-            # qual vela M5 acabou de ser processada. Antes este campo só era
-            # preenchido quando surgia um setup aprovado, por isso permanecia "-".
-            dt_ultima = ultimo.get("_dt")
-            if not isinstance(dt_ultima, datetime):
-                dt_ultima = parse_datetime_candle(ultimo.get("datetime"))
-            estado["vela"] = (
-                dt_ultima.strftime("%Y-%m-%d %H:%M:%S BRT")
-                if isinstance(dt_ultima, datetime)
-                else "-"
-            )
-
             estado["atualizado"] = agora_brt().strftime("%H:%M:%S BRT")
             estado["atualidade_min"] = f"{idade:.1f} min" if idade is not None else "-"
             if estado.get("sinal") not in ("CALL", "PUT"):
                 estado["sinal"] = "AGUARDAR"
-                estado["mensagem"] = "Monitorando M15: suporte/resistência + LTA/LTB + retração, sem Gale."
+                estado["mensagem"] = "Monitorando M5: suporte/resistência + LTA/LTB + retração, sem Gale."
         return None
 
     except Exception as e:
@@ -5289,28 +5124,28 @@ def executar_leitura():
     if not _aguardar_ativos_mercado_aberto(timeout=8):
         erro_ativos = _bullex_assets_last_error or "aguardando resposta da Traderoom"
         log(
-            "[OTC] Leitura adiada: active_id dos pares ainda não está pronto. "
+            "[ABERTO] Leitura adiada: active_id dos pares ainda não está pronto. "
             f"Detalhe: {erro_ativos}"
         )
         estado["sinal"] = "AGUARDAR"
         estado["score"] = 0
         estado["mensagem"] = (
-            "Aguardando carregamento dos pares OTC na Bullex."
+            "Aguardando carregamento dos pares Forex de mercado aberto na Bullex."
         )
         estado["atualizado"] = agora_brt().strftime("%H:%M:%S BRT")
         return
 
-    # R30 M15: libera análise assim que pelo menos um ativo tiver histórico M55 suficiente.
+    # R30 M15: libera análise assim que pelo menos um ativo tiver histórico M5 suficiente.
     if not _historico_pronto_event.is_set():
         _precarregar_historico_r22()
         if not _historico_pronto_event.is_set():
             estado["sinal"] = "AGUARDAR"
-            estado["mensagem"] = "R30 aguardando histórico M55 suficiente em pelo menos um ativo."
+            estado["mensagem"] = "R34 aguardando histórico M5 suficiente em pelo menos um ativo."
             estado["atualizado"] = agora_brt().strftime("%H:%M:%S BRT")
-            log("[R30 PRELOAD M15] Leitura sem sinais: nenhum ativo M15 pronto ainda.")
+            log("[R34 PRELOAD M5] Leitura sem sinais: nenhum ativo M5 pronto ainda.")
             return
 
-    # A R30 gera sinais OTC M15 após o preload individual por ativo.
+    # A R30 gera sinais de mercado aberto M5 após o preload individual por ativo.
     # Este ciclo de 5 minutos finaliza/atualiza operações e saúde dos ativos.
     finalizar_operacoes_vencidas_antes_da_leitura()
 
@@ -5328,7 +5163,7 @@ def executar_leitura():
     log(
         f"[MONITOR] ativos mapeados={len(ativos_ciclo)} | "
         f"ABERTO={qtd_aberto} | OTC={qtd_otc} | "
-        "sinais=AUTONOMO KNN OTC | entrada 2-8s | 2 operações GLOBAIS | 1 por ativo | melhor OTC Digital | 24H"
+        "sinais=MERCADO ABERTO M5 | 2 operações GLOBAIS | 1 por ativo | melhor par disponível"
     )
 
     for chave, symbol in ativos_ciclo:
@@ -5373,14 +5208,14 @@ def esperar_ate_proxima_leitura():
         ).replace(
             minute=0,
             second=0,
-            microsecond=10000,
+            microsecond=100000,
         )
 
     else:
         proxima = agora.replace(
             minute=proximo_bloco,
             second=0,
-            microsecond=10000,
+            microsecond=100000,
         )
 
     segundos = max(
@@ -5420,10 +5255,10 @@ def loop_robo():
         if _aguardar_ativos_mercado_aberto(timeout=30):
             with _bullex_assets_lock:
                 ativos_prontos = ", ".join(ATIVO_BULLEX.keys())
-            log(f"[OTC] Pronto para leitura: {ativos_prontos}")
+            log(f"[ABERTO] Pronto para leitura: {ativos_prontos}")
         else:
             log(
-                "[OTC] Inicialização ainda incompleta; "
+                "[ABERTO] Inicialização ainda incompleta; "
                 "a primeira leitura ficará em AGUARDAR, sem gerar KeyError."
             )
 
@@ -5503,91 +5338,6 @@ def calcular_bloqueios_por_par():
     return saida
 
 
-
-def _dados_grafico_dashboard():
-    """Monta o gráfico M1 usando exatamente os candles e níveis calculados pelo robô."""
-    symbol_alvo = estado.get("ativo")
-    cfg_alvo = None
-    codigo_alvo = None
-
-    with _bullex_assets_lock:
-        itens = [(codigo, dict(cfg)) for codigo, cfg in ATIVO_BULLEX.items()]
-
-    # Primeiro tenta mostrar o ativo que o robô analisou/sinalizou por último.
-    for codigo, cfg in itens:
-        if cfg.get("symbol") == symbol_alvo:
-            codigo_alvo, cfg_alvo = codigo, cfg
-            break
-
-    # Se ainda não houve sinal, escolhe o primeiro ativo que já tenha M15 suficiente.
-    if cfg_alvo is None:
-        for codigo, cfg in itens:
-            aid = cfg.get("active_id")
-            if aid is not None and len(_candles_cache(int(aid), 300)) >= 20:
-                codigo_alvo, cfg_alvo = codigo, cfg
-                break
-
-    if not cfg_alvo:
-        return {"pronto": False, "symbol": symbol_alvo or "-", "candles": [], "niveis": []}
-
-    active_id = int(cfg_alvo["active_id"])
-    candles = _candles_cache(active_id, 300)[-55:]
-    serie = []
-    for c in candles:
-        try:
-            ts = int(float(c.get("from") or 0))
-            if not ts:
-                dt = c.get("_dt") or parse_datetime_candle(c.get("datetime"))
-                ts = int(dt.timestamp()) if dt else 0
-            serie.append({
-                "t": ts,
-                "o": float(c["open"]),
-                "h": float(c["high"]),
-                "l": float(c["low"]),
-                "c": float(c["close"]),
-            })
-        except Exception:
-            continue
-
-    fechadas = somente_velas_fechadas(candles, 5)
-    atr15 = atr(fechadas[-SR_M15_LOOKBACK:], 14) if fechadas else None
-    niveis = []
-
-    try:
-        sup, res, _ = _niveis_sr_m15(active_id)
-        for g in sup[-4:]:
-            niveis.append({"tipo": "SUPORTE", "nivel": float(g["nivel"]), "toques": int(g.get("toques", 0))})
-        for g in res[-4:]:
-            niveis.append({"tipo": "RESISTENCIA", "nivel": float(g["nivel"]), "toques": int(g.get("toques", 0))})
-    except Exception:
-        pass
-
-    if atr15 and fechadas:
-        try:
-            lta = _linha_tendencia_m15(fechadas[-SR_M15_LOOKBACK:], "LTA", atr15)
-            if lta:
-                niveis.append({"tipo": "LTA", "nivel": float(lta["nivel"]), "slope": float(lta["slope"]), "toques": 2})
-        except Exception:
-            pass
-        try:
-            ltb = _linha_tendencia_m15(fechadas[-SR_M15_LOOKBACK:], "LTB", atr15)
-            if ltb:
-                niveis.append({"tipo": "LTB", "nivel": float(ltb["nivel"]), "slope": float(ltb["slope"]), "toques": 2})
-        except Exception:
-            pass
-
-    return {
-        "pronto": bool(serie),
-        "symbol": cfg_alvo.get("symbol", codigo_alvo),
-        "active_id": active_id,
-        "candles": serie,
-        "niveis": niveis,
-        "sinal": estado.get("sinal", "AGUARDAR"),
-        "preco": estado.get("preco", "0"),
-        "atualizado": estado.get("atualizado", "-"),
-    }
-
-
 # ============================================================
 # INTERFACE HTML
 # ============================================================
@@ -5606,7 +5356,7 @@ content="width=device-width,
 initial-scale=1.0">
 
 <title>
-Radar OTC M5
+Robô Mercado Aberto M5
 </title>
 
 <style>
@@ -5759,10 +5509,6 @@ h1 {
 .tabela-pares th,.tabela-pares td { padding:8px 5px; border-bottom:1px solid #444; text-align:center; }
 .tabela-pares th:first-child,.tabela-pares td:first-child { text-align:left; }
 .tabela-wrap { overflow-x:auto; }
-
-.grafico-m1 { width:100%; margin-top:14px; overflow:hidden; background:#151515; border:1px solid #333; border-radius:12px; }
-.grafico-m1 svg { display:block; width:100%; height:auto; min-height:300px; }
-.legenda-grafico { display:flex; flex-wrap:wrap; gap:12px; justify-content:center; margin-top:10px; color:#bbb; font-size:12px; }
 </style>
 
 </head>
@@ -5772,12 +5518,12 @@ h1 {
 <div class="container">
 
 <h1>
-Radar OTC M5
+Robô Mercado Aberto M5
 </h1>
 
 <div class="subtitulo">
 
-M5 • Radar de retração • atualização a cada 1 segundo
+Mercado aberto M5 + seletor global + 2 operações em pares diferentes
 
 </div>
 
@@ -5786,7 +5532,7 @@ M5 • Radar de retração • atualização a cada 1 segundo
 <div class="linha"><span>Modo</span><span class="valor">{{ estado.execucao.modo }}</span></div>
 <div class="linha"><span>Automática</span><span class="valor">{{ "ATIVA" if estado.execucao.automatica else "DESATIVADA" }}</span></div>
 <div class="linha"><span>Entrada atual</span><span class="valor">R$ {{ "%.2f"|format(estado.execucao.valor_atual) }}</span></div>
-<div class="linha"><span>Entrada</span><span class="valor">R$ 5,00 fixa • sem Martingale</span></div>
+<div class="linha"><span>Progressão</span><span class="valor">R$ 5,00 normal | Gale 1 R$ 6,00</span></div>
 <div class="linha"><span>Operação ativa</span><span class="valor">{{ "SIM" if estado.execucao.operacao_ativa else "NÃO" }}</span></div>
 <div class="linha"><span>Balance DEMO</span><span class="valor">{{ "ENCONTRADO" if estado.execucao.balance_id_disponivel else "AGUARDANDO" }}</span></div>
 <div class="linha"><span>Último erro</span><span class="valor">{{ estado.execucao.ultimo_erro or "-" }}</span></div>
@@ -5844,18 +5590,110 @@ M5 • Radar de retração • atualização a cada 1 segundo
 </div>
 
 <div class="card">
-<h3>Visão do robô — gráfico M1</h3>
-<div class="linha"><span>Ativo no gráfico</span><span class="valor">{{ grafico.symbol }}</span></div>
-<div class="linha"><span>Timeframe</span><span class="valor">M1</span></div>
-<div id="grafico-m1" class="grafico-m15">
-<svg id="svg-m1" viewBox="0 0 720 390" role="img" aria-label="Candles M1 com suporte, resistência, LTA e LTB"></svg>
+
+<h3>
+Filtros da entrada
+</h3>
+
+<div class="linha">
+<span>Regime</span>
+<span class="valor">{{ estado.detalhes.regime }}</span>
 </div>
-<div id="legenda-grafico" class="legenda-grafico">
-<span>— SUP suporte</span><span>— RES resistência</span><span>／ LTA</span><span>＼ LTB</span>
+
+<div class="linha">
+<span>Estratégia</span>
+<span class="valor">{{ estado.detalhes.estrategia }}</span>
 </div>
-<div class="observacao" style="margin-top:10px">
-As linhas são calculadas com os mesmos candles M1 usados pela estratégia. Atualização automática a cada 10 segundos.
+
+<div class="linha">
+<span>Nível M15</span>
+<span class="valor">MESMA VELA 5M</span>
 </div>
+
+<div class="linha">
+<span>Tendência 5M</span>
+<span class="valor">
+{{ estado.detalhes.tendencia_5m }}
+</span>
+</div>
+
+<div class="linha">
+<span>Tendência 15M</span>
+<span class="valor">
+{{ estado.detalhes.tendencia_15m }}
+</span>
+</div>
+
+<div class="linha">
+<span>Pullback</span>
+<span class="valor">
+{{ estado.detalhes.pullback }}
+</span>
+</div>
+
+<div class="linha">
+<span>Confirmação</span>
+<span class="valor">
+{{ estado.detalhes.confirmacao }}
+</span>
+</div>
+
+<div class="linha">
+<span>Mercado lateral</span>
+<span class="valor">
+{{ estado.detalhes.lateral }}
+</span>
+</div>
+
+<div class="linha">
+<span>Score CALL</span>
+<span class="valor">
+{{ estado.detalhes.score_call }}
+</span>
+</div>
+
+<div class="linha">
+<span>Score PUT</span>
+<span class="valor">
+{{ estado.detalhes.score_put }}
+</span>
+</div>
+
+<div class="linha">
+<span>RSI 14</span>
+<span class="valor">
+{{ estado.detalhes.rsi }}
+</span>
+</div>
+
+<div class="linha">
+<span>EMA 5</span>
+<span class="valor">
+{{ estado.detalhes.ema5 }}
+</span>
+</div>
+
+<div class="linha">
+<span>EMA 13</span>
+<span class="valor">
+{{ estado.detalhes.ema13 }}
+</span>
+</div>
+
+<div class="linha">
+<span>EMA 21</span>
+<span class="valor">
+{{ estado.detalhes.ema21 }}
+</span>
+</div>
+
+<div class="linha">
+<span>ATR 14</span>
+<span class="valor">
+{{ estado.detalhes.atr }}
+</span>
+</div>
+
 </div>
 
 <div class="card">
@@ -5921,11 +5759,15 @@ Taxa de acerto
 </div>
 
 <div class="card">
-<h3>Operação atual</h3>
-<div class="linha"><span>Último ativo</span><span class="valor">{{ estado.ativo }}</span></div>
-<div class="linha"><span>Direção</span><span class="valor">{{ estado.sinal }}</span></div>
-<div class="linha"><span>Preço</span><span class="valor">{{ estado.preco }}</span></div>
-<div class="linha"><span>Vela M5</span><span class="valor">{{ estado.vela }}</span></div>
+<h3>Resultados por par</h3>
+<div class="tabela-wrap">
+<table class="tabela-pares">
+<tr><th>Ativo</th><th>Status</th><th>WIN</th><th>LOSS</th><th>WIN 1ª</th><th>LOSS 1ª</th><th>Gale WIN</th><th>Gale LOSS</th><th>Lucro</th><th>Taxa</th></tr>
+{% for p in estatisticas_pares %}
+<tr><td>{{ p.symbol }}</td><td>{% set b = bloqueios_pares.get(p.symbol, {}) %}{% if b.get('bloqueado') %}BLOQUEADO {{ b.get('minutos_restantes') }} min{% else %}ATIVO{% endif %}</td><td>{{ p.wins }}</td><td>{{ p.losses }}</td><td>{{ p.primeira_wins }}</td><td>{{ p.primeira_losses }}</td><td>{{ p.gale_wins }}</td><td>{{ p.gale_losses }}</td><td>R$ {{ '%.2f'|format(p.lucro) }}</td><td>{{ p.taxa }}%</td></tr>
+{% endfor %}
+</table>
+</div>
 </div>
 
 <div class="card">
@@ -5941,13 +5783,13 @@ Quando houver sinal:
 <br>
 
 <strong>
-Entrada: durante a retração da vela M5
+Entrada: próxima vela de 5 minutos
 </strong>
 
 <br>
 
 <strong>
-Expiração: fechamento da mesma vela M5
+Expiração: 5 minutos
 </strong>
 
 <br><br>
@@ -5993,130 +5835,13 @@ a cada 10 segundos.
 </div>
 
 <script>
-(function () {
-    const dados = {{ grafico|tojson }};
-    const svg = document.getElementById("svg-m1");
-    if (!svg) return;
 
-    const NS = "http://www.w3.org/2000/svg";
-    const W = 720, H = 390, left = 58, right = 12, top = 16, bottom = 34;
-    const candles = Array.isArray(dados.candles) ? dados.candles : [];
-    const niveis = Array.isArray(dados.niveis) ? dados.niveis : [];
+setTimeout(function() {
 
-    function el(tag, attrs, txt) {
-        const n = document.createElementNS(NS, tag);
-        Object.entries(attrs || {}).forEach(([k,v]) => n.setAttribute(k, String(v)));
-        if (txt !== undefined) n.textContent = txt;
-        svg.appendChild(n);
-        return n;
-    }
+    location.reload();
 
-    if (!candles.length) {
-        el("text", {x: W/2, y: H/2, fill:"#aaa", "text-anchor":"middle", "font-size":"16"}, "Aguardando candles M1...");
-        return;
-    }
+}, 10000);
 
-    let minP = Math.min(...candles.map(c => c.l), ...niveis.map(n => n.nivel));
-    let maxP = Math.max(...candles.map(c => c.h), ...niveis.map(n => n.nivel));
-    let pad = Math.max((maxP-minP)*0.08, Math.abs(maxP)*0.0001);
-    minP -= pad; maxP += pad;
-    const plotW = W-left-right, plotH = H-top-bottom;
-    const y = p => top + (maxP-p)/(maxP-minP)*plotH;
-    const step = plotW / candles.length;
-    const x = i => left + step*(i+0.5);
-
-    // Grade e escala de preço.
-    for (let i=0;i<=4;i++) {
-        const yy = top + plotH*i/4;
-        const price = maxP - (maxP-minP)*i/4;
-        el("line",{x1:left,y1:yy,x2:W-right,y2:yy,stroke:"#2d2d2d","stroke-width":"1"});
-        el("text",{x:left-6,y:yy+4,fill:"#888","text-anchor":"end","font-size":"10"}, price.toFixed(price < 10 ? 5 : 3));
-    }
-
-    // Candles.
-    candles.forEach((c,i) => {
-        const xx=x(i), up=c.c>=c.o;
-        const stroke = up ? "#8bcf9b" : "#e58b8b";
-        el("line",{x1:xx,y1:y(c.h),x2:xx,y2:y(c.l),stroke:stroke,"stroke-width":"1.2"});
-        const yo=y(Math.max(c.o,c.c)), yc=y(Math.min(c.o,c.c));
-        el("rect",{x:xx-Math.max(2,step*0.28),y:yo,width:Math.max(3,step*0.56),height:Math.max(1,yc-yo),fill:stroke,rx:"0.5"});
-    });
-
-    // Níveis horizontais e linhas de tendência projetadas.
-    niveis.forEach((n,idx) => {
-        const isTrend = n.tipo==="LTA" || n.tipo==="LTB";
-        const stroke = n.tipo==="SUPORTE" ? "#78aee8" : n.tipo==="RESISTENCIA" ? "#e5b96f" : n.tipo==="LTA" ? "#75c7a1" : "#d78fa7";
-        if (isTrend && Number.isFinite(Number(n.slope))) {
-            const base = Number(n.nivel);
-            const slope = Number(n.slope);
-            const p0 = base - slope*(candles.length-1);
-            el("line",{x1:x(0),y1:y(p0),x2:x(candles.length-1),y2:y(base),stroke:stroke,"stroke-width":"1.7","stroke-dasharray":"6 4"});
-        } else {
-            el("line",{x1:left,y1:y(n.nivel),x2:W-right,y2:y(n.nivel),stroke:stroke,"stroke-width":"1.4","stroke-dasharray":"5 4"});
-        }
-        el("text",{x:W-right-3,y:y(n.nivel)-3,fill:stroke,"text-anchor":"end","font-size":"10"}, n.tipo+" "+Number(n.nivel).toFixed(Number(n.nivel)<10?5:3));
-    });
-
-    // Horários aproximados no eixo X.
-    [0, Math.floor((candles.length-1)/2), candles.length-1].forEach(i => {
-        const d = new Date(Number(candles[i].t)*1000);
-        const label = Number.isFinite(d.getTime()) ? d.toLocaleTimeString("pt-BR",{hour:"2-digit",minute:"2-digit"}) : "";
-        el("text",{x:x(i),y:H-10,fill:"#888","text-anchor":"middle","font-size":"10"},label);
-    });
-})();
-setTimeout(function(){ location.reload(); }, 1000);
-</script>
-
-
-<section id="radar-m1-live" style="margin:18px 0;padding:16px;border:1px solid #333;border-radius:14px;">
-  <div style="display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap">
-    <div>
-      <h2 style="margin:0 0 4px">Radar M5 ao vivo</h2>
-      <div style="opacity:.75">6 ativos mais próximos da entrada • atualização a cada 1 segundo • operação manual</div>
-    </div>
-    <div id="radar-clock" style="font-weight:700">Atualizando…</div>
-  </div>
-  <div id="radar-grid" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;margin-top:14px"></div>
-</section>
-<script>
-(function(){
-  const grid = document.getElementById('radar-grid');
-  const clock = document.getElementById('radar-clock');
-  let ultimoEntrar = '';
-  function esc(v){return String(v == null ? '' : v).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));}
-  async function atualizarRadar(){
-    try{
-      const r = await fetch('/radar-m5', {cache:'no-store'});
-      const d = await r.json();
-      const ativos = Array.isArray(d.ativos) ? d.ativos : [];
-      grid.innerHTML = ativos.map(a=>{
-        const entrar = a.status === 'ENTRAR AGORA';
-        const atencao = a.status === 'ATENÇÃO';
-        const borda = entrar ? '3px solid currentColor' : atencao ? '2px solid currentColor' : '1px solid #444';
-        const chamada = entrar ? (a.direcao === 'CALL' ? '🟢 COMPRA AGORA' : '🔴 VENDA AGORA') : esc(a.status);
-        return `<div style="padding:14px;border:${borda};border-radius:12px">
-          <div style="display:flex;justify-content:space-between;gap:8px"><strong>${esc(a.ativo)}</strong><strong>${a.progresso}%</strong></div>
-          <div style="font-size:20px;font-weight:800;margin:9px 0">${chamada}</div>
-          <div style="opacity:.8">Preço: ${esc(a.preco)} • fecha em ${esc(a.restantes)}s</div>
-          <div style="height:8px;background:#333;border-radius:99px;overflow:hidden;margin-top:10px"><div style="height:100%;width:${a.progresso}%;background:currentColor"></div></div>
-        </div>`;
-      }).join('') || '<div style="opacity:.7">Aguardando candles M5 suficientes…</div>';
-      clock.textContent = 'Ao vivo • ' + new Date().toLocaleTimeString();
-      const atual = ativos.filter(a=>a.status==='ENTRAR AGORA').map(a=>a.ativo+':'+a.direcao).join('|');
-      if(atual && atual !== ultimoEntrar && 'AudioContext' in window){
-        try{
-          const ac = new AudioContext(), o=ac.createOscillator(), g=ac.createGain();
-          o.connect(g); g.connect(ac.destination); o.frequency.value=880; g.gain.value=.05; o.start(); o.stop(ac.currentTime+.15);
-        }catch(e){}
-      }
-      ultimoEntrar = atual;
-    }catch(e){
-      clock.textContent = 'Reconectando…';
-    }
-  }
-  atualizarRadar();
-  setInterval(atualizarRadar,30000);
-})();
 </script>
 
 </body>
@@ -6125,257 +5850,28 @@ setTimeout(function(){ location.reload(); }, 1000);
 """
 
 
-
-# R44: execução automática permanece habilitada.
-BULLEX_AUTO_TRADE = True
-
 # ============================================================
 # ROTAS
 # ============================================================
 
-
-def _radar_m5_ao_vivo():
-    """R40: até 6 ativos OTC mais próximos da entrada, usando candles M5 reais do WS."""
-    itens = []
-    agora, _ = _horario_servidor_atual()
-    candle_from_atual = int(agora // 300) * 300
-    restantes = max(0, int(candle_from_atual + 300 - agora))
-
-    # ATIVO_BULLEX é atualizado pela descoberta dinâmica da Traderoom.
-    with _bullex_assets_lock:
-        configs = [dict(v) for v in ATIVO_BULLEX.values() if isinstance(v, dict)]
-
-    for cfg in configs:
-        try:
-            aid = int(cfg.get("active_id"))
-            simbolo = cfg.get("symbol") or cfg.get("ticker") or str(aid)
-            candles = _candles_cache(aid, 300)
-            if not candles or len(candles) < 25:
-                continue
-
-            # Localiza a vela M5 corrente recebida pelo candle-generated.
-            corrente = None
-            for c in reversed(candles):
-                try:
-                    cf = int(float(c.get("from", c.get("at", c.get("timestamp", 0))) or 0))
-                except Exception:
-                    cf = 0
-                if cf == candle_from_atual:
-                    corrente = dict(c)
-                    break
-            if corrente is None:
-                corrente = dict(candles[-1])
-
-            corrente["active_id"] = aid
-            corrente["size"] = 300
-            if "from" not in corrente:
-                corrente["from"] = candle_from_atual
-            if "to" not in corrente:
-                corrente["to"] = int(corrente["from"]) + 300
-
-            preco = float(corrente.get("close", corrente.get("price", 0)) or 0)
-            resultado = _resultado_retracao_intravela(corrente, aid)
-
-            direcao = None
-            confianca = 0.0
-            detalhe = ""
-            if isinstance(resultado, dict):
-                direcao = resultado.get("sinal")
-                confianca = float(resultado.get("confianca", 0) or 0)
-                detalhe = str(resultado.get("pullback") or resultado.get("estrategia") or "")
-
-            # Progresso visual NÃO é probabilidade de vitória.
-            # Mede proximidade do preço a um extremo da faixa recente enquanto
-            # o setup completo ainda não foi confirmado.
-            if confianca <= 0:
-                recentes = candles[-20:]
-                highs = [float(c.get("high", c.get("max", 0)) or 0) for c in recentes]
-                lows = [float(c.get("low", c.get("min", 0)) or 0) for c in recentes]
-                highs = [v for v in highs if v > 0]
-                lows = [v for v in lows if v > 0]
-                if highs and lows and preco > 0:
-                    hi, lo = max(highs), min(lows)
-                    amplitude = max(hi - lo, 1e-12)
-                    pos = max(0.0, min(1.0, (preco - lo) / amplitude))
-                    proximidade_extremo = max(pos, 1.0 - pos)
-                    confianca = min(0.79, max(0.20, proximidade_extremo * 0.79))
-                else:
-                    confianca = 0.20
-
-            pct = int(round(confianca * 100 if confianca <= 1 else confianca))
-            pct = max(0, min(100, pct))
-
-            if direcao in ("CALL", "PUT"):
-                status = "ENTRAR AGORA"
-                pct = max(pct, 90)
-            elif pct >= 80:
-                status = "ATENÇÃO"
-            elif pct >= 65:
-                status = "APROXIMANDO"
-            else:
-                status = "AGUARDANDO"
-
-            itens.append({
-                "ativo": simbolo,
-                "active_id": aid,
-                "preco": preco,
-                "progresso": pct,
-                "status": status,
-                "direcao": direcao,
-                "restantes": restantes,
-                "detalhe": detalhe,
-            })
-        except Exception as e:
-            log(f"[RADAR M5] ativo ignorado: {e}")
-            continue
-
-    itens.sort(
-        key=lambda x: (
-            1 if x["status"] == "ENTRAR AGORA" else 0,
-            x["progresso"]
-        ),
-        reverse=True
-    )
-    return itens[:6]
-
-
-@app.route("/radar-m1")
-def radar_m1_compat():
-    """Compatibilidade temporária para páginas antigas em cache: entrega o Radar M5."""
-    return jsonify({
-        "status": "ok",
-        "timeframe": "M5",
-        "modo": "AUTOMATICO",
-        "atualizacao_ms": 1000,
-        "ativos": _radar_m5_ao_vivo(),
-        "candles_m5_armazenados": sum(
-            len(_candles_cache(int(v.get("active_id")), 300))
-            for v in ATIVO_BULLEX.values()
-            if isinstance(v, dict) and v.get("active_id") is not None
-        ),
-    })
-
-
-@app.route("/radar-m5")
-def radar_m5():
-    financeiro = calcular_financeiro()
-    stats = calcular_estatisticas()
-    return jsonify({
-        "status": "ok",
-        "timeframe": "M5",
-        "modo": "AUTOMATICO",
-        "atualizacao_ms": 1000,
-        "ativos": _radar_m5_ao_vivo(),
-        "estatisticas": stats,
-        "financeiro": financeiro,
-        "pausa_lucro": _status_pausa_lucro(),
-        "meta_lucro": META_LUCRO_PAUSA,
-        "max_operacoes": MAX_OPERACOES_GLOBAIS,
-        "operacoes_ativas": _qtd_operacoes_globais_em_andamento(),
-        "candles_m5_armazenados": sum(len(_candles_cache(int(v.get("active_id")), 300)) for v in ATIVO_BULLEX.values() if isinstance(v, dict) and v.get("active_id") is not None),
-    })
-
-
 @app.route("/")
 def index():
-    return render_template_string(r"""
-<!doctype html>
-<html lang="pt-BR">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Radar M5</title>
-<style>
-:root{color-scheme:dark}
-*{box-sizing:border-box}
-body{margin:0;background:#0d0f12;color:#f4f6f8;font-family:Arial,sans-serif}
-main{max-width:1100px;margin:auto;padding:14px}
-.top{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:12px}
-h1{font-size:22px;margin:0}.live{font-size:13px;opacity:.75}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:12px}
-.card{border:1px solid #343941;border-radius:14px;padding:15px;background:#15181d;min-height:145px}
-.card.enter{border:3px solid currentColor}
-.card.attn{border:2px solid currentColor}
-.row{display:flex;justify-content:space-between;gap:8px;align-items:center}
-.asset{font-size:18px;font-weight:800}.pct{font-weight:800}
-.signal{font-size:23px;font-weight:900;margin:13px 0 9px}
-.meta{font-size:14px;opacity:.78}
-.bar{height:9px;background:#30343a;border-radius:99px;overflow:hidden;margin-top:12px}
-.fill{height:100%;background:currentColor}
-.empty{opacity:.7;padding:18px 2px}
-@media(max-width:520px){main{padding:10px}.grid{grid-template-columns:1fr}.signal{font-size:21px}}
-</style>
-</head>
-<body>
-<main>
-  <div class="top">
-    <h1>Radar M5 ao vivo</h1>
-    <div id="clock" class="live">Conectando…</div>
-  </div>
-  <div id="resumo" style="display:grid;grid-template-columns:repeat(4,minmax(120px,1fr));gap:8px;margin-bottom:12px">
-    <div class="card" style="min-height:auto"><div class="meta">Vitórias</div><strong id="wins">0</strong></div>
-    <div class="card" style="min-height:auto"><div class="meta">Perdas</div><strong id="losses">0</strong></div>
-    <div class="card" style="min-height:auto"><div class="meta">Lucro</div><strong id="lucro">R$ 0,00</strong></div>
-    <div class="card" style="min-height:auto"><div class="meta">Operações</div><strong id="ops">0/3</strong></div>
-  </div>
-  <div id="pausa" class="meta" style="margin:0 0 12px 2px">AUTO ATIVO • Meta de pausa: R$ 50,00</div>
-  <div id="grid" class="grid"><div class="empty">Aguardando mercado…</div></div>
-</main>
-<script>
-(function(){
- const grid=document.getElementById('grid'), clock=document.getElementById('clock');
- const wins=document.getElementById('wins'), losses=document.getElementById('losses'),
-       lucro=document.getElementById('lucro'), ops=document.getElementById('ops'),
-       pausa=document.getElementById('pausa');
- let ultimo='';
- const esc=v=>String(v==null?'':v).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
- async function update(){
-   try{
-     const r=await fetch('/radar-m5',{cache:'no-store'});
-     const d=await r.json();
-     const a=Array.isArray(d.ativos)?d.ativos:[];
-     const st=d.estatisticas||{}, fin=d.financeiro||{}, ps=d.pausa_lucro||{};
-     wins.textContent=Number(st.wins||0);
-     losses.textContent=Number(st.losses||0);
-     lucro.textContent='R$ '+Number(fin.lucro_total||0).toFixed(2).replace('.',',');
-     ops.textContent=String(d.operacoes_ativas||0)+'/'+String(d.max_operacoes||3);
-     if(ps.ativa){
-       const total=Math.max(0,Number(ps.restante_segundos||0));
-       const h=Math.floor(total/3600);
-       const m=Math.floor((total%3600)/60);
-       pausa.textContent='⏸ PAUSADO POR META DE LUCRO • volta em '+h+'h '+m+'min';
-     }else{
-       pausa.textContent='🤖 AUTO ATIVO • até 3 pares diferentes • pausa em R$ 50,00 de lucro';
-     }
-     grid.innerHTML=a.map(x=>{
-       const entrar=x.status==='ENTRAR AGORA', at=x.status==='ATENÇÃO';
-       const cls='card'+(entrar?' enter':at?' attn':'');
-       let sinal=esc(x.status);
-       if(entrar) sinal=x.direcao==='CALL'?'🟢 COMPRA AGORA':'🔴 VENDA AGORA';
-       return `<div class="${cls}">
-         <div class="row"><span class="asset">${esc(x.ativo)}</span><span class="pct">${esc(x.progresso)}%</span></div>
-         <div class="signal">${sinal}</div>
-         <div class="meta">Fecha em <strong>${esc(x.restantes)}s</strong></div>
-         <div class="bar"><div class="fill" style="width:${Math.max(0,Math.min(100,Number(x.progresso)||0))}%"></div></div>
-       </div>`;
-     }).join('')||'<div class="empty">Aguardando ativos M5…</div>';
-     clock.textContent='AO VIVO • '+new Date().toLocaleTimeString();
-     const atual=a.filter(x=>x.status==='ENTRAR AGORA').map(x=>x.ativo+':'+x.direcao).join('|');
-     if(atual && atual!==ultimo && 'AudioContext' in window){
-       try{
-         const ac=new AudioContext(),o=ac.createOscillator(),g=ac.createGain();
-         o.connect(g);g.connect(ac.destination);o.frequency.value=880;g.gain.value=.05;o.start();o.stop(ac.currentTime+.16);
-       }catch(e){}
-     }
-     ultimo=atual;
-   }catch(e){clock.textContent='Reconectando…';}
- }
- update(); setInterval(update,30000);
-})();
-</script>
-</body>
-</html>
-""")
+    garantir_robo_iniciado()
+
+    estado[
+        "estatisticas"
+    ] = calcular_estatisticas()
+
+    return render_template_string(
+        HTML,
+        estado=estado,
+        estatisticas_pares=calcular_estatisticas_por_par(),
+        financeiro=calcular_financeiro(),
+        valor_entrada_atual=_valor_entrada_atual(),
+        valor_gale_atual=_valor_gale_atual(),
+        bloqueios_pares=calcular_bloqueios_por_par()
+    )
+
 
 @app.route("/dados")
 def dados():
@@ -6401,7 +5897,7 @@ def health():
             ),
         "estrategia":
             (
-                "AUTONOMO KNN OTC: aprendizado por ativo + seletor GLOBAL do melhor OTC Digital | 24H"
+                "MERCADO ABERTO M5: descoberta dinâmica + seletor GLOBAL do melhor par disponível"
             ),
         "fonte_candles": "Bullex",
         "execucao_automatica": BULLEX_AUTO_TRADE,
@@ -6440,7 +5936,7 @@ def health():
         "historico_preload_pronto": _historico_pronto_event.is_set(),
         "historico_preload_ultima_tentativa": _historico_preload_ultima_tentativa,
         "historico_preload_status": dict(_historico_preload_status),
-        "mercado": "OTC",
+        "mercado": "ABERTO",
         "ativos_otc": {
             "detectado": _bullex_assets_detected,
             "quantidade": len(ATIVO_BULLEX),
@@ -6487,7 +5983,7 @@ if __name__ == "__main__":
         port=int(
             os.getenv(
                 "PORT",
-                "1000"
+                "10000"
             )
         ),
         debug=False,
