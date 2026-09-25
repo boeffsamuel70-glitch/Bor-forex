@@ -156,7 +156,7 @@ BULLEX_USER_BALANCE_ID = os.getenv(
 VALORES_ENTRADA = [5.00, 9.00]
 # R36: progressão por WIN: 5 -> 9 -> reinicia em 5.
 # Qualquer LOSS/DOJI reinicia imediatamente em R$5. Sem Gale/Martingale.
-BANCA_INICIAL = 220.00
+BANCA_INICIAL = 215.00
 BANCA_MINIMA = 205.00
 BANCA_META = 270.00
 VALOR_GALE = 0.00
@@ -295,7 +295,6 @@ estado["execucao"] = {
     "ultimo_erro": None,
     "balance_id_disponivel": bool(BULLEX_USER_BALANCE_ID),
     "balance_source": "ENV" if BULLEX_USER_BALANCE_ID else None,
-    "stop_loss_total": STOP_LOSS_TOTAL,
     "stop_loss_atingido": False,
 }
 
