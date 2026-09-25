@@ -102,7 +102,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "R35-OPEN-MARKET-M5-GESTAO-10-18-8-13-1OP-20260925"
+BULLEX_DIAGNOSTIC_VERSION = "R37-OPEN-MARKET-M5-GESTAO-5-9-STOP20-CICLOS-1OP-20260925"
 
 _bullex_diag = {
     "messages": 0,
@@ -153,9 +153,11 @@ BULLEX_USER_BALANCE_ID = os.getenv(
     ""
 ).strip()
 
-VALORES_ENTRADA = [10.00, 18.00, 8.00, 13.00]
-# R35: progressão por WIN: 10 -> 18 -> 8 -> 13 -> reinicia em 10.
-# Qualquer LOSS/DOJI reinicia imediatamente em R$10. Sem Gale/Martingale.
+VALORES_ENTRADA = [5.00, 9.00]
+# R36: progressão por WIN: 5 -> 9 -> reinicia em 5.
+# Qualquer LOSS/DOJI reinicia imediatamente em R$5. Sem Gale/Martingale.
+STOP_LOSS_TOTAL = 20.00
+STOP_LOSS_VALOR_POR_CICLO = 5.00
 VALOR_GALE = 0.00
 # Se a Bullex não devolver o payout no retorno da ordem, usa este valor apenas como fallback.
 BULLEX_PAYOUT_FALLBACK = float(os.getenv("BULLEX_PAYOUT_FALLBACK", "87").strip() or "87")
@@ -292,6 +294,8 @@ estado["execucao"] = {
     "ultimo_erro": None,
     "balance_id_disponivel": bool(BULLEX_USER_BALANCE_ID),
     "balance_source": "ENV" if BULLEX_USER_BALANCE_ID else None,
+    "stop_loss_total": STOP_LOSS_TOTAL,
+    "stop_loss_atingido": False,
 }
 
 _robo_lock = threading.Lock()
@@ -716,6 +720,15 @@ def _valor_entrada_atual():
 def _valor_gale_atual():
     return float(VALOR_GALE)
 
+def _perda_stop_acumulada():
+    """Stop por ciclos: cada LOSS encerrado conta R$5, inclusive LOSS da entrada de R$9."""
+    perdas = sum(1 for op in _historico_resultados if op.get("resultado") == "LOSS")
+    return round(perdas * float(STOP_LOSS_VALOR_POR_CICLO), 2)
+
+def _stop_loss_atingido():
+    """Bloqueia novas entradas ao acumular R$20 no contador de perdas por ciclo."""
+    return _perda_stop_acumulada() >= float(STOP_LOSS_TOTAL)
+
 def _extrair_payout_percent(obj):
     """Procura um percentual de payout/profit retornado pela Bullex."""
     chaves = {"payout", "payout_percent", "payout_percentage", "profit_percent", "profit_percentage"}
@@ -770,6 +783,10 @@ def _atualizar_estado_execucao():
         "operacoes_ativas": _qtd_operacoes_globais_em_andamento(),
         "balance_id_disponivel": _bullex_balance_id is not None,
         "balance_source": _bullex_balance_source,
+        "stop_loss_total": STOP_LOSS_TOTAL,
+        "stop_loss_perda_acumulada": _perda_stop_acumulada(),
+        "stop_loss_valor_por_ciclo": STOP_LOSS_VALOR_POR_CICLO,
+        "stop_loss_atingido": _stop_loss_atingido(),
     })
 
 
@@ -1053,6 +1070,12 @@ def executar_ordem_intravela(symbol, sinal, resultado, valor_override=None, tipo
     if sinal not in ("CALL", "PUT"):
         return None
 
+    if _stop_loss_atingido():
+        estado["execucao"]["ultimo_erro"] = "STOP_LOSS_TOTAL_ATINGIDO"
+        _atualizar_estado_execucao()
+        log(f"[GESTAO] STOP LOSS atingido: perdas de ciclo somaram R${_perda_stop_acumulada():.2f} (limite R${STOP_LOSS_TOTAL:.2f}). Novas entradas bloqueadas.")
+        return "STOP_LOSS_TOTAL"
+
     if not BULLEX_USER_BALANCE_ID:
         estado["execucao"]["ultimo_erro"] = "SEM_BALANCE_ID"
         _atualizar_estado_execucao()
@@ -1269,7 +1292,7 @@ def executar_ordem_intravela(symbol, sinal, resultado, valor_override=None, tipo
 
 
 def _atualizar_progressao(resultado):
-    """R35: 10 -> 18 -> 8 -> 13 somente após WIN; LOSS/DOJI volta para 10."""
+    """R36: 5 -> 9 somente após WIN; segundo WIN reinicia em 5; LOSS/DOJI volta para 5."""
     global _nivel_progressao
     if resultado == "WIN":
         _nivel_progressao += 1
