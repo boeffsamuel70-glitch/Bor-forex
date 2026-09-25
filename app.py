@@ -102,7 +102,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "R34-OPEN-MARKET-M5-DYNAMIC-2OPS-20260924"
+BULLEX_DIAGNOSTIC_VERSION = "R35-OPEN-MARKET-M5-GESTAO-10-18-8-13-1OP-20260925"
 
 _bullex_diag = {
     "messages": 0,
@@ -153,8 +153,10 @@ BULLEX_USER_BALANCE_ID = os.getenv(
     ""
 ).strip()
 
-VALORES_ENTRADA = [5.00]
-VALOR_GALE = 6.00
+VALORES_ENTRADA = [10.00, 18.00, 8.00, 13.00]
+# R35: progressão por WIN: 10 -> 18 -> 8 -> 13 -> reinicia em 10.
+# Qualquer LOSS/DOJI reinicia imediatamente em R$10. Sem Gale/Martingale.
+VALOR_GALE = 0.00
 # Se a Bullex não devolver o payout no retorno da ordem, usa este valor apenas como fallback.
 BULLEX_PAYOUT_FALLBACK = float(os.getenv("BULLEX_PAYOUT_FALLBACK", "87").strip() or "87")
 EXPIRACAO_MINUTOS = 5
@@ -194,7 +196,7 @@ M15_RETRACAO_MAX = 0.72
 M15_LINHA_TOLERANCIA_ATR = 0.22
 MARTINGALE_ATIVO = False
 
-MAX_OPERACOES_GLOBAIS = 2
+MAX_OPERACOES_GLOBAIS = 1
 MAX_OPERACOES_POR_ATIVO = 1
 AUTONOMO_MIN_AMOSTRAS = 45
 AUTONOMO_K_VIZINHOS = 17
@@ -708,7 +710,8 @@ def _montar_send_message(nome, version, body=None):
 # ============================================================
 
 def _valor_entrada_atual():
-    return float(VALORES_ENTRADA[0])
+    nivel = max(0, min(int(_nivel_progressao), len(VALORES_ENTRADA) - 1))
+    return float(VALORES_ENTRADA[nivel])
 
 def _valor_gale_atual():
     return float(VALOR_GALE)
@@ -763,8 +766,8 @@ def _atualizar_estado_execucao():
         "modo": "DEMO DIGITAL",
         "valor_atual": _valor_entrada_atual(),
         "nivel_progressao": _nivel_progressao,
-        "operacao_ativa": bool(_operacoes_ativas_por_symbol),
-        "operacoes_ativas": len(_operacoes_ativas_por_symbol),
+        "operacao_ativa": _qtd_operacoes_globais_em_andamento() > 0,
+        "operacoes_ativas": _qtd_operacoes_globais_em_andamento(),
         "balance_id_disponivel": _bullex_balance_id is not None,
         "balance_source": _bullex_balance_source,
     })
@@ -1041,7 +1044,7 @@ def _registrar_ordem_confirmada(symbol, ticker, sinal, valor, active_id, balance
     return 'CONFIRMADA'
 
 def executar_ordem_intravela(symbol, sinal, resultado, valor_override=None, tipo_entrada="PRIMEIRA"):
-    """Envia uma ordem. valor_override é usado pelo Gale 1 (R$ 6,00)."""
+    """Envia uma ordem. R35 usa o valor atual da progressão global."""
     global _bullex_last_error
 
     if not BULLEX_AUTO_TRADE:
@@ -1266,14 +1269,14 @@ def executar_ordem_intravela(symbol, sinal, resultado, valor_override=None, tipo
 
 
 def _atualizar_progressao(resultado):
+    """R35: 10 -> 18 -> 8 -> 13 somente após WIN; LOSS/DOJI volta para 10."""
     global _nivel_progressao
     if resultado == "WIN":
-        _nivel_progressao = 0
-    elif resultado == "LOSS":
-        if _nivel_progressao < len(VALORES_ENTRADA) - 1:
-            _nivel_progressao += 1
-        else:
+        _nivel_progressao += 1
+        if _nivel_progressao >= len(VALORES_ENTRADA):
             _nivel_progressao = 0
+    else:
+        _nivel_progressao = 0
     _atualizar_estado_execucao()
 
 
@@ -4419,8 +4422,7 @@ def _processar_sinal_intravela(active_id, msg):
     # R30: Martingale desativado. Cada entrada M5 encerra em WIN/LOSS/DOJI.
     _gales_pendentes.clear()
 
-    # R31: permite até 2 operações simultâneas no robô inteiro,
-    # mantendo no máximo 1 operação por ativo.
+    # R35: somente 1 operação por vez no robô inteiro.
     with _execucao_lock:
         if not _ha_vaga_operacao_global():
             return
