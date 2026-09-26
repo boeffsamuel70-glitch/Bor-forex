@@ -102,7 +102,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "R39-OTC-M5-RECUPERACAO-5-PAYOUT87-BANCA900-1OP-20260926"
+BULLEX_DIAGNOSTIC_VERSION = "R39B-OTC-M5-RECUPERACAO-5-PAYOUT87-BANCA900-1OP-20260926"
 
 _bullex_diag = {
     "messages": 0,
@@ -5237,7 +5237,7 @@ def executar_leitura():
     log(
         f"[MONITOR] ativos mapeados={len(ativos_ciclo)} | "
         f"ABERTO={qtd_aberto} | OTC={qtd_otc} | "
-        "sinais=OTC M5 | 2 operações GLOBAIS | 1 por ativo | melhor par disponível"
+        "sinais=OTC M5 | 1 operação GLOBAL | 1 por ativo | melhor par disponível"
     )
 
     for chave, symbol in ativos_ciclo:
