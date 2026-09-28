@@ -65,8 +65,8 @@ BULLEX_USER_AGENT = os.getenv(
 # ATIVOS BULLEX
 # ============================================================
 
-# MERCADO OTC DINAMICO.
-# Nao usa IDs fixos: apos autenticar, a Traderoom fornece os pares OTC disponíveis.
+# MERCADO ABERTO DINAMICO.
+# Nao usa IDs fixos: apos autenticar, a Traderoom fornece os pares Forex abertos.
 ATIVO_BULLEX = {}
 PARES_MERCADO_ABERTO = {}
 PARES_OTC_ALVO = {}
@@ -75,7 +75,7 @@ _bullex_assets_lock = threading.RLock()
 _bullex_assets_detected = False
 _bullex_assets_last_error = None
 _bullex_assets_updated_at = None
-_bullex_assets_source = "DIGITAL_OTC_DYNAMIC"
+_bullex_assets_source = "DIGITAL_FOREX_OPEN_DYNAMIC"
 _bullex_assets_ready_event = threading.Event()
 _bullex_assets_init_lock = threading.Lock()
 
@@ -102,7 +102,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "R39B-OTC-M5-RECUPERACAO-5-PAYOUT87-BANCA900-1OP-20260926"
+BULLEX_DIAGNOSTIC_VERSION = "R38-OPEN-MARKET-M5-GESTAO-5-9-BANCA-205-270-PAYOUT83-1OP-20260925"
 
 _bullex_diag = {
     "messages": 0,
@@ -153,20 +153,15 @@ BULLEX_USER_BALANCE_ID = os.getenv(
     ""
 ).strip()
 
-VALOR_BASE = 5.00
-PAYOUT_GESTAO_PERCENT = 87.00
-LUCRO_ALVO_CICLO = round(VALOR_BASE * PAYOUT_GESTAO_PERCENT / 100.0, 2)
-VALORES_ENTRADA = [VALOR_BASE]
-# R39: recuperação dinâmica após LOSS.
-# Próxima entrada = (perdas acumuladas do ciclo + lucro-alvo R$4,35) / 0,87.
-# Após qualquer WIN, o ciclo é zerado e a próxima entrada volta para R$5.
+VALORES_ENTRADA = [10.00, 19.00]
+# R36: progressão por WIN: 10 -> 19 -> reinicia em 10.
+# Qualquer LOSS/DOJI reinicia imediatamente em R$10. Sem Gale/Martingale.
 BANCA_INICIAL = 900.00
-BANCA_MINIMA = 0.00
-BANCA_META = float("inf")
+BANCA_MINIMA = 800.00
+BANCA_META = 1100.00
 VALOR_GALE = 0.00
-BULLEX_PAYOUT_FALLBACK = float(os.getenv("BULLEX_PAYOUT_FALLBACK", "87").strip() or "87")
-_perdas_ciclo_gestao = 0.0
-_tentativa_ciclo_gestao = 1
+# Se a Bullex não devolver o payout no retorno da ordem, usa este valor apenas como fallback.
+BULLEX_PAYOUT_FALLBACK = float(os.getenv("BULLEX_PAYOUT_FALLBACK", "83").strip() or "83")
 EXPIRACAO_MINUTOS = 5
 # A antiga janela de 3 segundos foi removida.
 # Esta estratégia entra DURANTE a vela atual e expira no fechamento da MESMA vela.
@@ -719,11 +714,8 @@ def _montar_send_message(nome, version, body=None):
 # ============================================================
 
 def _valor_entrada_atual():
-    """R39: R$5 no início; após LOSS recupera perdas do ciclo + R$4,35."""
-    if _perdas_ciclo_gestao <= 0:
-        return float(VALOR_BASE)
-    valor = (_perdas_ciclo_gestao + LUCRO_ALVO_CICLO) / (PAYOUT_GESTAO_PERCENT / 100.0)
-    return round(float(valor) + 1e-9, 2)
+    nivel = max(0, min(int(_nivel_progressao), len(VALORES_ENTRADA) - 1))
+    return float(VALORES_ENTRADA[nivel])
 
 def _valor_gale_atual():
     return float(VALOR_GALE)
@@ -742,7 +734,11 @@ def _saldo_gestao_atual():
     return round(float(BANCA_INICIAL) + lucro, 2)
 
 def _limite_banca_atingido():
-    """R39: sem stop mínimo/máximo artificial; limita apenas pelo saldo disponível."""
+    saldo = _saldo_gestao_atual()
+    if saldo <= float(BANCA_MINIMA):
+        return "STOP_LOSS"
+    if saldo >= float(BANCA_META):
+        return "STOP_WIN"
     return None
 
 def _extrair_payout_percent(obj):
@@ -801,11 +797,7 @@ def _atualizar_estado_execucao():
         "balance_source": _bullex_balance_source,
         "banca_inicial": BANCA_INICIAL,
         "banca_minima": BANCA_MINIMA,
-        "banca_meta": None,
-        "lucro_alvo_ciclo": LUCRO_ALVO_CICLO,
-        "perdas_ciclo": round(_perdas_ciclo_gestao, 2),
-        "tentativa_ciclo": _tentativa_ciclo_gestao,
-        "payout_gestao": PAYOUT_GESTAO_PERCENT,
+        "banca_meta": BANCA_META,
         "saldo_gestao": _saldo_gestao_atual(),
         "limite_banca": _limite_banca_atingido(),
     })
@@ -1154,18 +1146,6 @@ def executar_ordem_intravela(symbol, sinal, resultado, valor_override=None, tipo
 
     ticker = config.get("ticker")
     valor = float(valor_override) if valor_override is not None else _valor_entrada_atual()
-    saldo_disponivel = _saldo_gestao_atual()
-    if valor > saldo_disponivel:
-        log(
-            f"[GESTAO] Entrada necessária R${valor:.2f} excede saldo teórico "
-            f"R${saldo_disponivel:.2f}; ordem não enviada."
-        )
-        with _execucao_lock:
-            _operacoes_em_envio.discard(symbol)
-            _active_ids_em_envio.discard(active_id)
-        estado["execucao"]["ultimo_erro"] = "SALDO_INSUFICIENTE_GESTAO"
-        _atualizar_estado_execucao()
-        return "SALDO_INSUFICIENTE"
 
     server_ts, source = _horario_servidor_atual()
     candle_from = int(resultado["candle_from"])
@@ -1326,29 +1306,15 @@ def executar_ordem_intravela(symbol, sinal, resultado, valor_override=None, tipo
 
 
 
-def _atualizar_progressao(resultado, valor_operacao=None):
-    """R39: LOSS acumula prejuízo; WIN encerra o ciclo e volta para R$5."""
-    global _nivel_progressao, _perdas_ciclo_gestao, _tentativa_ciclo_gestao
-
-    valor = float(valor_operacao or _valor_entrada_atual())
-
+def _atualizar_progressao(resultado):
+    """R36: 10 -> 19 somente após WIN; segundo WIN reinicia em 10; LOSS/DOJI volta para 10."""
+    global _nivel_progressao
     if resultado == "WIN":
-        _perdas_ciclo_gestao = 0.0
-        _tentativa_ciclo_gestao = 1
-        _nivel_progressao = 0
-        log("[GESTAO] WIN: ciclo recuperado/encerrado; próxima entrada R$5,00.")
-    elif resultado == "LOSS":
-        _perdas_ciclo_gestao = round(_perdas_ciclo_gestao + valor, 2)
-        _tentativa_ciclo_gestao += 1
-        _nivel_progressao = _tentativa_ciclo_gestao - 1
-        proxima = _valor_entrada_atual()
-        log(
-            f"[GESTAO] LOSS: perdas do ciclo R${_perdas_ciclo_gestao:.2f} | "
-            f"tentativa {_tentativa_ciclo_gestao} | próxima R${proxima:.2f}."
-        )
+        _nivel_progressao += 1
+        if _nivel_progressao >= len(VALORES_ENTRADA):
+            _nivel_progressao = 0
     else:
-        log("[GESTAO] DOJI: mantém o ciclo e repete o valor calculado.")
-
+        _nivel_progressao = 0
     _atualizar_estado_execucao()
 
 
@@ -2270,14 +2236,14 @@ def _normalizar_par_mercado_aberto(item):
 
     par = base[:6]
 
-    # R39: opera SOMENTE pares OTC. Mercado aberto é ignorado.
-    if not is_otc:
+    # R34: opera SOMENTE Forex de mercado aberto. OTC e outros produtos sao ignorados.
+    if is_otc:
         return None
     if len(par) != 6 or not par.isalpha():
         return None
-    codigo = f"{par}OTC"
-    symbol_final = f"{par[:3]}/{par[3:]} OTC"
-    mercado = "OTC"
+    codigo = par
+    symbol_final = f"{par[:3]}/{par[3:]}"
+    mercado = "ABERTO"
 
     return {
         "codigo": codigo,
@@ -2410,7 +2376,7 @@ def _atualizar_ativos_mercado_aberto(ativos, origem):
         _bullex_assets_ready_event.set()
 
     estado["ativos_info"] = {
-        "tipo": "OTC",
+        "tipo": "MERCADO ABERTO",
         "quantidade": len(novos_bullex),
         "status": "AUTOMÁTICO - M5",
         "lista": ", ".join(
@@ -2419,7 +2385,7 @@ def _atualizar_ativos_mercado_aberto(ativos, origem):
         ) or "-",
     }
     log(
-        "[ATIVOS OTC] Pares OTC carregados: "
+        "[ATIVOS ABERTOS] Pares Forex carregados: "
         + ", ".join(
             f"{cfg['ticker']}={cfg['active_id']}"
             for cfg in novos_bullex.values()
@@ -2449,13 +2415,13 @@ def _inicializar_ativos_mercado_aberto():
             _, ativos = _consultar_lista_mercado_aberto(fonte_digital)
             if not ativos:
                 raise RuntimeError(
-                    "Lista digital não retornou pares OTC disponíveis."
+                    "Lista digital não retornou pares Forex de mercado aberto disponíveis."
                 )
 
             _atualizar_ativos_mercado_aberto(ativos, fonte_digital)
             _assinar_candles_mercado_aberto()
             log(
-                f"[OTC] Inicialização concluída com {len(ativos)} ativo(s)."
+                f"[ABERTO] Inicialização concluída com {len(ativos)} ativo(s)."
             )
             return
 
@@ -2485,7 +2451,7 @@ def _inicializar_ativos_mercado_aberto():
             _bullex_assets_ready_event.clear()
 
         estado["ativos_info"] = {
-            "tipo": "OTC",
+            "tipo": "MERCADO ABERTO",
             "quantidade": 0,
             "status": "AGUARDANDO",
             "lista": "-",
@@ -4967,7 +4933,7 @@ def avaliar_operacao(symbol, candles):
             _operacoes_em_envio.discard(symbol)
 
         _registrar_fim_de_ciclo(symbol, operacao, resultado)
-        _atualizar_progressao(resultado, valor_op)
+        _atualizar_progressao(resultado)
         _atualizar_estado_execucao()
 
         estatisticas = calcular_estatisticas()
@@ -5204,7 +5170,7 @@ def executar_leitura():
         estado["sinal"] = "AGUARDAR"
         estado["score"] = 0
         estado["mensagem"] = (
-            "Aguardando carregamento dos pares OTC na Bullex."
+            "Aguardando carregamento dos pares Forex de mercado aberto na Bullex."
         )
         estado["atualizado"] = agora_brt().strftime("%H:%M:%S BRT")
         return
@@ -5237,7 +5203,7 @@ def executar_leitura():
     log(
         f"[MONITOR] ativos mapeados={len(ativos_ciclo)} | "
         f"ABERTO={qtd_aberto} | OTC={qtd_otc} | "
-        "sinais=OTC M5 | 1 operação GLOBAL | 1 por ativo | melhor par disponível"
+        "sinais=MERCADO ABERTO M5 | 2 operações GLOBAIS | 1 por ativo | melhor par disponível"
     )
 
     for chave, symbol in ativos_ciclo:
