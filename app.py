@@ -65,8 +65,8 @@ BULLEX_USER_AGENT = os.getenv(
 # ATIVOS BULLEX
 # ============================================================
 
-# MERCADO ABERTO DINAMICO.
-# Nao usa IDs fixos: apos autenticar, a Traderoom fornece os pares Forex abertos.
+# MERCADO OTC DINAMICO.
+# Nao usa IDs fixos: apos autenticar, a Traderoom fornece os ativos OTC disponiveis.
 ATIVO_BULLEX = {}
 PARES_MERCADO_ABERTO = {}
 PARES_OTC_ALVO = {}
@@ -75,7 +75,7 @@ _bullex_assets_lock = threading.RLock()
 _bullex_assets_detected = False
 _bullex_assets_last_error = None
 _bullex_assets_updated_at = None
-_bullex_assets_source = "DIGITAL_FOREX_OPEN_DYNAMIC"
+_bullex_assets_source = "DIGITAL_OTC_DYNAMIC"
 _bullex_assets_ready_event = threading.Event()
 _bullex_assets_init_lock = threading.Lock()
 
@@ -102,7 +102,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "R38-OPEN-MARKET-M5-GESTAO-5-9-BANCA-205-270-PAYOUT83-1OP-20260925"
+BULLEX_DIAGNOSTIC_VERSION = "R39-OTC-M5-1OP-20260928"
 
 _bullex_diag = {
     "messages": 0,
@@ -2189,7 +2189,7 @@ def _primeiro_valor(item, chaves):
 
 
 def _normalizar_par_mercado_aberto(item):
-    """Normaliza os OTC explicitamente configurados."""
+    """Normaliza somente ativos OTC retornados dinamicamente pela Traderoom."""
     if not isinstance(item, dict):
         return None
 
@@ -2236,14 +2236,14 @@ def _normalizar_par_mercado_aberto(item):
 
     par = base[:6]
 
-    # R34: opera SOMENTE Forex de mercado aberto. OTC e outros produtos sao ignorados.
-    if is_otc:
+    # R39: opera SOMENTE ativos OTC. Mercado aberto e outros produtos sao ignorados.
+    if not is_otc:
         return None
     if len(par) != 6 or not par.isalpha():
         return None
-    codigo = par
-    symbol_final = f"{par[:3]}/{par[3:]}"
-    mercado = "ABERTO"
+    codigo = f"{par}-OTC"
+    symbol_final = f"{par[:3]}/{par[3:]} OTC"
+    mercado = "OTC"
 
     return {
         "codigo": codigo,
@@ -2274,7 +2274,7 @@ def _extrair_mercado_aberto_da_resposta(resposta):
         score_atual = int(raw_atual.get("is_visible") is True) + int(raw_atual.get("is_active") is True)
         if score_novo > score_atual:
             encontrados[codigo] = normalizado
-    # R8: lista dinâmica; devolve os pares Forex de mercado aberto encontrados.
+    # R39: lista dinâmica; devolve somente os ativos OTC encontrados.
     return sorted(encontrados.values(), key=lambda x: x.get("codigo", ""))
 
 
@@ -2285,7 +2285,7 @@ def _corpo_lista_instrumentos(nome):
 
 
 def _consultar_lista_mercado_aberto(nome, versoes=("2.0", "1.0")):
-    """Consulta e agrega os pares Forex de mercado aberto retornados pela lista digital.
+    """Consulta e agrega os ativos OTC retornados pela lista digital.
 
     Algumas respostas da Traderoom podem variar conforme versão/body.
     A R17 não para na primeira resposta parcial: junta todos os ativos
@@ -2376,7 +2376,7 @@ def _atualizar_ativos_mercado_aberto(ativos, origem):
         _bullex_assets_ready_event.set()
 
     estado["ativos_info"] = {
-        "tipo": "MERCADO ABERTO",
+        "tipo": "OTC",
         "quantidade": len(novos_bullex),
         "status": "AUTOMÁTICO - M5",
         "lista": ", ".join(
@@ -2385,7 +2385,7 @@ def _atualizar_ativos_mercado_aberto(ativos, origem):
         ) or "-",
     }
     log(
-        "[ATIVOS ABERTOS] Pares Forex carregados: "
+        "[ATIVOS OTC] Ativos OTC carregados: "
         + ", ".join(
             f"{cfg['ticker']}={cfg['active_id']}"
             for cfg in novos_bullex.values()
@@ -2396,7 +2396,7 @@ def _atualizar_ativos_mercado_aberto(ativos, origem):
 
 
 def _inicializar_ativos_mercado_aberto():
-    """Descobre automaticamente os pares Forex de mercado aberto disponíveis na lista DIGITAL.
+    """Descobre automaticamente os ativos OTC disponíveis na lista DIGITAL.
 
     A inicialização é serializada para impedir duas descobertas concorrentes
     após reconexões rápidas do WebSocket.
@@ -2404,7 +2404,7 @@ def _inicializar_ativos_mercado_aberto():
     global _bullex_assets_last_error
 
     if not _bullex_assets_init_lock.acquire(blocking=False):
-        log("[ABERTO] Descoberta de ativos já está em andamento.")
+        log("[OTC] Descoberta de ativos já está em andamento.")
         return
 
     try:
@@ -2415,19 +2415,19 @@ def _inicializar_ativos_mercado_aberto():
             _, ativos = _consultar_lista_mercado_aberto(fonte_digital)
             if not ativos:
                 raise RuntimeError(
-                    "Lista digital não retornou pares Forex de mercado aberto disponíveis."
+                    "Lista digital não retornou ativos OTC disponíveis."
                 )
 
             _atualizar_ativos_mercado_aberto(ativos, fonte_digital)
             _assinar_candles_mercado_aberto()
             log(
-                f"[ABERTO] Inicialização concluída com {len(ativos)} ativo(s)."
+                f"[OTC] Inicialização concluída com {len(ativos)} ativo(s)."
             )
             return
 
         except Exception as e:
             _bullex_assets_last_error = str(e)
-            log(f"[ABERTO] Descoberta digital falhou: {e}")
+            log(f"[OTC] Descoberta digital falhou: {e}")
 
         # Diagnóstico adicional. IDs marginais nunca são usados para ordens.
         try:
@@ -2451,14 +2451,14 @@ def _inicializar_ativos_mercado_aberto():
             _bullex_assets_ready_event.clear()
 
         estado["ativos_info"] = {
-            "tipo": "MERCADO ABERTO",
+            "tipo": "OTC",
             "quantidade": 0,
             "status": "AGUARDANDO",
             "lista": "-",
             "erro": _bullex_assets_last_error,
         }
         log(
-            "[ABERTO] Ativos ainda não disponíveis. "
+            "[OTC] Ativos ainda não disponíveis. "
             "A leitura ficará bloqueada até nova autenticação/descoberta."
         )
     finally:
@@ -2513,7 +2513,7 @@ def _assinar_candles_mercado_aberto():
                 _assinar_candle(active_id, size)
                 log(
                     f"[ATIVOS] Assinatura {rotulo} ativa: "
-                    f"{config.get('symbol')} [{config.get('mercado', 'ABERTO')}] "
+                    f"{config.get('symbol')} [{config.get('mercado', 'OTC')}] "
                     f"active_id={active_id}"
                 )
             except Exception as e:
@@ -5164,13 +5164,13 @@ def executar_leitura():
     if not _aguardar_ativos_mercado_aberto(timeout=8):
         erro_ativos = _bullex_assets_last_error or "aguardando resposta da Traderoom"
         log(
-            "[ABERTO] Leitura adiada: active_id dos pares ainda não está pronto. "
+            "[OTC] Leitura adiada: active_id dos ativos ainda não está pronto. "
             f"Detalhe: {erro_ativos}"
         )
         estado["sinal"] = "AGUARDAR"
         estado["score"] = 0
         estado["mensagem"] = (
-            "Aguardando carregamento dos pares Forex de mercado aberto na Bullex."
+            "Aguardando carregamento dos ativos OTC na Bullex."
         )
         estado["atualizado"] = agora_brt().strftime("%H:%M:%S BRT")
         return
@@ -5185,7 +5185,7 @@ def executar_leitura():
             log("[R34 PRELOAD M5] Leitura sem sinais: nenhum ativo M5 pronto ainda.")
             return
 
-    # A R30 gera sinais de mercado aberto M5 após o preload individual por ativo.
+    # A R30 gera sinais OTC M5 após o preload individual por ativo.
     # Este ciclo de 5 minutos finaliza/atualiza operações e saúde dos ativos.
     finalizar_operacoes_vencidas_antes_da_leitura()
 
@@ -5203,7 +5203,7 @@ def executar_leitura():
     log(
         f"[MONITOR] ativos mapeados={len(ativos_ciclo)} | "
         f"ABERTO={qtd_aberto} | OTC={qtd_otc} | "
-        "sinais=MERCADO ABERTO M5 | 2 operações GLOBAIS | 1 por ativo | melhor par disponível"
+        f"sinais=OTC M5 | {MAX_OPERACOES_GLOBAIS} operação GLOBAL | 1 por ativo | melhor par disponível"
     )
 
     for chave, symbol in ativos_ciclo:
@@ -5295,10 +5295,10 @@ def loop_robo():
         if _aguardar_ativos_mercado_aberto(timeout=30):
             with _bullex_assets_lock:
                 ativos_prontos = ", ".join(ATIVO_BULLEX.keys())
-            log(f"[ABERTO] Pronto para leitura: {ativos_prontos}")
+            log(f"[OTC] Pronto para leitura: {ativos_prontos}")
         else:
             log(
-                "[ABERTO] Inicialização ainda incompleta; "
+                "[OTC] Inicialização ainda incompleta; "
                 "a primeira leitura ficará em AGUARDAR, sem gerar KeyError."
             )
 
@@ -5937,7 +5937,7 @@ def health():
             ),
         "estrategia":
             (
-                "MERCADO ABERTO M5: descoberta dinâmica + seletor GLOBAL do melhor par disponível"
+                "OTC M5: descoberta dinâmica + seletor GLOBAL do melhor ativo disponível"
             ),
         "fonte_candles": "Bullex",
         "execucao_automatica": BULLEX_AUTO_TRADE,
@@ -5976,7 +5976,7 @@ def health():
         "historico_preload_pronto": _historico_pronto_event.is_set(),
         "historico_preload_ultima_tentativa": _historico_preload_ultima_tentativa,
         "historico_preload_status": dict(_historico_preload_status),
-        "mercado": "ABERTO",
+        "mercado": "OTC",
         "ativos_otc": {
             "detectado": _bullex_assets_detected,
             "quantidade": len(ATIVO_BULLEX),
