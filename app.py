@@ -102,7 +102,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "R39-OTC-M5-1OP-20260928"
+BULLEX_DIAGNOSTIC_VERSION = "R40-GESTAO-LUCRO-87-SEM-STOPS-20260930"
 
 _bullex_diag = {
     "messages": 0,
@@ -153,15 +153,16 @@ BULLEX_USER_BALANCE_ID = os.getenv(
     ""
 ).strip()
 
-VALORES_ENTRADA = [10.00, 19.00]
-# R36: progressão por WIN: 10 -> 19 -> reinicia em 10.
-# Qualquer LOSS/DOJI reinicia imediatamente em R$10. Sem Gale/Martingale.
-BANCA_INICIAL = 900.00
-BANCA_MINIMA = 800.00
-BANCA_META = 1100.00
+VALOR_ENTRADA_BASE = 10.00
+# R40: gestão sem stop financeiro.
+# 1ª entrada = R$10. Se der WIN, a 2ª entrada usa SOMENTE o lucro da 1ª.
+# Ex.: payout 87% -> R$10 x 87% = R$8,70 na 2ª entrada.
+# Se a 2ª der WIN, volta para R$10. Qualquer LOSS/DOJI também volta para R$10.
+VALORES_ENTRADA = [VALOR_ENTRADA_BASE]
+BANCA_INICIAL = 900.00  # apenas referência visual; não bloqueia operações
 VALOR_GALE = 0.00
-# Se a Bullex não devolver o payout no retorno da ordem, usa este valor apenas como fallback.
-BULLEX_PAYOUT_FALLBACK = float(os.getenv("BULLEX_PAYOUT_FALLBACK", "83").strip() or "83")
+# Se a Bullex não devolver o payout real, usa 87% como base.
+BULLEX_PAYOUT_FALLBACK = float(os.getenv("BULLEX_PAYOUT_FALLBACK", "87").strip() or "87")
 EXPIRACAO_MINUTOS = 5
 # A antiga janela de 3 segundos foi removida.
 # Esta estratégia entra DURANTE a vela atual e expira no fechamento da MESMA vela.
@@ -339,6 +340,7 @@ _r24_dispatchers = set()
 _r24_velas_finalizadas = set()
 R24_JANELA_CLASSIFICACAO_SEGUNDOS = 7.00
 _nivel_progressao = 0
+_valor_proxima_entrada = VALOR_ENTRADA_BASE
 _bullex_balance_id = None
 _bullex_balance_source = None
 _bullex_instrument_cache = {}
@@ -714,8 +716,8 @@ def _montar_send_message(nome, version, body=None):
 # ============================================================
 
 def _valor_entrada_atual():
-    nivel = max(0, min(int(_nivel_progressao), len(VALORES_ENTRADA) - 1))
-    return float(VALORES_ENTRADA[nivel])
+    """R40: R$10 na base; após WIN da base, usa somente o lucro real como 2ª entrada."""
+    return round(float(_valor_proxima_entrada), 2)
 
 def _valor_gale_atual():
     return float(VALOR_GALE)
@@ -734,11 +736,7 @@ def _saldo_gestao_atual():
     return round(float(BANCA_INICIAL) + lucro, 2)
 
 def _limite_banca_atingido():
-    saldo = _saldo_gestao_atual()
-    if saldo <= float(BANCA_MINIMA):
-        return "STOP_LOSS"
-    if saldo >= float(BANCA_META):
-        return "STOP_WIN"
+    """R40: nenhum stop loss/stop gain financeiro bloqueia novas entradas."""
     return None
 
 def _extrair_payout_percent(obj):
@@ -796,10 +794,10 @@ def _atualizar_estado_execucao():
         "balance_id_disponivel": _bullex_balance_id is not None,
         "balance_source": _bullex_balance_source,
         "banca_inicial": BANCA_INICIAL,
-        "banca_minima": BANCA_MINIMA,
-        "banca_meta": BANCA_META,
+        "banca_minima": None,
+        "banca_meta": None,
         "saldo_gestao": _saldo_gestao_atual(),
-        "limite_banca": _limite_banca_atingido(),
+        "limite_banca": None,
     })
 
 
@@ -1083,14 +1081,6 @@ def executar_ordem_intravela(symbol, sinal, resultado, valor_override=None, tipo
     if sinal not in ("CALL", "PUT"):
         return None
 
-    limite_banca = _limite_banca_atingido()
-    if limite_banca:
-        saldo = _saldo_gestao_atual()
-        estado["execucao"]["ultimo_erro"] = f"{limite_banca}_ATINGIDO"
-        _atualizar_estado_execucao()
-        log(f"[GESTAO] {limite_banca} atingido: saldo calculado R${saldo:.2f} | faixa permitida R${BANCA_MINIMA:.2f} a R${BANCA_META:.2f}. Novas entradas bloqueadas.")
-        return limite_banca
-
     if not BULLEX_USER_BALANCE_ID:
         estado["execucao"]["ultimo_erro"] = "SEM_BALANCE_ID"
         _atualizar_estado_execucao()
@@ -1306,15 +1296,27 @@ def executar_ordem_intravela(symbol, sinal, resultado, valor_override=None, tipo
 
 
 
-def _atualizar_progressao(resultado):
-    """R36: 10 -> 19 somente após WIN; segundo WIN reinicia em 10; LOSS/DOJI volta para 10."""
-    global _nivel_progressao
-    if resultado == "WIN":
-        _nivel_progressao += 1
-        if _nivel_progressao >= len(VALORES_ENTRADA):
+def _atualizar_progressao(resultado, operacao=None):
+    """R40: base R$10 -> após WIN usa somente o lucro -> depois reinicia. LOSS/DOJI = R$10."""
+    global _nivel_progressao, _valor_proxima_entrada
+
+    if resultado == "WIN" and int(_nivel_progressao) == 0:
+        payout = float((operacao or {}).get("payout_percent", BULLEX_PAYOUT_FALLBACK) or BULLEX_PAYOUT_FALLBACK)
+        valor = float((operacao or {}).get("valor", VALOR_ENTRADA_BASE) or VALOR_ENTRADA_BASE)
+        lucro = round(valor * payout / 100.0, 2)
+        if lucro > 0:
+            _nivel_progressao = 1
+            _valor_proxima_entrada = lucro
+            log(f"[GESTAO R40] WIN base R${valor:.2f} | payout={payout:.2f}% | próxima entrada somente com lucro: R${lucro:.2f}")
+        else:
             _nivel_progressao = 0
+            _valor_proxima_entrada = VALOR_ENTRADA_BASE
     else:
+        # WIN da 2ª entrada, LOSS ou DOJI: sempre reinicia na base.
         _nivel_progressao = 0
+        _valor_proxima_entrada = VALOR_ENTRADA_BASE
+        log(f"[GESTAO R40] {resultado}: próxima entrada R${VALOR_ENTRADA_BASE:.2f}")
+
     _atualizar_estado_execucao()
 
 
@@ -4933,7 +4935,7 @@ def avaliar_operacao(symbol, candles):
             _operacoes_em_envio.discard(symbol)
 
         _registrar_fim_de_ciclo(symbol, operacao, resultado)
-        _atualizar_progressao(resultado)
+        _atualizar_progressao(resultado, operacao)
         _atualizar_estado_execucao()
 
         estatisticas = calcular_estatisticas()
