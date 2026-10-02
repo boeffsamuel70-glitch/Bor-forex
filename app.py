@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 import json
 import re
+import math
 import requests
 import websocket
 
@@ -102,7 +103,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "R40-GESTAO-LUCRO-87-SEM-STOPS-20260930"
+BULLEX_DIAGNOSTIC_VERSION = "R41-M5-NIVEIS-30MIN-GESTAO-10-6-20261002"
 
 _bullex_diag = {
     "messages": 0,
@@ -158,7 +159,8 @@ VALOR_ENTRADA_BASE = 10.00
 # 1ª entrada = R$10. Se der WIN, a 2ª entrada usa SOMENTE o lucro da 1ª.
 # Ex.: payout 87% -> R$10 x 87% = R$8,70 na 2ª entrada.
 # Se a 2ª der WIN, volta para R$10. Qualquer LOSS/DOJI também volta para R$10.
-VALORES_ENTRADA = [VALOR_ENTRADA_BASE]
+VALOR_ENTRADA_WIN = 6.00
+VALORES_ENTRADA = [VALOR_ENTRADA_BASE, VALOR_ENTRADA_WIN]
 BANCA_INICIAL = 900.00  # apenas referência visual; não bloqueia operações
 VALOR_GALE = 0.00
 # Se a Bullex não devolver o payout real, usa 87% como base.
@@ -1297,26 +1299,19 @@ def executar_ordem_intravela(symbol, sinal, resultado, valor_override=None, tipo
 
 
 def _atualizar_progressao(resultado, operacao=None):
-    """R40: base R$10 -> após WIN usa somente o lucro -> depois reinicia. LOSS/DOJI = R$10."""
-    global _nivel_progressao, _valor_proxima_entrada
+    """R41: WIN da base R$10 -> R$6; qualquer resultado da etapa 2 -> R$10.
 
+    LOSS ou DOJI em qualquer etapa reinicia em R$10. Sem martingale.
+    """
+    global _nivel_progressao, _valor_proxima_entrada
     if resultado == "WIN" and int(_nivel_progressao) == 0:
-        payout = float((operacao or {}).get("payout_percent", BULLEX_PAYOUT_FALLBACK) or BULLEX_PAYOUT_FALLBACK)
-        valor = float((operacao or {}).get("valor", VALOR_ENTRADA_BASE) or VALOR_ENTRADA_BASE)
-        lucro = round(valor * payout / 100.0, 2)
-        if lucro > 0:
-            _nivel_progressao = 1
-            _valor_proxima_entrada = lucro
-            log(f"[GESTAO R40] WIN base R${valor:.2f} | payout={payout:.2f}% | próxima entrada somente com lucro: R${lucro:.2f}")
-        else:
-            _nivel_progressao = 0
-            _valor_proxima_entrada = VALOR_ENTRADA_BASE
+        _nivel_progressao = 1
+        _valor_proxima_entrada = VALOR_ENTRADA_WIN
+        log(f"[GESTAO R41] WIN base: proxima entrada R${VALOR_ENTRADA_WIN:.2f}")
     else:
-        # WIN da 2ª entrada, LOSS ou DOJI: sempre reinicia na base.
         _nivel_progressao = 0
         _valor_proxima_entrada = VALOR_ENTRADA_BASE
-        log(f"[GESTAO R40] {resultado}: próxima entrada R${VALOR_ENTRADA_BASE:.2f}")
-
+        log(f"[GESTAO R41] {resultado}: proxima entrada R${VALOR_ENTRADA_BASE:.2f}")
     _atualizar_estado_execucao()
 
 
@@ -4036,6 +4031,46 @@ def _linha_tendencia_m15(fechadas, lado, atr15):
     return {"nivel":float(nivel),"slope":float(slope),"toques":2,"timeframe":"M15","tipo":lado}
 
 
+# R41: aproximação da grade de preço exibida no zoom de 30 minutos.
+# A Bullex não fornece a grade visual via stream de candles; reconstruímos
+# intervalos legíveis (1, 2, 2.5, 5, 10 x potência de dez) por ativo, a partir
+# da amplitude recente de 6 candles M5. Não afirma replicar pixels da plataforma.
+GRADE_30M_ATIVA = True
+GRADE_30M_DIVISOES_ALVO = 5
+GRADE_30M_TOLERANCIA_ATR = 0.12
+GRADE_30M_TOLERANCIA_PASSO = 0.12
+
+
+def _passo_grade_legivel(passo_bruto):
+    if not math.isfinite(passo_bruto) or passo_bruto <= 0:
+        return None
+    escala = 10 ** math.floor(math.log10(passo_bruto))
+    mantissa = passo_bruto / escala
+    return min((1, 2, 2.5, 5, 10), key=lambda n: abs(math.log(n / mantissa))) * escala
+
+
+def _grade_preco_30m(active_id, candle_from, maxima, minima, atr_atual):
+    historico = _fechadas_antes(_candles_cache(active_id, 300), candle_from, 300)[-6:]
+    if len(historico) < 6:
+        return None
+    topo = max([float(x['high']) for x in historico] + [maxima])
+    fundo = min([float(x['low']) for x in historico] + [minima])
+    amplitude = topo - fundo
+    if amplitude <= 0:
+        return None
+    passo = _passo_grade_legivel(amplitude / GRADE_30M_DIVISOES_ALVO)
+    if not passo:
+        return None
+    # Limita a tolerância para não aprovar pontos no meio entre duas linhas.
+    tolerancia = min(atr_atual * GRADE_30M_TOLERANCIA_ATR,
+                     passo * GRADE_30M_TOLERANCIA_PASSO)
+    return passo, tolerancia
+
+
+def _nivel_grade_proximo(preco, passo):
+    return math.floor(preco / passo + 0.5) * passo
+
+
 def _resultado_retracao_intravela(msg, active_id):
     """R30: M15, suporte/resistência + LTA/LTB, entrada na retração e expiração na mesma vela."""
     if not isinstance(msg,dict) or int(msg.get("size",300) or 300) != 300: return None
@@ -4068,6 +4103,8 @@ def _resultado_retracao_intravela(msg, active_id):
     if ltb: candidatos.append(('PUT','LTB',ltb['nivel'],2))
     if not candidatos: return None
 
+    grade = _grade_preco_30m(active_id, candle_from, maxima, minima, a) if GRADE_30M_ATIVA else None
+    if GRADE_30M_ATIVA and grade is None: return None
     amplitude=max(maxima-minima,1e-12)
     movimento_alta=maxima-abertura; movimento_baixa=abertura-minima
     aprovados=[]
@@ -4080,6 +4117,18 @@ def _resultado_retracao_intravela(msg, active_id):
         tol=a*(M15_LINHA_TOLERANCIA_ATR if tipo in ('LTA','LTB') else M15_TOQUE_TOLERANCIA_ATR)
         tocou = minima <= nivel+tol if sinal=='CALL' else maxima >= nivel-tol
         if not tocou: continue
+        # A zona técnica de suporte/resistência/LTA/LTB também deve coincidir
+        # com uma divisão de preço estimada para o zoom de 30 minutos.
+        if grade is not None:
+            passo_grade, tolerancia_grade = grade
+            linha_grade = _nivel_grade_proximo(nivel, passo_grade)
+            if abs(nivel - linha_grade) > tolerancia_grade: continue
+            # A extremidade da vela deve ter realmente alcançado essa linha;
+            # não basta o preço estar vagamente na mesma região.
+            extremo = minima if sinal == 'CALL' else maxima
+            if abs(extremo - linha_grade) > tolerancia_grade: continue
+        else:
+            linha_grade = None
         if sinal=='CALL':
             impulso=max(movimento_baixa,1e-12); rejeicao=preco-minima; retracao=rejeicao/impulso
             if preco <= nivel-a*0.03: continue
@@ -4092,21 +4141,21 @@ def _resultado_retracao_intravela(msg, active_id):
         for s2,t2,n2,_ in candidatos:
             if s2==sinal and t2!=tipo and abs(n2-nivel)<=a*0.25: confluencia+=1
         score=(toques if tipo in ('SUPORTE','RESISTENCIA') else 2) + confluencia*2 + (1 if tendencia!='NEUTRA' else 0) + (1 if adx15 and adx15>=18 else 0)
-        aprovados.append((score,sinal,tipo,nivel,toques,retracao,rejeicao,confluencia))
+        aprovados.append((score,sinal,tipo,nivel,toques,retracao,rejeicao,confluencia,linha_grade))
     if not aprovados: return None
-    aprovados.sort(reverse=True,key=lambda x:x[0]); score,sinal,tipo,nivel,toques,retracao,rejeicao,confluencia=aprovados[0]
+    aprovados.sort(reverse=True,key=lambda x:x[0]); score,sinal,tipo,nivel,toques,retracao,rejeicao,confluencia,linha_grade=aprovados[0]
     # confiança é um indicador interno de qualidade do setup, não probabilidade garantida.
     confianca=min(0.90,0.58+0.035*score)
     symbol=_symbol_por_active_id(active_id)[1]
-    log(f"[M5 RETRACAO] {symbol} {sinal} | {tipo}={nivel:.5f} toques={toques} | tendencia={tendencia} ADX={adx15 if adx15 is not None else 0:.1f} | retracao={retracao*100:.1f}% | confluencia={confluencia}")
+    log(f"[M5 RETRACAO] {symbol} {sinal} | {tipo}={nivel:.5f} toques={toques} | tendencia={tendencia} ADX={adx15 if adx15 is not None else 0:.1f} | retracao={retracao*100:.1f}% | confluencia={confluencia} | grade30m={linha_grade}")
     return {
       'sinal':sinal,'score':round(confianca*100,1),'score_call':round(confianca*100,1) if sinal=='CALL' else 0,'score_put':round(confianca*100,1) if sinal=='PUT' else 0,
-      'preco':preco,'vela':datetime.fromtimestamp(candle_from,TZ),'estrategia':'M15_SR_LTA_LTB_RETRACAO','regime':tendencia,
+      'preco':preco,'vela':datetime.fromtimestamp(candle_from,TZ),'estrategia':'M5_RETRACAO_GRADE_30M','regime':tendencia,
       'pullback':f'RETRACAO {retracao*100:.1f}% EM {tipo}','rejeicao':f'REJEICAO {rejeicao/a:.2f} ATR','atr':a,'rsi':rv,
       'ema5':e5,'ema13':e13,'ema21':e21,'tendencia_5m':'N/A','tendencia_15m':tendencia,'bloqueio':'SINAL_M15_RETRACAO',
       'mensagem':f'{sinal} M15 | {tipo} + retração | confluência={confluencia} | qualidade={confianca*100:.1f}%',
       'candle_from':candle_from,'candle_to':candle_to,'segundos_decorridos':decorridos,'segundos_restantes':restantes,
-      'impulso':impulso,'retracao_ratio':retracao,'nivel_sr':nivel,'tipo_nivel':tipo,'toques_nivel':toques,'distancia_abertura_nivel':dist_abertura,
+      'impulso':impulso,'retracao_ratio':retracao,'nivel_grade_30m':linha_grade,'passo_grade_30m':grade[0] if grade else None,'nivel_sr':nivel,'tipo_nivel':tipo,'toques_nivel':toques,'distancia_abertura_nivel':dist_abertura,
       'adx15':adx15,'confianca':confianca,'confianca_ciclo':confianca,'amostras_ciclo':0,'amostras_modelo':len(m15),'margem':0.0,
       'ajuste_online':0.0,'faixa_confianca':'M15','adaptativo':{},'filtro_adaptativo':'N/A'
     }
