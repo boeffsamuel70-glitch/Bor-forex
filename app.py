@@ -4053,8 +4053,8 @@ def _r42_resumo():
 
 GRADE_30M_ATIVA = True
 GRADE_30M_DIVISOES_ALVO = 5
-GRADE_30M_TOLERANCIA_ATR = 0.12
-GRADE_30M_TOLERANCIA_PASSO = 0.12
+GRADE_30M_TOLERANCIA_ATR = 0.20
+GRADE_30M_TOLERANCIA_PASSO = 0.20
 
 
 def _passo_grade_legivel(passo_bruto):
@@ -4152,7 +4152,9 @@ def _resultado_retracao_intravela(msg, active_id):
             # A extremidade da vela deve ter realmente alcançado essa linha;
             # não basta o preço estar vagamente na mesma região.
             extremo = minima if sinal == 'CALL' else maxima
-            if abs(extremo - linha_grade) > tolerancia_grade:
+            # Permite pequena ultrapassagem do pavio, sem dispensar a grade.
+            tolerancia_extremo = min(a * 0.28, passo_grade * 0.28)
+            if abs(extremo - linha_grade) > tolerancia_extremo:
                 _r42_contar("grade_extremo_distante")
                 continue
         else:
