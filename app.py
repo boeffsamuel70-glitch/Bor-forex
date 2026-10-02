@@ -103,7 +103,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "R41-M5-NIVEIS-30MIN-GESTAO-10-6-20261002"
+BULLEX_DIAGNOSTIC_VERSION = "R42-DIAGNOSTICO-INTRAVELA-20261002"
 
 _bullex_diag = {
     "messages": 0,
@@ -4035,6 +4035,22 @@ def _linha_tendencia_m15(fechadas, lado, atr15):
 # A Bullex não fornece a grade visual via stream de candles; reconstruímos
 # intervalos legíveis (1, 2, 2.5, 5, 10 x potência de dez) por ativo, a partir
 # da amplitude recente de 6 candles M5. Não afirma replicar pixels da plataforma.
+# R42: contadores de fluxo, sem consultas extras nem mudanças de entrada.
+_r42_diag_lock = threading.Lock()
+_r42_diag = {}
+def _r42_contar(chave):
+    with _r42_diag_lock:
+        _r42_diag[chave] = _r42_diag.get(chave, 0) + 1
+
+def _r42_resumo():
+    with _r42_diag_lock:
+        dados = dict(_r42_diag)
+        _r42_diag.clear()
+    with _bullex_cv:
+        cache = {k: len(v) for k, v in _bullex_candles.items() if isinstance(k, tuple) and len(k) == 2 and k[1] == 300}
+    suficientes = sum(1 for n in cache.values() if n >= 55)
+    log(f"[R42 DIAG 5MIN] WS_authenticated={_bullex_authenticated} | preload={_historico_pronto_event.is_set()} | ativos_cache_M5={len(cache)} | cache_55_ou_mais={suficientes} | eventos={dados}")
+
 GRADE_30M_ATIVA = True
 GRADE_30M_DIVISOES_ALVO = 5
 GRADE_30M_TOLERANCIA_ATR = 0.12
@@ -4073,6 +4089,7 @@ def _nivel_grade_proximo(preco, passo):
 
 def _resultado_retracao_intravela(msg, active_id):
     """R30: M15, suporte/resistência + LTA/LTB, entrada na retração e expiração na mesma vela."""
+    _r42_contar("estrategia_chamada")
     if not isinstance(msg,dict) or int(msg.get("size",300) or 300) != 300: return None
     try:
         abertura=float(msg['open']); preco=float(msg['close'])
@@ -4085,7 +4102,9 @@ def _resultado_retracao_intravela(msg, active_id):
     if restantes < INTRAVELA_MIN_SEGUNDOS_RESTANTES: return None
 
     m15=_fechadas_antes(_candles_cache(active_id,300),candle_from,300)[-SR_M15_LOOKBACK:]
-    if len(m15)<45: return None
+    if len(m15)<45:
+        _r42_contar("estrategia_historico_menor_45")
+        return None
     a=atr(m15,14)
     if not a or a<=0: return None
     c=closes(m15); e5,e13,e21=ema(c,5),ema(c,13),ema(c,21); rv=rsi(c,14); adx15=_adx_candles(m15,14)
@@ -4101,10 +4120,15 @@ def _resultado_retracao_intravela(msg, active_id):
         candidatos.append(('PUT','RESISTENCIA',float(g['nivel']),int(g.get('toques',0))))
     if lta: candidatos.append(('CALL','LTA',lta['nivel'],2))
     if ltb: candidatos.append(('PUT','LTB',ltb['nivel'],2))
-    if not candidatos: return None
+    if not candidatos:
+        _r42_contar("sem_sr_linhas")
+        return None
+    _r42_contar("com_sr_linhas")
 
     grade = _grade_preco_30m(active_id, candle_from, maxima, minima, a) if GRADE_30M_ATIVA else None
-    if GRADE_30M_ATIVA and grade is None: return None
+    if GRADE_30M_ATIVA and grade is None:
+        _r42_contar("grade_indisponivel")
+        return None
     amplitude=max(maxima-minima,1e-12)
     movimento_alta=maxima-abertura; movimento_baixa=abertura-minima
     aprovados=[]
@@ -4122,11 +4146,15 @@ def _resultado_retracao_intravela(msg, active_id):
         if grade is not None:
             passo_grade, tolerancia_grade = grade
             linha_grade = _nivel_grade_proximo(nivel, passo_grade)
-            if abs(nivel - linha_grade) > tolerancia_grade: continue
+            if abs(nivel - linha_grade) > tolerancia_grade:
+                _r42_contar("grade_nivel_sr_distante")
+                continue
             # A extremidade da vela deve ter realmente alcançado essa linha;
             # não basta o preço estar vagamente na mesma região.
             extremo = minima if sinal == 'CALL' else maxima
-            if abs(extremo - linha_grade) > tolerancia_grade: continue
+            if abs(extremo - linha_grade) > tolerancia_grade:
+                _r42_contar("grade_extremo_distante")
+                continue
         else:
             linha_grade = None
         if sinal=='CALL':
@@ -4142,7 +4170,10 @@ def _resultado_retracao_intravela(msg, active_id):
             if s2==sinal and t2!=tipo and abs(n2-nivel)<=a*0.25: confluencia+=1
         score=(toques if tipo in ('SUPORTE','RESISTENCIA') else 2) + confluencia*2 + (1 if tendencia!='NEUTRA' else 0) + (1 if adx15 and adx15>=18 else 0)
         aprovados.append((score,sinal,tipo,nivel,toques,retracao,rejeicao,confluencia,linha_grade))
-    if not aprovados: return None
+    if not aprovados:
+        _r42_contar("sem_setup_final")
+        return None
+    _r42_contar("setup_aprovado")
     aprovados.sort(reverse=True,key=lambda x:x[0]); score,sinal,tipo,nivel,toques,retracao,rejeicao,confluencia,linha_grade=aprovados[0]
     # confiança é um indicador interno de qualidade do setup, não probabilidade garantida.
     confianca=min(0.90,0.58+0.035*score)
@@ -4502,10 +4533,13 @@ def _tentar_gale_na_proxima_vela(active_id, msg):
 
 
 def _processar_sinal_intravela(active_id, msg):
+    _r42_contar("candle_generated_scan")
     codigo, symbol = _symbol_por_active_id(active_id)
     if not codigo or not symbol:
+        _r42_contar("sem_symbol_mapeado")
         return
     if _status_bloqueio_ativo(symbol):
+        _r42_contar("ativo_bloqueado")
         return
 
     # R30: Martingale desativado. Cada entrada M5 encerra em WIN/LOSS/DOJI.
@@ -4514,18 +4548,24 @@ def _processar_sinal_intravela(active_id, msg):
     # R35: somente 1 operação por vez no robô inteiro.
     with _execucao_lock:
         if not _ha_vaga_operacao_global():
+            _r42_contar("sem_vaga_global")
             return
 
     if not dentro_do_horario() or not _historico_pronto_event.is_set():
+        _r42_contar("preload_nao_pronto")
         return
 
     # R30 M15: histórico é validado por ativo. Um ativo atrasado não bloqueia os demais.
     if not _historico_m15_pronto_ativo(active_id, 55):
+        _r42_contar("ativo_sem_55_candles")
         return
 
+    _r42_contar("ativo_analisado")
     resultado = _resultado_retracao_intravela(msg, active_id)
     if resultado is None:
+        _r42_contar("analise_sem_sinal")
         return
+    _r42_contar("candidato_gerado")
     candle_key=(int(active_id),int(resultado['candle_from']))
     with _intravela_lock:
         if candle_key in _intravela_velas_tentadas:
@@ -5264,6 +5304,7 @@ def executar_leitura():
         "estatisticas"
     ] = calcular_estatisticas()
 
+    _r42_resumo()
     log(
         "Leitura concluida."
     )
@@ -6014,7 +6055,7 @@ def health():
             telegram_configurado(),
         "operacoes_pendentes":
             len(_operacoes_pendentes),
-        "entrada_fixa": 5.00,
+        "entrada_fixa": VALOR_ENTRADA_BASE,
         "gale_valor": _valor_gale_atual(),
         "entrada_valor": _valor_entrada_atual(),
         "financeiro": calcular_financeiro(),
@@ -6057,7 +6098,7 @@ def health():
 
 _atualizar_estado_execucao()
 
-log(f"AUTO TRADE DEMO={'ATIVO' if BULLEX_AUTO_TRADE else 'DESATIVADO'} | entrada fixa=R${_valor_entrada_atual():.2f} | progressao=DESATIVADA")
+log(f"AUTO TRADE DEMO={'ATIVO' if BULLEX_AUTO_TRADE else 'DESATIVADO'} | entrada base=R${VALOR_ENTRADA_BASE:.2f} | apos WIN base=R${VALOR_ENTRADA_WIN:.2f} | sem Gale")
 log(f"BULLEX_USER_BALANCE_ID={'CONFIGURADO' if BULLEX_USER_BALANCE_ID else 'AUSENTE'}")
 
 log(
