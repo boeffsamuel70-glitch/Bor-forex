@@ -103,7 +103,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "R42-DIAGNOSTICO-INTRAVELA-20261002"
+BULLEX_DIAGNOSTIC_VERSION = "R43-FILTRO-FOREX-FIAT-20261003"
 
 _bullex_diag = {
     "messages": 0,
@@ -1082,6 +1082,11 @@ def executar_ordem_intravela(symbol, sinal, resultado, valor_override=None, tipo
 
     if sinal not in ("CALL", "PUT"):
         return None
+
+    # Segunda trava, imediatamente antes de qualquer envio de ordem.
+    if not _symbol_forex_permitido(symbol):
+        log(f"[FILTRO FOREX] ORDEM BLOQUEADA: {symbol} (nao e par FIAT autorizado)")
+        return "ATIVO_NAO_PERMITIDO"
 
     if not BULLEX_USER_BALANCE_ID:
         estado["execucao"]["ultimo_erro"] = "SEM_BALANCE_ID"
@@ -2185,6 +2190,33 @@ def _primeiro_valor(item, chaves):
     return None
 
 
+# R43: lista fechada de moedas fiduciarias aceitas. Sem cripto, acoes, indices,
+# commodities, USD/BRL e EUR/JPY (restricao anterior do usuario).
+MOEDAS_FOREX_PERMITIDAS = frozenset({
+    "USD", "EUR", "GBP", "JPY", "AUD", "CAD", "CHF", "NZD",
+    "NOK", "SEK", "DKK", "PLN", "TRY", "ZAR", "COP", "HKD",
+    "MXN", "SGD", "CNH", "CNY", "CZK", "HUF", "ILS", "THB",
+})
+PARES_FOREX_BLOQUEADOS = frozenset({"USDBRL", "BRLUSD", "EURJPY", "JPYEUR"})
+
+
+def _par_forex_permitido(par):
+    """Fail-closed: aceita apenas dois codigos FIAT distintos e sem bloqueio."""
+    par = str(par or "").upper()
+    return (len(par) == 6 and par.isalpha()
+            and par[:3] in MOEDAS_FOREX_PERMITIDAS
+            and par[3:] in MOEDAS_FOREX_PERMITIDAS
+            and par[:3] != par[3:]
+            and par not in PARES_FOREX_BLOQUEADOS)
+
+
+def _symbol_forex_permitido(symbol):
+    """Confere o nome completo sem aceitar prefixos de outros produtos."""
+    nome = str(symbol or "").upper().strip()
+    m = re.fullmatch(r"([A-Z]{3})/([A-Z]{3})\s+OTC", nome)
+    return bool(m and _par_forex_permitido(m.group(1) + m.group(2)))
+
+
 def _normalizar_par_mercado_aberto(item):
     """Normaliza somente ativos OTC retornados dinamicamente pela Traderoom."""
     if not isinstance(item, dict):
@@ -2231,7 +2263,11 @@ def _normalizar_par_mercado_aberto(item):
     if len(base) < 6:
         return None
 
+    # Nunca truncar nomes de outros produtos para inventar um par de moedas.
+    # Ex.: COCA-COLA, MICROSOFT e criptomoedas devem ser rejeitados.
     par = base[:6]
+    if not _par_forex_permitido(par):
+        return None
 
     # R39: opera SOMENTE ativos OTC. Mercado aberto e outros produtos sao ignorados.
     if not is_otc:
@@ -2353,6 +2389,9 @@ def _atualizar_ativos_mercado_aberto(ativos, origem):
     novos_bullex = {}
     novos_ativos = {}
     for item in ativos:
+        if not _symbol_forex_permitido(item.get("symbol")):
+            log(f"[FILTRO FOREX] BLOQUEADO: {item.get('symbol')} | fora da lista FIAT")
+            continue
         codigo = item["codigo"]
         novos_bullex[codigo] = {
             "symbol": item["symbol"],
@@ -2362,6 +2401,11 @@ def _atualizar_ativos_mercado_aberto(ativos, origem):
             "mercado": item.get("mercado", "OTC" if item.get("is_otc") else "ABERTO"),
         }
         novos_ativos[codigo] = item["symbol"]
+
+    if not novos_bullex:
+        raise RuntimeError("Filtro Forex: nenhum par FIAT OTC permitido foi encontrado; operacoes bloqueadas.")
+    log(f"[FILTRO FOREX] LIBERADOS {len(novos_bullex)} de {len(ativos)} ativos reconhecidos: "
+        + ", ".join(sorted(cfg["symbol"] for cfg in novos_bullex.values())))
 
     with _bullex_assets_lock:
         ATIVO_BULLEX = novos_bullex
