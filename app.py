@@ -103,7 +103,7 @@ _bullex_client_session_id = None
 # ============================================================
 # DIAGNOSTICO DA VERSAO DEPLOYADA
 # ============================================================
-BULLEX_DIAGNOSTIC_VERSION = "R43-FILTRO-FOREX-FIAT-20261003"
+BULLEX_DIAGNOSTIC_VERSION = "R44-SEM-GRADE-PRECO-20261003"
 
 _bullex_diag = {
     "messages": 0,
@@ -4095,7 +4095,7 @@ def _r42_resumo():
     suficientes = sum(1 for n in cache.values() if n >= 55)
     log(f"[R42 DIAG 5MIN] WS_authenticated={_bullex_authenticated} | preload={_historico_pronto_event.is_set()} | ativos_cache_M5={len(cache)} | cache_55_ou_mais={suficientes} | eventos={dados}")
 
-GRADE_30M_ATIVA = True
+GRADE_30M_ATIVA = False  # R44: sem grade; preserva S/R, LTA, LTB e retracao
 GRADE_30M_DIVISOES_ALVO = 5
 GRADE_30M_TOLERANCIA_ATR = 0.20
 GRADE_30M_TOLERANCIA_PASSO = 0.20
@@ -4224,10 +4224,10 @@ def _resultado_retracao_intravela(msg, active_id):
     # confiança é um indicador interno de qualidade do setup, não probabilidade garantida.
     confianca=min(0.90,0.58+0.035*score)
     symbol=_symbol_por_active_id(active_id)[1]
-    log(f"[M5 RETRACAO] {symbol} {sinal} | {tipo}={nivel:.5f} toques={toques} | tendencia={tendencia} ADX={adx15 if adx15 is not None else 0:.1f} | retracao={retracao*100:.1f}% | confluencia={confluencia} | grade30m={linha_grade}")
+    log(f"[M5 RETRACAO] {symbol} {sinal} | {tipo}={nivel:.5f} toques={toques} | tendencia={tendencia} ADX={adx15 if adx15 is not None else 0:.1f} | retracao={retracao*100:.1f}% | confluencia={confluencia}")
     return {
       'sinal':sinal,'score':round(confianca*100,1),'score_call':round(confianca*100,1) if sinal=='CALL' else 0,'score_put':round(confianca*100,1) if sinal=='PUT' else 0,
-      'preco':preco,'vela':datetime.fromtimestamp(candle_from,TZ),'estrategia':'M5_RETRACAO_GRADE_30M','regime':tendencia,
+      'preco':preco,'vela':datetime.fromtimestamp(candle_from,TZ),'estrategia':'M5_RETRACAO_SR_LTA_LTB_SEM_GRADE','regime':tendencia,
       'pullback':f'RETRACAO {retracao*100:.1f}% EM {tipo}','rejeicao':f'REJEICAO {rejeicao/a:.2f} ATR','atr':a,'rsi':rv,
       'ema5':e5,'ema13':e13,'ema21':e21,'tendencia_5m':'N/A','tendencia_15m':tendencia,'bloqueio':'SINAL_M15_RETRACAO',
       'mensagem':f'{sinal} M15 | {tipo} + retração | confluência={confluencia} | qualidade={confianca*100:.1f}%',
